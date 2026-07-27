@@ -1,1 +1,8 @@
 * text=auto eol=lf
+
+# 隔离区没有 git，用 cat VERSION 就要能看到 commit 和日期
+VERSION export-subst
+
+# 打包用 git archive 读 committed blob，这些不进包
+private/ export-ignore
+.claude/ export-ignore

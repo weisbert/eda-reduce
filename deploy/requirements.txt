@@ -1,0 +1,15 @@
+# wave_reduce 的第三方依赖。**现在是空的** —— wave_core / wave_emit / wave_cli
+# 是硬性纯标准库，GUI 用 tkinter（也是标准库，但装不了 wheel，见下）。
+#
+# 这个文件为空不代表管道多余：双包模型现在就建好，哪天要加 numpy 加速
+# wave_metrics_*，只是在这里加一行、重出一次 full 包，
+# 而不是回头重做整条部署链。
+#
+# 加依赖时的规矩：
+#   1. 写死版本（numpy==1.24.4 这种），不写范围 —— 隔离区不能重解析
+#   2. 跑 `python deploy/package.py full`，glibc 审计闸会告诉你版本合不合适
+#   3. 送之前跑 `bash deploy/dryrun_manylinux2014.sh` 断网彩排
+#   4. **必须走 full 包**，增量包不带轮子，依赖哈希闸会挡住
+#
+# tkinter 装不了 wheel（它是 CPython 自带的 C 扩展 + Tcl/Tk 运行时），
+# 只能让隔离区管理员上系统包 python3-tk / tkinter。写在这里没用。
