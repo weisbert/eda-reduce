@@ -1,16 +1,32 @@
-# drawio-reduce
+# eda-reduce
 
-把 draw.io 图（模拟电路原理图 / 系统架构图）压成一段能直接粘贴给大模型的紧凑文本。
+把 EDA 工具的产出压成一段能直接粘贴给大模型的紧凑文本。
 
-给那些**只能传文本、不能传文件**的场景用：把 30 KB 的 `.drawio` 压成 3 KB 的 `.rd`，模型据此重建出网表。
+给那些**只能传文本、不能传文件**的场景用——隔离网络、无外网的仿真机器、
+只有一个聊天框的通道。目标是把模型分析电路真正需要的信息搬出来，
+而不是把文件压小。
 
 ```
-tools/drawio_reduce.py   .drawio -> .rd 压缩器（纯标准库，Python 3.8+，无依赖）
-docs/reduce-spec.md      .rd 格式规范 + 设计约定（分工线、黑名单、坐标解算）
-docs/ckt-format.md       .ckt 概念网表格式 —— 模型回给你的东西长什么样
-examples/demo.drawio     样例：教科书 5 管 OTA + 一小段架构图
-examples/demo.rd         压缩结果（1.9 KB，同时充当回归测试基准）
-examples/demo.ckt        从 .rd 重建出的网表 + 全部推断标注
+原理图  my.drawio  ──drawio_reduce──▶  my.rd  (1/6 ~ 1/10)  ──▶  模型重建出网表 .ckt
+波形    my.csv     ──wave_reduce────▶  my.wv  (≤20 KB)      ──▶  模型定位 debug 问题
+截图    plot.png   ──plot_digitize──▶  my.wv                ──▶  （导不出数据时的兜底）
+```
+
+## 工具
+
+| | 状态 | 干什么 |
+|---|---|---|
+| `tools/drawio_reduce.py` | **可用** | `.drawio` → `.rd`。纯标准库，Python 3.8+，无依赖 |
+| `tools/wave_reduce.py` | 计划中 | Cadence 波形 CSV → `.wv`，带 Tkinter GUI 预览。见 [`docs/wave-spec.md`](docs/wave-spec.md) |
+| `tools/plot_digitize.py` | 计划中 | 波形截图 → `.wv`。导不出数据时的兜底 |
+
+```
+docs/rd-spec.md       .rd 格式规范 + 设计约定（分工线、黑名单、坐标解算）
+docs/ckt-format.md    .ckt 概念网表格式 —— 模型回给你的东西长什么样
+docs/wave-spec.md     .wv 格式 + wave_reduce 设计约定（计划，未实现）
+examples/demo.drawio  样例：教科书 5 管 OTA + 一小段架构图
+examples/demo.rd      压缩结果（1.9 KB，同时充当回归测试基准）
+examples/demo.ckt     从 .rd 重建出的网表 + 全部推断标注
 ```
 
 ## 用法
@@ -54,6 +70,10 @@ waypoint 圆点那串 190 字符的样式同样如此。按这个密度 150 管�
 
 同理，保留策略是**黑名单**：只丢已知纯渲染用途的样式 key，未知 key 一律保留——没见过的 key 更可能是有意义的形状变体，而不是装饰。
 
+> 波形工具那条分工线**不一样**：脚本看得见全分辨率数据而模型永远看不见，
+> 所以需要全分辨率才能算出的**测量**（峰值、抖动、settling、spur dBc）必须脚本做，
+> 不做就永远丢了。脚本负责测量，模型负责诊断。详见 [`docs/wave-spec.md`](docs/wave-spec.md)。
+
 ## 画图不需要遵守任何约定
 
 按习惯画就行。颜色（常用来区分电源域）、箭头方向、虚线、线宽、加粗、边上的标签全都保留。
@@ -70,6 +90,11 @@ waypoint 圆点那串 190 字符的样式同样如此。按这个密度 150 管�
 HTML 富文本标签（`<b>` 转 `*…*` 保留强调，`V<sub>ss</sub>` → `Vss`）。
 
 不支持 group / 容器的父子坐标折算（暂未实现；图元的嵌套关系可由 bbox 包含推断）。
+
+## 数据不进这个仓库
+
+`examples/` 里只有合成的脱敏样例。真实电路文件、真实波形一律留在这个仓库**之外**——
+闸门是物理隔离，`.gitignore` 里那条 `private/` 只是纵深防御。
 
 ## License
 

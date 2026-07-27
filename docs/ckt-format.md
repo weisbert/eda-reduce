@@ -96,4 +96,4 @@ R2  res 1=vfb  2=vss
 ---
 
 > 早期版本这里有一节 draw.io 画图约定，已废弃——现在按你的习惯画就行，
-> 结构由 tools/drawio_reduce.py 压缩后交给模型重建。见 docs/reduce-spec.md。
+> 结构由 tools/drawio_reduce.py 压缩后交给模型重建。见 docs/rd-spec.md。
