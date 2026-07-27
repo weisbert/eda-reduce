@@ -296,17 +296,31 @@ CSV ─▶ wave_core ───────────────────�
 一根人造 spur）+ `examples/demo_tran.wv`。改工具后 diff 它，和 `examples/demo.rd`
 一个路子。**真实波形一律 `private/`，不进 examples。**
 
-### 建议轮次
+### 实现顺序（一次做完，不分轮次）
 
-1. **`wave_core` + `wave_emit` + `wave_cli` + 合成回归样例** —— 通用层，最该做扎实的一轮
-2. **`wave_metrics_tran` + `wave_metrics_freq`** —— 两种 kind 一起做。
-   一次做两个才能证明注册表的边界切对了；只做一个必然切歪
-3. **`wave_gui`**（Tkinter）
-4. **deploy 双包管道**（照搬为主）
-5. `plot_digitize`
+每完成一步就 commit，不要攒到最后——中途出意外也不至于全丢。
 
-第 2 轮把 tran 和 freq 一起做是有意的：用户的 debug 类型开放（电压/电流/PSS 谱都可能），
-所以「加一种分析类型」这条路径必须在第一天就被走通两次，否则第三次一定要返工。
+| # | 做什么 | 完成判据 |
+|---|---|---|
+| 0 | **`examples/gen_demo_wave.py`** 合成波形生成器 + 生成 `demo_tran.csv` / `demo_ac.csv` | 两个 csv 生成出来；里面按设计埋了阶跃、振铃、一个 glitch、一根窄 spur |
+| 1 | **`wave_core`** 解析 / 预细化 / RDP / 量化 / 重建自检 | 对 demo 数据能压缩并报出 max\|err\|；埋的 glitch 和 spur 没被削掉 |
+| 2 | **`wave_emit`** `.wv` 三段格式 + kind 注册表 | 产出 `examples/demo_tran.wv`，人读得懂 |
+| 3 | **`wave_cli`** | `python tools/wave_reduce.py demo_tran.csv` 端到端跑通 |
+| 4 | **`wave_metrics_tran` + `wave_metrics_freq`** | 两种 kind 都注册进去；测量值和合成信号的已知真值对得上 |
+| 5 | **`wave_gui`** Tkinter | 能开窗、拖滑块字节数实时变、误差窗格画出来 |
+| 6 | **`deploy/`** 双包管道 | full / incremental 都能出包；本地能解开验证 |
+| 7 | **`plot_digitize`** | 把第 0 步生成的波形渲染成 PNG 再数字化回来，误差落在像素精度内 |
+
+两个刻意的排序决定：
+
+- **第 0 步先做合成样例**。后面每一步都拿它验——而且因为是合成的，**真值已知**，
+  metrics 算得对不对是可判定的，不用靠肉眼看曲线像不像。它同时是回归基准
+  （改工具后 diff `examples/demo_tran.wv`，和 `examples/demo.rd` 一个路子）。
+- **第 4 步 tran 和 freq 一起做**。debug 类型是开放的（电压/电流/PSS 谱都可能），
+  所以「加一种分析类型」这条路径必须在第一天就被走通**两次**，否则边界一定切歪，
+  第三种类型来的时候返工。
+
+真实波形一律留在工作区仓，**不进 `examples/`**。
 
 ## 10. 方案二：截图数字化（`plot_digitize.py`，兜底）
 
