@@ -1,0 +1,37 @@
+# 由 examples/demo.rd 重建
+# 引脚约定：electrical 库 MOS 固定连接点 = (0,0.5)栅 / (1,0)上 / (1,1)下
+#           nmos 上=d 下=s；pmos 上=s 下=d。flip/direction 已在 .rd 里解算完。
+
+.block  demo_ota5t
+.intent 教科书 5 管 OTA，用来跑通 drawio_reduce.py 的全部解析分支
+.supply vdd vss
+.port   inp inn out vbias
+
+M3   pmos  s=vdd   d=n1    g=n1                       # W55 自环 = 二极管接法
+M4   pmos  s=vdd   d=out   g=n1
+M5   nmos  d=n1    g=inp   s=tail   w=10u l=0.5u m=4  # ←Ctrl+M 属性；T33 "x4" 也在旁边，两者一致
+M6   nmos  d=out   g=inn   s=tail
+M7   nmos  d=tail  g=vbias s=vss                      # ←边标签 "vbias"
+CL   cap   1=out   2=vss              c=2p            # ←T34 "*CL=2pF*"@570,345
+
+.end
+
+
+# ---- 架构图部分（同一页下方）----
+# BIAS GEN [蓝 #dae8fc] --vbias--> OTA CORE [绿 #d5e8d4]
+# 色标文本框 T42: 蓝=VDD_1V8, 绿=VDD_3V3
+
+# ============================================================================
+# 推断标注 —— 脚本没做也不该做，请对着图核
+# ============================================================================
+# [A] waypoint 落在哪条线上
+#     J20 @325,200 → W54 (M3栅 250,200 → M4栅 400,200) 的横段
+#     J21 @450,240 → W53 (M4漏 450,220 → M6漏 430,300) 的 x=450 竖段  ⇒ CL 挂在 out
+# [B] 悬空端点判为同网
+#     vdd：W2 从 @120,120 到 @560,120，W50/W51 的悬空端落在 @200,120 / @450,120
+# [C] 浮动文本框归属
+#     T31 "inp"@90,305   → W62 的悬空端 @130,320
+#     T32 "inn"@520,290  → W63 的悬空端 @520,320
+#     T33 "x4"@145,340   → M5（与 Ctrl+M 里的 m=4 一致，互为佐证）
+#     T34 "*CL=2pF*"     → CL
+#     T30 "Vdd"@100,100  → 电源横线 W2

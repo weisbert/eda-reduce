@@ -1,0 +1,21 @@
+# 私有电路文件 —— 绝不进版本库
+private/
+*.private.*
+
+# 本地产物
+*.rd
+!examples/demo.rd
+*.ckt
+!examples/demo.ckt
+*.drawio
+!examples/demo.drawio
+*.drawio.bak
+*.dtmp
+
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
