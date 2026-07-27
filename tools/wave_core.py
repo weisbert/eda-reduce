@@ -1004,8 +1004,12 @@ class Reduction(object):
 
 
 def reduce_trace(tr, tol=DEFAULT_TOL, max_points=None, cand=None, forced=(),
-                 keep_extrema=True, keep_offset=True):
-    """预细化 -> 强制点 -> RDP -> 量化 -> 自检。GUI 只重跑后三步。"""
+                 keep_extrema=True, keep_offset=True, check=True):
+    """预细化 -> 强制点 -> RDP -> 量化 -> 自检。GUI 只重跑后三步。
+
+    check=False 跳过重建自检（O(n)）。二分点数预算时用得上：中间那十几次
+    只关心字节数，最后定下来再算一次真正的误差。
+    """
     set_eps(tr, tol)
     if cand is None:
         cand = predecimate(tr, tol)
@@ -1019,5 +1023,5 @@ def reduce_trace(tr, tol=DEFAULT_TOL, max_points=None, cand=None, forced=(),
     kept = rdp(tr, cand, tol, max_points, f)
     specs = make_colspec(tr, tol, keep_offset=keep_offset)
     xspec = XSpec(tr, kept)
-    err = recon_error(tr, kept, xspec, specs)
+    err = recon_error(tr, kept, xspec, specs) if check else []
     return Reduction(tr, kept, cand, xspec, specs, err, tol, max_points, sorted(f))
