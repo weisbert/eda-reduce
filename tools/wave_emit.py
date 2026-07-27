@@ -52,7 +52,9 @@ class Metric(object):
 
     def text(self, xunit, sig=6):
         if isinstance(self.value, str):
-            v = self.value
+            # 预格式化的值也要带单位 —— spec 要求「名字 值 单位」三元组
+            sep = "" if self.unit == "%" else " "
+            v = (self.value + sep + self.unit) if self.unit else self.value
         else:
             v = eng_str(self.value, self.unit, sig)
         s = "%s %s" % (self.name, v)

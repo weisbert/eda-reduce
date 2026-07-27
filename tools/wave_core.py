@@ -111,6 +111,10 @@ def _sigfmt(v, sig):
     """N 位有效数字。保留科学记数——log 轴跨 9 个 decade，定点写不下。"""
     if v == 0.0:
         return "0"
+    # 整数部分有几位就至少要几位有效数字，否则 640 会被 %.2g 打成 6.4e2
+    a = abs(v)
+    if a >= 1.0:
+        sig = max(sig, int(math.floor(math.log10(a))) + 1)
     s = "%.*g" % (sig, v)
     if "e" in s:                                   # 1e+10 -> 1e10，省两个字节
         m, e = s.split("e")
