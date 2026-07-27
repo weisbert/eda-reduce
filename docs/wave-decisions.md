@@ -229,6 +229,23 @@ Tk 默认把回调异常打到 stderr 然后**继续跑 mainloop**，自检撞�
 现在 full 和 incremental 看起来没差别。但哪天加 numpy，只是往
 `requirements.txt` 加一行、重出一次 full 包，而不是回头重做整条部署链。
 
+**文件名和 spec 第 7 节不一样**：spec 写的是 `requirements-gui.txt`
+（那是从 LDO_modeling 搬过来的名字，那边确实只有 GUI 有依赖）。
+这里没有「GUI 专属依赖」这个概念——GUI 用的 tkinter 根本装不了 wheel——
+所以就叫 `requirements.txt`。
+
+### 32b. 可选依赖单独放 `requirements-optional.txt`，不进打包流程
+
+`requirements.txt` 是**被审计、被哈希、被冻进 lock** 的那一份。
+往里加一行的代价是：重下轮子 + 过 glibc 审计闸 + **必须走 full 包**。
+
+Pillow 只有 `plot_digitize` 用，而且缺了会自动退回自带的 zlib 解码器
+（结果逐字节一致，有测试守着）。为这种东西把整条链拖下水、
+让隔离区多背几 MB，不值。所以单独一个文件、明写「`package.py` 不读它」。
+
+同理 tkinter **不写进任何 requirements**：写了也没用，pip 装不了，
+只能上系统包。`bootstrap.sh` 会探一下并告诉你有没有。
+
 ---
 
 ## 八、截图数字化

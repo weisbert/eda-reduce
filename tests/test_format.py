@@ -8,6 +8,7 @@
 
 import ast
 import os
+import sys
 import unittest
 
 import _common as C
@@ -56,6 +57,63 @@ class TestPureStdlib(unittest.TestCase):
         for f in ("wave_metrics_tran.py", "wave_metrics_freq.py"):
             bad = imports_of(os.path.join(TOOLS, f)) - STDLIB_OK - {"numpy"}
             self.assertEqual(bad, set(), "%s 引了 %s" % (f, bad))
+
+    def test_whole_repo_has_only_documented_optional_deps(self):
+        """全仓扫一遍：非标准库的 import 只允许出现在文档里写明的可选依赖里。
+
+        README 写着「不用 pip install」。这条测试就是那句话的守卫 ——
+        谁哪天顺手 import 了个第三方包，这里会立刻炸。
+        """
+        allowed = {"PIL"}                       # deploy/requirements-optional.txt
+        local = set(m[:-3] for m in os.listdir(TOOLS) if m.endswith(".py"))
+        local |= {"audit_wheels", "_common", "_block"}
+        try:
+            std = set(sys.stdlib_module_names)
+        except AttributeError:
+            self.skipTest("Python < 3.10 没有 stdlib_module_names")
+        bad = {}
+        for base, dirs, files in os.walk(ROOT):
+            dirs[:] = [d for d in dirs if d not in (".git", "dist", "__pycache__")]
+            for f in files:
+                if not f.endswith(".py"):
+                    continue
+                p = os.path.join(base, f)
+                for m in imports_of(p) - std - local - allowed:
+                    bad.setdefault(m, []).append(os.path.relpath(p, ROOT))
+        self.assertEqual(bad, {}, "出现了没记录的第三方依赖: %s" % bad)
+
+    def test_pillow_is_genuinely_optional(self):
+        """把 PIL 从 meta_path 上彻底挡掉，plot_digitize 必须照常出结果。
+
+        「有 Pillow 就用，没有就退回自带解码器」这句话得是真的 ——
+        隔离区可能连 Pillow 都没有。
+        """
+        import subprocess
+        import tempfile
+        out = os.path.join(tempfile.mkdtemp(), "d.csv")
+        code = (
+            "import sys\n"
+            "class B:\n"
+            "    def find_module(self, n, p=None):\n"
+            "        return self if n.split('.')[0] in ('PIL','numpy') else None\n"
+            "    def load_module(self, n):\n"
+            "        raise ImportError(n)\n"
+            "sys.meta_path.insert(0, B())\n"
+            "sys.path.insert(0, %r)\n"
+            "import plot_digitize\n"
+            "sys.exit(plot_digitize.main([%r,'--xaxis','0,300n','--yaxis','0,1.3',"
+            "'--trace','#e01b24=v','-o',%r]))\n"
+            % (TOOLS, os.path.join(ROOT, "examples", "demo_plot.png"), out))
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        p = subprocess.run([sys.executable, "-c", code], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=180)
+        err = p.stderr.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, err)
+        self.assertIn("自带解码器", err, "没有 PIL 时应当走自带解码器")
+        self.assertTrue(os.path.exists(out))
+        with open(out, encoding="utf-8") as fh:
+            self.assertGreater(len(fh.readlines()), 1000)
 
     def test_escape_hatch_runs_without_metrics_modules(self):
         """metrics 模块缺席时也要能出 .wv —— 这是逃生舱的定义。"""

@@ -26,6 +26,16 @@
 > `wave_metrics_*`，只是往 `requirements.txt` 加一行、重出一次 full 包，
 > 而不是回头重做整条部署链。
 
+### 两个 requirements 文件的分工
+
+| 文件 | 进打包流程吗 | 内容 |
+|---|---|---|
+| `requirements.txt` | **进**。被审计、被哈希、被冻进 `requirements.lock` | 现在是空的 |
+| `requirements-optional.txt` | **不进**。`package.py` 不读它 | Pillow（`plot_digitize` 可选加速） |
+
+往 `requirements.txt` 加一行的代价是：重下轮子 + 过 glibc 审计闸 + **必须走 full 包**。
+所以「缺了工具照样跑」的东西不放进去，免得把整条链拖下水，也免得隔离区多背几 MB。
+
 ## 黄区：打包
 
 ```powershell

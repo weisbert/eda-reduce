@@ -1,0 +1,29 @@
+# 可选依赖 —— **这个文件不进打包流程**，package.py 不读它。
+#
+# 为什么单独放一个文件而不是写进 requirements.txt：
+#   requirements.txt 是**被审计、被哈希、被冻进 lock** 的那一份。
+#   往里加一行的代价是：重下轮子 + 过 glibc 审计闸 + 必须走 full 包
+#   （增量包不带轮子，依赖哈希闸会挡住）。
+#   下面这些东西缺了工具照样跑，不值得为它们把整条链拖下水，
+#   也不值得让隔离区多背几 MB。
+#
+# 所以：这里列的东西**不会**被打进气隙包。想在隔离区用，
+# 要么手工加进 requirements.txt 重出 full 包，要么让管理员上系统包。
+
+# ---------------------------------------------------------------- Pillow
+# 只有 tools/plot_digitize.py 用得上，而且是 try/except 可选：
+#   有  -> 用 Pillow 解 PNG（快，格式吃得全）
+#   没有 -> 退回自带解码器（zlib 手解，非隔行 8-bit，filter 0-4，
+#           颜色类型 0/2/3/4/6）。**结果逐字节一致**，
+#           tests/test_digitize.py 的 test_pure_decoder_matches_pillow 在守这条。
+# 大图上 Pillow 快一个数量级；demo 那张 1920x1080 两条路都在 1 秒内。
+Pillow>=8.0
+
+# ---------------------------------------------------------------- tkinter
+# 不在这里写，因为**写了也没用**：tkinter 是 CPython 自带的 C 扩展 +
+# Tcl/Tk 运行时，pip 装不了。--gui 要用它，命令行不要。
+# 隔离区上只能让管理员装系统包：
+#   RHEL/CentOS:  yum install python3-tkinter
+#   Debian/Ubuntu: apt install python3-tk
+# bootstrap.sh 会探一下并告诉你有没有。
+# 2026-07-27 在隔离区实测确认可用，**换机器要重新确认**。

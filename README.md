@@ -20,6 +20,28 @@
 | `tools/wave_reduce.py` | **可用** | Cadence 波形 CSV → `.wv`（≤20 KB），带 Tkinter GUI 预览。见 [`docs/wave-spec.md`](docs/wave-spec.md) |
 | `tools/plot_digitize.py` | **可用** | 波形截图 → CSV/`.wv`。导不出数据时的兜底 |
 
+## 依赖：没有。不用 `pip install`
+
+```bash
+git clone https://github.com/weisbert/eda-reduce.git && cd eda-reduce
+python tools/wave_reduce.py examples/demo_tran.csv     # 就这样，不用装任何东西
+```
+
+Python 3.6+，**全部纯标准库**。仓库里那个 `deploy/requirements.txt` 是空的
+（只有注释）——部署管道按双包模型建好了，只是现在没东西可装，
+哪天加了 numpy 往里写一行就行，不用回头重做部署链。
+
+两个**可选**的东西，没有也照常跑：
+
+| | 缺了会怎样 | 怎么补 |
+|---|---|---|
+| `Pillow` | `plot_digitize` 退回自带的 PNG 解码器（纯标准库 zlib，约 60 行）。结果一样，大图慢一些 | `pip install Pillow`，纯 python 之外的机器上也可以不装 |
+| `tkinter` | `--gui` 用不了，命令行全部照常 | **装不了 wheel**（CPython 自带的 C 扩展 + Tcl/Tk 运行时），只能上系统包 `python3-tk` / `tkinter` |
+
+这条「核心不依赖任何东西」是**硬约束**不是巧合：`wave_core.py` + `wave_emit.py`
++ `wave_cli.py` 三个文件 scp 到任何机器就能跑，是部署链坏掉时的逃生舱。
+`tests/test_format.py` 里有 AST 扫描在守这条线。
+
 ```
 docs/rd-spec.md       .rd 格式规范 + 设计约定（分工线、黑名单、坐标解算）
 docs/ckt-format.md    .ckt 概念网表格式 —— 模型回给你的东西长什么样
