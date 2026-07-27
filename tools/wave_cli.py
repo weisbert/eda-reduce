@@ -75,6 +75,12 @@ def fit_budget(tr, tol, budget, m, forced, cand, max_points=None,
     return red, txt
 
 
+def _why_tol(tr, tol):
+    r = max((s.rng for s in tr.signals), default=0.0)
+    u = tr.signals[0].unit if tr.signals else ""
+    return "相当于 %s 的容差" % core.eng_str(tol * r, u, 3)
+
+
 def process(path, args):
     """-> (text, [(trace, reduction), ...])"""
     traces = core.parse_csv(path, layout=args.layout, xcols=args.xcols)
@@ -88,15 +94,23 @@ def process(path, args):
         m = None
         if not args.no_metrics:
             m = emit.run_metrics(tr)
-        core.set_eps(tr, args.tol)
-        cand = core.predecimate(tr, args.tol)
-        forced = list(m.forced()) if m else []
+        tol = args.tol
         notes = []
+        if tol is None:
+            tol = core.DEFAULT_TOL
+            sug = m.suggest_tol() if m else None
+            if sug:
+                notes.append("tol 用了 kind=%s 建议的 %g（没给 --tol）；"
+                             "%s" % (tr.kind, sug, _why_tol(tr, sug)))
+                tol = sug
+        core.set_eps(tr, tol)
+        cand = core.predecimate(tr, tol)
+        forced = list(m.forced()) if m else []
         if m is None and not args.no_metrics:
             notes.append("kind=%s 没有注册的 metrics 模块，本文件只有 SHAPE 段"
                          "（已注册: %s）" % (tr.kind, ", ".join(emit.registered())
                                             or "无"))
-        red, txt = fit_budget(tr, args.tol, per, m, forced, cand,
+        red, txt = fit_budget(tr, tol, per, m, forced, cand,
                               args.max_points, not args.no_offset, notes)
         chunks.append(txt)
         info.append((tr, red))
@@ -109,8 +123,9 @@ def build_parser():
         description="Cadence 波形 CSV -> .wv（能粘进聊天框的紧凑文本）")
     p.add_argument("infile", nargs="*", help="ViVA 导出的 CSV")
     p.add_argument("-o", "--out", help="输出文件，默认 stdout")
-    p.add_argument("--tol", type=float, default=core.DEFAULT_TOL,
-                   help="RDP 相对容差，占量程比例（默认 %(default)s）")
+    p.add_argument("--tol", type=float, default=None,
+                   help="RDP 相对容差，占量程比例（默认 %g；某些 kind 会自荐"
+                        "更合适的值）" % core.DEFAULT_TOL)
     p.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
                    help="输出字节上限，0 = 不限（默认 %(default)s）")
     p.add_argument("--max-points", type=int, default=None,

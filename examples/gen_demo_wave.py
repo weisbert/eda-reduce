@@ -432,13 +432,30 @@ def spec_rows(p, rng):
 
 
 def spec_truth(p):
+    """真值分两种，测量该对的是后一种。
+
+    `dbc` 是**注入**的幅度；`dbc_observed` 是那个 bin 上**实际**的幅度 ——
+    洛伦兹线型的尾巴会互相叠加，载波在 2.5 GHz 处还有 -69 dBc 的裙边，
+    叠到 -52 dBc 的 spur 上就是 +1.1 dB。工具量到的是后者，这不是工具错。
+    """
+    hw = p["hwhm_bins"] * p["df"]
+    tones = [(p["carrier"], p["carrier_v"])]
+    for f, dbc in p["spurs"]:
+        tones.append((f, p["carrier_v"] * 10.0 ** (dbc / 20.0)))
+
+    def amp(f):
+        return sum(ta / (1.0 + ((f - tf) / hw) ** 2) for tf, ta in tones)
+
+    car = amp(p["carrier"])
     out = {"carrier_f": p["carrier"], "carrier_v": p["carrier_v"],
-           "floor_dbc": p["floor_dbc"], "df": p["df"], "n": p["n"],
-           "xscale": "lin", "spurs": []}
+           "carrier_v_observed": car, "floor_dbc": p["floor_dbc"],
+           "df": p["df"], "n": p["n"], "hwhm": hw, "xscale": "lin", "spurs": []}
     for f, dbc in sorted(p["spurs"]):
+        a = amp(f)
         out["spurs"].append({
             "f": f, "dbc": dbc,
-            "v": p["carrier_v"] * 10.0 ** (dbc / 20.0),
+            "dbc_observed": 20.0 * math.log10(a / car),
+            "v": p["carrier_v"] * 10.0 ** (dbc / 20.0), "v_observed": a,
             "f_over_f0": f / p["carrier"],
         })
     return out
@@ -497,7 +514,9 @@ DIRTY = '''"time","V(out)","I(load)",
 
 DIRTY_TRUTH = {
     "raw_rows": 14,
-    "kept_rows": 10,          # 去掉 1 个重复 t、1 个 NaN 行、1 个 inf 行、1 个非单调行
+    # 只丢 1 个重复 t 和 1 个非单调行。NaN/inf/空单元那三行**不整行丢** ——
+    # 同一行别的信号还是好的，整行丢会连累它们；坏的那一格线性补上并报进 notes。
+    "kept_rows": 12,
     "expect_notes": ["dup", "nonmono", "nan", "inf", "blank", "dt"],
     "signals": ["V(out)", "I(load)"],
     "units": {"time": "s", "V(out)": "V", "I(load)": "A"},
