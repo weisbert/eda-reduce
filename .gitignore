@@ -19,3 +19,6 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Claude Code 本地配置/skill —— 不进公开仓库
+.claude/
