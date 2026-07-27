@@ -65,13 +65,24 @@ def fit_budget(tr, tol, budget, m, forced, cand, max_points=None,
             hi = mid - 1
     if best is None:
         best = 2
-    for _ in range(8):                       # 收尾核一次真字节数，超了再收一点
+    for _ in range(12):                      # 收尾核一次真字节数，超了再收一点
         red = core.reduce_trace(tr, tol, best, red.cand, forced,
                                 keep_offset=keep_offset)
         txt = emit.emit(red, m, notes)
         if emit.nbytes(txt) <= budget or best <= 2:
             break
-        best = max(2, int(best * 0.95))
+        best = max(2, int(best * 0.9))
+    n = emit.nbytes(txt)
+    if n > budget:
+        # 压不进去就**说出来**。强制保留点（spur 峰及其包络、极值、事件）
+        # 是不许为了预算牺牲的 —— 牺牲了就等于回到 54x 低报那个坑里。
+        red = core.reduce_trace(tr, tol, best, red.cand, forced,
+                                keep_offset=keep_offset)
+        txt = emit.emit(red, m, (notes or []) + [
+            "**超预算**：%d > %d 字节。强制保留点有 %d 个（spur/极值/事件，"
+            "不许为预算牺牲），已经压到 %d 点还是下不来。"
+            "要更小就调 --tol 或者分段导出。"
+            % (n, budget, len(red.forced), len(red.kept))])
     return red, txt
 
 
@@ -144,6 +155,8 @@ def build_parser():
     p.add_argument("--list-kinds", action="store_true",
                    help="列出已注册的分析类型后退出")
     p.add_argument("--gui", action="store_true", help="开 Tkinter 预览窗口")
+    p.add_argument("--selftest", action="store_true",
+                   help="配 --gui 用：无人值守跑一遍 GUI 并打印状态后自动退出")
     return p
 
 
