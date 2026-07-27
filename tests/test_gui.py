@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+"""GUI 的无人值守自检。
+
+默认**跳过**：它会真的弹一个窗口出来，routine 跑测试时不该被打断。
+要跑就设环境变量：
+
+    EDA_REDUCE_GUI_TEST=1 python -m unittest discover -s tests
+
+自检本身有硬超时，而且接管了 Tk 的异常钩子 —— Tk 默认把回调异常打到 stderr
+然后继续跑 mainloop，撞上就永远不退出（第一版就是这么挂住的）。
+"""
+
+import os
+import subprocess
+import sys
+import unittest
+
+from _common import ROOT
+
+RUN = os.environ.get("EDA_REDUCE_GUI_TEST") == "1"
+
+
+@unittest.skipUnless(RUN, "会弹窗；设 EDA_REDUCE_GUI_TEST=1 才跑")
+class TestGuiSelftest(unittest.TestCase):
+
+    def test_selftest_runs_and_exits(self):
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "tools", "wave_reduce.py"),
+             os.path.join(ROOT, "examples", "demo_tran.csv"),
+             "--gui", "--selftest"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("TIMEOUT", out)
+        self.assertNotIn("EXC", out)
+        self.assertIn("载入完成", out)
+        # 滑块拖动要真的重算：四档 max_points 应当给出不同的点数/字节数
+        rows = [ln for ln in out.splitlines() if ln.startswith("max_points=")]
+        self.assertGreaterEqual(len(rows), 4)
+        got = set(rows)
+        self.assertEqual(len(got), len(rows), "不同的 max_points 给了一样的结果")
+        self.assertIn("框选缩放", out)
+        self.assertIn("状态栏", out)
+
+    def test_canvas_segment_budget(self):
+        """Canvas 上的图元数要恒定 —— 拖动时才不掉帧。"""
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "tools", "wave_reduce.py"),
+             os.path.join(ROOT, "examples", "demo_tran.csv"),
+             "--gui", "--selftest"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        out = p.stdout.decode("utf-8", "replace")
+        counts = []
+        for ln in out.splitlines():
+            if "canvas items" in ln:
+                counts.append(ln.split("canvas items")[1].strip())
+        self.assertTrue(counts)
+        self.assertEqual(len(set(counts)), 1, "图元数应当恒定: %s" % counts)
+
+
+class TestGuiPureCompute(unittest.TestCase):
+    """不碰 Tk 的那部分可以随时测：像素分箱、重建取值、坐标变换。"""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+    def test_envelope_binning(self):
+        import wave_gui
+        x = [i * 1e-9 for i in range(1000)]
+        y = [(-1.0 if i == 500 else 0.0) for i in range(1000)]
+        band = wave_gui.bin_envelope(x, [y], 0, 1000, 100)
+        lo, hi = band[0]
+        self.assertEqual(len(lo), 100)
+        # 那个孤立的坑必须出现在某一列的下包络里 —— 抽样会漏掉它，包络不会
+        self.assertAlmostEqual(min(v for v in lo if v is not None), -1.0)
+        self.assertAlmostEqual(max(v for v in hi if v is not None), 0.0)
+
+    def test_recon_lookup(self):
+        import wave_gui
+        kx = [0.0, 1.0, 2.0]
+        ky = [0.0, 10.0, 20.0]
+        self.assertAlmostEqual(wave_gui.recon_at(kx, ky, 0.5), 5.0)
+        self.assertAlmostEqual(wave_gui.recon_at(kx, ky, 1.5), 15.0)
+        self.assertAlmostEqual(wave_gui.recon_at(kx, ky, -1.0), 0.0)
+        self.assertAlmostEqual(wave_gui.recon_at(kx, ky, 9.0), 20.0)
+
+    def test_xform_log(self):
+        import wave_gui
+        f = wave_gui.Xform(10.0, 1e10, 0.0, 1.0, 1000, 200, logx=True)
+        a, b = f.sx(10.0), f.sx(1e10)
+        self.assertLess(a, b)
+        mid = f.sx(1e5.__float__() ** 1)          # 10^5.5 的一半位置附近
+        self.assertGreater(mid, a)
+        self.assertLess(mid, b)
+        self.assertAlmostEqual(f.wx(a), 10.0, delta=1e-6)
+
+
+if __name__ == "__main__":
+    unittest.main()

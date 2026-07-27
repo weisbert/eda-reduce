@@ -17,16 +17,22 @@
 | | 状态 | 干什么 |
 |---|---|---|
 | `tools/drawio_reduce.py` | **可用** | `.drawio` → `.rd`。纯标准库，Python 3.8+，无依赖 |
-| `tools/wave_reduce.py` | 计划中 | Cadence 波形 CSV → `.wv`，带 Tkinter GUI 预览。见 [`docs/wave-spec.md`](docs/wave-spec.md) |
-| `tools/plot_digitize.py` | 计划中 | 波形截图 → `.wv`。导不出数据时的兜底 |
+| `tools/wave_reduce.py` | **可用** | Cadence 波形 CSV → `.wv`（≤20 KB），带 Tkinter GUI 预览。见 [`docs/wave-spec.md`](docs/wave-spec.md) |
+| `tools/plot_digitize.py` | **可用** | 波形截图 → CSV/`.wv`。导不出数据时的兜底 |
 
 ```
 docs/rd-spec.md       .rd 格式规范 + 设计约定（分工线、黑名单、坐标解算）
 docs/ckt-format.md    .ckt 概念网表格式 —— 模型回给你的东西长什么样
-docs/wave-spec.md     .wv 格式 + wave_reduce 设计约定（计划，未实现）
+docs/wave-spec.md     .wv 格式 + wave_reduce 设计约定
+docs/wave-decisions.md  spec 没定、实现时拍板的细节（附理由）
 examples/demo.drawio  样例：教科书 5 管 OTA + 一小段架构图
 examples/demo.rd      压缩结果（1.9 KB，同时充当回归测试基准）
 examples/demo.ckt     从 .rd 重建出的网表 + 全部推断标注
+examples/gen_demo_wave.py  合成波形生成器 —— 真值已知，所以测量对不对是可判定的
+examples/demo_*.csv   合成波形样例（瞬态 / AC / 谱 / 布局B / 脏数据）
+examples/demo_*.wv    压缩结果，同时充当回归基准
+deploy/               隔离区双包部署管道（见 deploy/README.md）
+tests/                unittest 全套（见 tests/README.md）
 ```
 
 ## 用法
@@ -34,6 +40,12 @@ examples/demo.ckt     从 .rd 重建出的网表 + 全部推断标注
 ```bash
 python tools/drawio_reduce.py my.drawio -o my.rd
 python tools/drawio_reduce.py my.drawio --bbox 400,300,800,700   # 只导出一个区域
+
+python tools/wave_reduce.py my.csv -o my.wv        # 自动压到 20 KB 以内
+python tools/wave_reduce.py my.csv --gui           # 拖滑块看丢了什么、看字节数
+python tools/wave_reduce.py my.csv --tol 0.002 --budget 20480
+python tools/plot_digitize.py shot.png --xaxis 0,300n --yaxis 0.7,0.87 \
+    --trace '#e01b24=vdd_pll' -o dig.csv           # 截图兜底
 ```
 
 ```
@@ -46,6 +58,51 @@ my.rd  (原始体积的 1/6 ~ 1/10)
                                                     ↓
    对着图核 .ckt 末尾的「推断标注」段  ←────────────  标注出所有猜测
 ```
+
+## `.wv` 长什么样
+
+三段。`[METRICS]` / `[EVENTS]` 是**全精度的事实**（脚本在全分辨率数据上量的，
+丢了不可逆），`[SHAPE]` 是**降精度的形状**。头部第二行是**自检**——
+输出声明自己的不确定度，等价于 `.ckt` 末尾那段推断标注。
+
+```
+# WV1  tran  demo_tran  4 sig  time 0 .. 300 ns  2545 -> 596 pts (4.3x)
+# recon: max|err| 116 uV (13.35% of range) @ time=74.37 ns  rms 22.9 uV  [worst V(vref)]
+# c1   V(vdd_pll)  [mV] offset 800 mV  range -85.3..+59.6  (量化 100 uV)  err 1.46%
+...
+[METRICS]
+c1    min 714.693 mV @ 40.9918 ns   max 859.579 mV @ 59.4121 ns   pp 144.886 mV
+c1    settle(+-1%) 159.9 ns (band 8 mV)   settle(+-0.1%) n/a (带宽 800 uV < 6x 噪声底)
+c1    glitch1 -3.564 mV @ 119.972 ns (width 210 ps, 23.0x 噪声底, 窗口 640 ps)
+c2    period 6.40004 ns   jitter_rms 3.84155 ps   jitter_pp 15.6873 ps (N=46 cycles)
+[EVENTS]
+119.972 ns    c1   GLITCH      -3.564 mV, 23.0x 噪声底, width 210 ps
+[SHAPE] time c1 c2 c3 c4
+148.275 2.6 1200 1.5335 406
+```
+
+实测：134 KB 的瞬态 CSV → 20.4 KB；95 KB 的谱 → 15 KB；32 KB 的 AC → 2 KB。
+
+## 波形那条分工线不一样
+
+`drawio_reduce` 的铁律是「脚本只做确定性变换，语义判断留给模型」。波形反过来：
+
+> **脚本看得见全分辨率数据，模型永远看不见。**
+> 峰值的精确位置、周期抖动、settling time、spur 的 dBc——需要全分辨率才算得出，
+> **脚本不算就永远丢了**，模型拿到 400 个点之后再聪明也算不回来。
+
+所以分工线往下挪一格：**脚本负责「测量」，模型负责「诊断」。脚本绝不写形容词。**
+输出里不出现「轻微过冲」「看起来稳定」这类词，只有数。
+（`tests/test_format.py` 里有个词表在守这一条。）
+
+同一条原则的另一面是**不确定就声明不确定度，不要猜一个**：
+
+- 容差带比噪声底还窄 → 写 `n/a (带宽 800 uV < 6x 噪声底 155 uV，测不了)`
+- 到窗口结束还没进带 → 写 `n/a (未 settle)`，不报个假数
+- 斜率 → 必须带测量窗口（dt 坍缩区间里噪声除以 2 ps 能大三个数量级）
+- 单位从列名推的 → 打个 `?`；读不出来 → 写 `unknown`，不猜
+- 压不进 20 KB → 在输出里说超了多少、为什么下不来
+- 截图数字化 → 头里强制打精度上限，某列有多个候选就报「无法判定」
 
 ## 为什么不直接发 XML
 

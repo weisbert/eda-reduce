@@ -65,7 +65,8 @@ PREDEC_FRAC = 0.3            # 预细化阈值 = PREDEC_FRAC * eps（来自实�
 QUANT_FRAC = 0.25            # 量化步长 <= eps/4：抽点误差已经接受了，再细是纯浪费
 NOISE_K = 3.0                # eps 不低于 NOISE_K 倍噪声底：追噪声是在编码噪声
 MAX_CAND = 20000             # 预细化的候选点上限，GUI 的交互全在这个集合上做
-DT_COLLAPSE = 50.0           # dt 相对中位数塌掉这么多倍就报出来
+DT_COLLAPSE = 50.0           # dt 相对附近粗尺度塌掉这么多倍才看一眼
+DT_RUN_MIN = 4               # 连着这么多小步才算「挣扎」，两三步是栅格拼接痕迹
 
 
 # --------------------------------------------------------------- 数值小工具
@@ -515,13 +516,6 @@ def analyze(tr, kind=None, xscale=None):
     sd = sorted(dts)
     tr.dt_med = sd[len(sd) // 2]
     tr.dt_min, tr.dt_max = sd[0], sd[-1]
-    if tr.xscale == "log":
-        # log 轴上 dt 本来就跨几个数量级，坍缩判据不成立；改报每 decade 多少点
-        span = math.log10(tr.x[-1] / tr.x[0]) if tr.x[0] > 0 else 0.0
-        if span > 0:
-            tr.note("x 轴判为 log（%.2f decade，%.0f 点/decade）" % (span, n / span))
-    else:
-        _flag_dt_collapse(tr, dts)
 
     for s in tr.signals:
         y = s.y
@@ -535,6 +529,14 @@ def analyze(tr, kind=None, xscale=None):
                 hi, hi_i = v, i
         s.vmin, s.vmax, s.vmin_at, s.vmax_at = lo, hi, li, hi_i
         s.noise = noise_floor(tr.x, y)
+
+    if tr.xscale == "log":
+        # log 轴上 dt 本来就跨几个数量级，坍缩判据不成立；改报每 decade 多少点
+        span = math.log10(tr.x[-1] / tr.x[0]) if tr.x[0] > 0 else 0.0
+        if span > 0:
+            tr.note("x 轴判为 log（%.2f decade，%.0f 点/decade）" % (span, n / span))
+    else:
+        _flag_dt_collapse(tr, dts)
     return tr
 
 
@@ -601,31 +603,90 @@ def _detect_xscale(x):
     return "log" if math.sqrt(var) / m < 0.05 else "lin"
 
 
+def _local_dt_ref(dts, block=64, pct=0.9):
+    """每个位置的「附近本来能有多粗」。
+
+    两个坑都踩过：
+    - 不能用**全局**中位数。Spectre 输出里 dt 本来就跨几个量级（沿上 15 ps、
+      平坦区 2 ns），全局中位数被点数最多的那一档带跑 —— demo_tran 里
+      2 ps 的坍缩相对全局中位只有 7.5x，根本触发不了阈值。
+    - 也不能用局部**中位数**。时钟每 6.4 ns 就加密一次，局部中位数同样是 15 ps。
+    所以取邻近块的**高分位**：那才是「这一带本来的粗尺度」。
+    真正的判据不是这个比值，是后面那道「区间内信号动没动」。
+    """
+    n = len(dts)
+
+    def q(a):
+        s = sorted(a)
+        return s[min(len(s) - 1, int(pct * (len(s) - 1) + 0.5))]
+
+    if n < 3 * block:
+        return [q(dts)] * n
+    hi = []
+    for a in range(0, n, block):
+        hi.append(q(dts[a:a + block]))
+    out = [0.0] * n
+    for i in range(n):
+        k = i // block
+        out[i] = max(hi[max(0, k - 1):min(len(hi), k + 2)])
+    return out
+
+
 def _flag_dt_collapse(tr, dts):
-    """dt 突然坍缩本身就是 debug 信号（Spectre 收敛挣扎），要报不要跳过。"""
-    med = tr.dt_med
-    if med <= 0:
+    """dt 突然坍缩**而信号又没怎么动** —— 那才是收敛挣扎，是 debug 信号。
+
+    光看 dt 坍缩会把自适应细化也报进来：求解器在陡沿上加密是它该干的事，
+    不是毛病。区别在于沿上信号在剧烈变化，而收敛挣扎时求解器在一个
+    什么都没发生的地方原地踏步。所以判据是**坍缩 + 无活动**，
+    另一类只报个数，不占篇幅。
+    """
+    n = len(dts)
+    if n < 4:
         return
+    ref = _local_dt_ref(dts)
     runs = []
     i = 0
-    n = len(dts)
     while i < n:
-        if dts[i] * DT_COLLAPSE < med:
-            j = i
-            mn = dts[i]
-            while j < n and dts[j] * DT_COLLAPSE < med:
+        if dts[i] * DT_COLLAPSE < ref[i]:
+            j, mn = i, dts[i]
+            while j < n and dts[j] * DT_COLLAPSE < ref[j]:
                 mn = min(mn, dts[j])
                 j += 1
-            runs.append((tr.x[i], tr.x[min(j, n - 1)], med / mn, j - i))
+            runs.append((i, min(j, n - 1), ref[i], mn))
             i = j
         else:
             i += 1
-    for t0, t1, ratio, cnt in runs[:6]:
-        tr.note("dt 坍缩 %.0fx（中位 %s -> 最小 %s）@ %s..%s，%d 步"
-                % (ratio, eng_str(med, tr.xunit), eng_str(med / ratio, tr.xunit),
-                   eng_str(t0, tr.xunit), eng_str(t1, tr.xunit), cnt))
-    if len(runs) > 6:
-        tr.note("…另有 %d 段 dt 坍缩未列出" % (len(runs) - 6))
+    quiet, busy, tiny = [], 0, 0
+    for a, b, rf, mn in runs:
+        if b - a + 1 < DT_RUN_MIN:
+            # 两三个点凑得近是栅格拼接痕迹，不是挣扎。挣扎是连着走很多小步
+            tiny += 1
+            continue
+        act = 0.0
+        for s in tr.signals:
+            # 「动没动」要跟**噪声底**比，不能只跟量程比：一条几乎平的通道
+            # 光噪声就能占掉量程的 10%，那不叫动
+            band = max(0.005 * s.rng, 6.0 * s.noise)
+            if band <= 0:
+                continue
+            seg = s.y[a:b + 1]
+            act = max(act, (max(seg) - min(seg)) / band)
+        if act < 1.0:
+            quiet.append((a, b, rf, mn, act))
+        else:
+            busy += 1
+    for a, b, rf, mn, act in quiet[:6]:
+        tr.note("dt 坍缩 %.0fx（附近 %s -> 最小 %s）@ %s..%s，%d 步，"
+                "期间所有信号的变化都没超出噪声带 —— 像是求解器在原地挣扎"
+                % (rf / mn, eng_str(rf, tr.xunit), eng_str(mn, tr.xunit),
+                   eng_str(tr.x[a], tr.xunit), eng_str(tr.x[b + 1], tr.xunit),
+                   b - a + 1))
+    if len(quiet) > 6:
+        tr.note("…另有 %d 段同类 dt 坍缩未列出" % (len(quiet) - 6))
+    if busy or tiny:
+        tr.note("另有 %d 段加密在信号快变处（自适应步长的正常行为）、"
+                "%d 处 2~%d 步的孤立细化（栅格拼接痕迹），都未列出"
+                % (busy, tiny, DT_RUN_MIN - 1))
 
 
 # --------------------------------------------------------------- 预细化
