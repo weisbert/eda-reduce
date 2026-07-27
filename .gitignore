@@ -12,6 +12,15 @@ private/
 *.drawio.bak
 *.dtmp
 
+# 波形：真实数据一律留在仓库外，只放合成样例
+*.csv
+!examples/demo_*.csv
+*.wv
+!examples/demo_*.wv
+*.png
+!examples/demo_*.png
+dist/
+
 __pycache__/
 *.pyc
 .venv/

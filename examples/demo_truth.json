@@ -1,0 +1,137 @@
+{
+ "_note": "\u7531 gen_demo_wave.py \u751f\u6210\uff1b\u89e3\u6790\u5f0f/\u7cbe\u5bc6\u6805\u683c\u7ed9\u51fa\uff0c\u4e0d\u662f\u91cf\u51fa\u6765\u7684",
+ "demo_ac.csv": {
+  "kind": "freq",
+  "signals": {
+   "dB20(V(out))": {
+    "dc_db": -59.99999999956563,
+    "f_3db_hi": 118850222.7437019,
+    "fp": 100000000.0,
+    "fz": 1000000.0,
+    "n": 1081,
+    "peak_db": -10.457140632838126,
+    "peak_f": 100000000.0,
+    "q": 3.0,
+    "xscale": "log"
+   }
+  }
+ },
+ "demo_dirty.csv": {
+  "expect_notes": [
+   "dup",
+   "nonmono",
+   "nan",
+   "inf",
+   "blank",
+   "dt"
+  ],
+  "kept_rows": 10,
+  "raw_rows": 14,
+  "signals": [
+   "V(out)",
+   "I(load)"
+  ],
+  "units": {
+   "I(load)": "A",
+   "V(out)": "V",
+   "time": "s"
+  }
+ },
+ "demo_spec.csv": {
+  "kind": "freq",
+  "signals": {
+   "V(vco_out)": {
+    "carrier_f": 2400000000.0,
+    "carrier_v": 1.0,
+    "df": 1250000.0,
+    "floor_dbc": -120.0,
+    "n": 4001,
+    "spurs": [
+     {
+      "dbc": -67.0,
+      "f": 100000000.0,
+      "f_over_f0": 0.041666666666666664,
+      "v": 0.00044668359215096305
+     },
+     {
+      "dbc": -52.0,
+      "f": 2500000000.0,
+      "f_over_f0": 1.0416666666666667,
+      "v": 0.0025118864315095794
+     },
+     {
+      "dbc": -38.0,
+      "f": 4800000000.0,
+      "f_over_f0": 2.0,
+      "v": 0.012589254117941675
+     }
+    ],
+    "xscale": "lin"
+   }
+  }
+ },
+ "demo_tran.csv": {
+  "dt_collapse_at": 2.5e-07,
+  "kind": "tran",
+  "n": 2545,
+  "signals": {
+   "I(mp0)": {
+    "dc": 0.0009,
+    "mean": 0.0014190801704497395,
+    "rms_ripple": 0.0002067196700929615,
+    "step": 0.0006,
+    "sw_amp": 6e-05
+   },
+   "V(ctrl)": {
+    "duty": 0.4501470189813526,
+    "edge_jitter_rms": 3e-12,
+    "fall_1090": 9.2e-11,
+    "first_rise": 9.998134402489827e-10,
+    "jitter_pp": 1.5636881246270344e-11,
+    "jitter_rms": 3.8181039975404685e-12,
+    "n_cycles": 46,
+    "n_rise": 47,
+    "period": 6.400037198049895e-09,
+    "rise_1090": 8.8e-11,
+    "vhi": 1.2,
+    "vlo": 0.0
+   },
+   "V(vdd_pll)": {
+    "baseline": 0.8,
+    "f_ring": 25000000.0,
+    "glitch_at": 1.2e-07,
+    "glitch_depth": -0.0032,
+    "glitch_fwhm": 2.1e-10,
+    "max": 0.859466953121489,
+    "max_at": 5.9194e-08,
+    "min": 0.7147871908504745,
+    "min_at": 4.099095e-08,
+    "noise_rms": 0.00015,
+    "overshoot_at": 5.9194e-08,
+    "overshoot_pct": 7.433369140186121,
+    "pp": 0.14467976227101453,
+    "settle_1pct": 1.59886e-07,
+    "slew_max": -135063210.73383468,
+    "slew_max_at": 4.049275e-08,
+    "tau_ring": 5e-08
+   },
+   "V(vref)": {
+    "max": 0.6008,
+    "mean": 0.6003999999999999,
+    "min": 0.6
+   }
+  },
+  "t_end": 3e-07,
+  "x_unit": "s",
+  "xscale": "lin"
+ },
+ "demo_tran_layoutb.csv": {
+  "n": [
+   849,
+   364
+  ],
+  "traces": 2
+ },
+ "scale": 1.0,
+ "seed": 20260727
+}
