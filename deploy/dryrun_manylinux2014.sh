@@ -26,7 +26,7 @@ echo "   镜像 : $IMG"
 echo "   包   : $ABS"
 
 docker run --rm --network none -v "$ABS:/in/pkg.tar.gz:ro" "$IMG" bash -euxc '
-    cd /tmp && mkdir -p pkg && tar xzf /in/pkg.tar.gz -C pkg && cd pkg
+    mkdir -p /opt/x && cd /opt/x && tar xzf /in/pkg.tar.gz
 
     # CRLF 闸：黄区是 Windows，.sh 带 \r 到这里就是 bad interpreter
     if grep -rlU $"\r" . >/dev/null 2>&1; then
@@ -36,8 +36,8 @@ docker run --rm --network none -v "$ABS:/in/pkg.tar.gz:ro" "$IMG" bash -euxc '
         exit 1
     fi
 
-    cd /tmp && bash pkg/bootstrap.sh          # 默认装到 /tmp/eda_reduce
-    /tmp/eda_reduce/wave /tmp/eda_reduce/app/examples/demo_ac.csv -o /tmp/a.wv
+    bash bootstrap.sh                         # 就地装（最常见的用法）
+    ./wave app/examples/demo_ac.csv -o /tmp/a.wv
     head -3 /tmp/a.wv
     echo "断网离线安装 + 端到端 OK"
 '

@@ -19,7 +19,7 @@
 | 内容 | wheels + `requirements.lock` + app + `bootstrap.sh` + `update.sh` | 只有 app 源码 + `update.sh` |
 | 体积 | 有几个依赖就多大；**现在依赖为空，几十 KB** | 几十 KB |
 | 什么时候用 | 首次安装、**依赖变了** | 日常改代码（绝大多数时候） |
-| 隔离区上跑 | `bash pkg/bootstrap.sh` | `bash pkg/update.sh` |
+| 隔离区上跑 | 解进一个目录后 `bash bootstrap.sh`（就地装） | 解到别处后 `bash <包>/update.sh <安装目录>` |
 
 > 现在 `requirements.txt` 是空的（`wave_core` / `wave_emit` / `wave_cli` 硬性纯标准库），
 > 所以两种包看起来没差别。**但管道现在就按双包建**——哪天要加 numpy 加速
@@ -100,26 +100,40 @@ python deploy/audit_wheels.py dist/_stage_full/wheels
 
 ## 隔离区：安装与更新
 
+包是 **tarbomb**（顶层直接是 `app/` `bootstrap.sh` `update.sh`
+`MANIFEST.json` `requirements.lock` 五项，没有统一外层目录），
+所以**解进一个你自己建的目录，然后就地装**是最自然的用法：
+
 ```bash
 # 首次
-mkdir -p pkg && tar xzf eda_reduce_full.tar.gz -C pkg
-bash pkg/bootstrap.sh                    # 装到 ./eda_reduce
-
-# 日常
-mkdir -p pkg && tar xzf eda_reduce_incremental.tar.gz -C pkg
-bash pkg/update.sh                       # 更新 ./eda_reduce
+mkdir ~/eda_reduce && cd ~/eda_reduce
+tar xzf /path/to/eda_reduce_full.tar.gz
+bash bootstrap.sh                        # 就装在这儿，app/ 已经就位不用拷
 ```
 
-**装在哪由你定，脚本不替你决定。** 默认是**当前目录下的 `eda_reduce/`**——
-不需要 root，不假定任何目录约定，卸载就是 `rm -rf` 它。想装别处：
+**装在哪由你定，脚本不替你决定**，不需要 root，不假定任何目录约定，
+卸载就是 `rm -rf` 那一个目录。想装别处：
 
 ```bash
-bash pkg/bootstrap.sh ~/tools/wave       # 传参
+bash bootstrap.sh ~/tools/wave           # 传参
 export EDA_REDUCE_PREFIX=~/tools/wave    # 或者设成常态，update.sh 也认
 ```
 
-从**包目录里面**跑会被拦住（`rm -rf $PREFIX/app` 会把源删掉，
-而且 `pkg/` 一删 `results/` 跟着没），报错会告诉你怎么办。
+不传参、又不在包目录里时，默认装到 `./eda_reduce`。
+
+```bash
+# 日常更新：增量包解到**安装目录外面**
+mkdir -p ~/upd && tar xzf /path/to/eda_reduce_incremental.tar.gz -C ~/upd
+bash ~/upd/update.sh ~/eda_reduce
+```
+
+> ⚠️ **增量包不能解进安装目录。** 那样 `app/` 会在备份之前就被新版盖掉，
+> 于是「备份」备的是新的那份，**回滚点静默丢失**——出事时才发现滚不回去。
+> `update.sh` 会拦住并告诉你怎么办。
+>
+> `update.sh` 找安装目录的顺序：`$1` → `$EDA_REDUCE_PREFIX` →
+> `./eda_reduce` → 当前目录本身（要有 `INSTALL.json` + `app/`）。
+> 都找不到会把找过哪些地方列出来，不猜。
 
 **用 `bash xxx.sh` 调，不要 `./xxx.sh`。** 登录 shell 常是 tcsh，
 而且上传通道经常把 exec 位掉了。

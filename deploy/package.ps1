@@ -73,9 +73,11 @@ Get-ChildItem $Out -File | Where-Object { $_.Name -like '*.tar.gz*' } |
 Write-Host ""
 Write-Host "隔离区上（注意用 bash 调，不要 ./）："
 if ($Mode -eq 'full') {
-    Write-Host "  mkdir pkg; tar xzf eda_reduce_full.tar.gz -C pkg; bash pkg/bootstrap.sh"
-    Write-Host "  (默认装到当前目录下的 eda_reduce/，不需要 root;要装别处就把路径传进去)"
+    Write-Host "  mkdir ~/eda_reduce; cd ~/eda_reduce"
+    Write-Host "  tar xzf eda_reduce_full.tar.gz; bash bootstrap.sh"
+    Write-Host "  (就地装，不需要 root。要装别处: bash bootstrap.sh <路径>)"
 } else {
-    Write-Host "  mkdir pkg; tar xzf eda_reduce_incremental.tar.gz -C pkg; bash pkg/update.sh"
-    Write-Host "  (默认更新当前目录下的 eda_reduce/)"
+    Write-Host "  mkdir -p ~/upd; tar xzf eda_reduce_incremental.tar.gz -C ~/upd"
+    Write-Host "  bash ~/upd/update.sh ~/eda_reduce"
+    Write-Host "  (增量包要解到安装目录外面,否则 app/ 会在备份前被盖掉)"
 }

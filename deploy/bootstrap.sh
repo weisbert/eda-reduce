@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# 隔离区首次安装（full 包）。
+# 隔离区首次安装（full 包）。最省事的用法就是**就地装**：
 #
-#     tar xzf eda_reduce_full.tar.gz -C pkg
-#     bash pkg/bootstrap.sh                 # 装到 ./eda_reduce
-#     bash pkg/bootstrap.sh ~/tools/wave    # 或者你指定的任何地方
+#     mkdir ~/eda_reduce && cd ~/eda_reduce
+#     tar xzf .../eda_reduce_full.tar.gz    # 包是 tarbomb，顶层就是 app/ 等五项
+#     bash bootstrap.sh                     # 就装在这儿，app/ 已经就位不用拷
 #
-# **默认装在当前目录下的 eda_reduce/**，不需要 root，不假定任何目录约定。
-# 想固定到别处就传参，或者设 EDA_REDUCE_PREFIX。
+# 也可以装到别处：
+#
+#     bash bootstrap.sh ~/tools/wave        # 传参
+#     EDA_REDUCE_PREFIX=~/tools/wave bash bootstrap.sh
+#
+# 不传参且当前目录不是包目录时，默认装到 ./eda_reduce。
+# **不需要 root，不假定任何目录约定**，卸载就是 rm -rf 那一个目录。
 #
 # **用 `bash xxx.sh` 调，不要 `./xxx.sh`** —— 登录 shell 常是 tcsh，
 # 而且上传通道经常把 exec 位掉了。
@@ -21,24 +26,34 @@
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PREFIX="${1:-${EDA_REDUCE_PREFIX:-$PWD/eda_reduce}}"
+# 人站在包目录里不传参，意思显然是「就装这儿」，不是「在这儿再套一层」
+if [ -z "${1:-}" ] && [ -z "${EDA_REDUCE_PREFIX:-}" ] \
+   && [ "$(pwd -P)" = "$HERE" ]; then
+    PREFIX="$HERE"
+else
+    PREFIX="${1:-${EDA_REDUCE_PREFIX:-$PWD/eda_reduce}}"
+fi
 mkdir -p "$PREFIX"
 PREFIX="$(cd "$PREFIX" && pwd)"          # 转成绝对路径，后面全都不含糊
 
-# 装到包目录里面去会自己吃自己：rm -rf $PREFIX/app 会删掉源，cp 就没得拷了。
-# 而且 pkg/ 一删，results/ 跟着没。
-case "$PREFIX" in
-    "$HERE"|"$HERE"/*)
-        echo "错误：安装目录 $PREFIX 在包目录 $HERE 里面。"
-        echo "      先 cd 出来再跑，或者显式指定一个位置："
-        echo "        cd .. && bash $(basename "$HERE")/bootstrap.sh"
-        echo "        bash $0 ~/tools/wave"
-        exit 1 ;;
-esac
+INPLACE=0
+if [ "$PREFIX" = "$HERE" ]; then
+    INPLACE=1                            # 包解在哪就装在哪，app/ 已经就位
+else
+    # 装到包目录**下面**去会自己吃自己：rm -rf $PREFIX/app 会删掉源，
+    # cp 就没得拷了。而且外层一删，results/ 跟着没。
+    case "$PREFIX" in
+        "$HERE"/*)
+            echo "错误：安装目录 $PREFIX 在包目录 $HERE 里面（又不等于它）。"
+            echo "      要就地装就在包目录里直接 bash bootstrap.sh；"
+            echo "      要装别处就给一个包目录外面的路径。"
+            exit 1 ;;
+    esac
+fi
 
 echo "== eda-reduce 首次安装 =="
 echo "   包目录 : $HERE"
-echo "   安装到 : $PREFIX"
+echo "   安装到 : $PREFIX$([ "$INPLACE" = "1" ] && echo "   （就地）")"
 
 [ -f "$HERE/MANIFEST.json" ] || { echo "错误：这不像一个 full 包（缺 MANIFEST.json）"; exit 1; }
 mode="$(grep -o '"mode"[^,]*' "$HERE/MANIFEST.json" | sed 's/.*: *"//; s/"//')"
@@ -86,9 +101,13 @@ else
     echo "      包里没有轮子（依赖为空）—— 纯标准库，跳过 pip"
 fi
 
-echo "[3/5] 铺 app/ …"
-rm -rf "$PREFIX/app"
-cp -r "$HERE/app" "$PREFIX/app"
+if [ "$INPLACE" = "1" ]; then
+    echo "[3/5] app/ 就地使用（包解在安装目录里，不用拷）…"
+else
+    echo "[3/5] 铺 app/ …"
+    rm -rf "$PREFIX/app"
+    cp -r "$HERE/app" "$PREFIX/app"
+fi
 mkdir -p "$PREFIX/results" "$PREFIX/.backups"
 ln -sfn "$PREFIX/results" "$PREFIX/app/results"
 

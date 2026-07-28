@@ -47,12 +47,13 @@ class TestNoHardcodedInstallPath(unittest.TestCase):
                         bad.append("%s:%d" % (f, i))
         self.assertEqual(bad, [], "deploy/ 里还有写死的绝对安装路径: %s" % bad)
 
-    def test_default_prefix_is_cwd(self):
+    def test_prefix_resolution_is_explicit(self):
+        """安装位置的来源必须是这三个，而且顺序固定：参数 > 环境变量 > 当前目录。"""
         for f in ("bootstrap.sh", "update.sh"):
             with open(os.path.join(ROOT, "deploy", f), encoding="utf-8") as fh:
                 src = fh.read()
-            self.assertIn('${1:-${EDA_REDUCE_PREFIX:-$PWD/eda_reduce}}', src,
-                          "%s 的默认前缀应当是当前目录下的 eda_reduce/" % f)
+            for token in ("EDA_REDUCE_PREFIX", "$PWD/eda_reduce"):
+                self.assertIn(token, src, "%s 少了 %s" % (f, token))
 
 
 @unittest.skipUnless(BASH and HAS_GIT, "需要 bash + git 仓库")
@@ -122,12 +123,73 @@ class TestPackageAndInstall(unittest.TestCase):
         # 冒烟测试跑的是真实压缩，结果要和仓库基线一致
         self.assertIn("2545 -> 585", out, "端到端结果和基线对不上\n" + out)
 
-    def test_refuses_to_install_inside_package_dir(self):
-        """装进包目录会自己吃自己：rm -rf $PREFIX/app 把源删了，cp 就没得拷。"""
-        r = sh([BASH, "bootstrap.sh"], cwd=self.pkg)
+    def test_in_place_install(self):
+        """包是 tarbomb，「解进自己建的目录然后就地装」才是最自然的用法。
+
+        这时 app/ 已经在位，不用拷 —— 拷反而会自己吃自己
+        （rm -rf $PREFIX/app 把源删了）。
+        """
+        home = os.path.join(self.tmp, "inplace", "eda_reduce")
+        os.makedirs(home)
+        subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
+        r = sh([BASH, "bootstrap.sh"], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("就地", out)
+        self.assertFalse(os.path.exists(os.path.join(home, "eda_reduce")),
+                         "不该在里面再套一层")
+        for sub in ("app", "results", "INSTALL.json", "wave", ".backups"):
+            self.assertTrue(os.path.exists(os.path.join(home, sub)), sub)
+        self.assertIn("2545 -> 585", out, "就地装出来的结果也得对")
+        r = sh([BASH, os.path.join(home, "wave"), "--list-kinds"], cwd=home)
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+
+    def test_refuses_nested_install_inside_package_dir(self):
+        """装到包目录**下面**（不等于它）才是自己吃自己，要拦。"""
+        r = sh([BASH, "bootstrap.sh", os.path.join(self.pkg, "sub")],
+               cwd=self.pkg)
         out = r.stdout.decode("utf-8", "replace")
         self.assertNotEqual(r.returncode, 0, "应当拒绝: " + out)
         self.assertIn("在包目录", out)
+
+    def test_incremental_must_not_be_extracted_into_install_dir(self):
+        """增量包解进安装目录 = app/ 在备份前就被盖掉，回滚点静默丢失。"""
+        home = os.path.join(self.tmp, "clobber", "eda_reduce")
+        os.makedirs(home)
+        subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
+        self.assertEqual(sh([BASH, "bootstrap.sh"], cwd=home).returncode, 0)
+        r = sh([sys.executable, os.path.join(ROOT, "deploy", "package.py"),
+                "incremental", "--out", self.dist])
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+        subprocess.check_call(
+            ["tar", "xzf", os.path.join(self.dist,
+                                        "eda_reduce_incremental.tar.gz"),
+             "-C", home])
+        r = sh([BASH, "update.sh"], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(r.returncode, 0, "必须拒绝: " + out)
+        self.assertIn("回滚点", out, "要说清为什么不能继续")
+        self.assertIn(".backups", out, "要告诉人怎么救")
+
+    def test_update_finds_install_when_run_from_inside_it(self):
+        """人站在装好的目录里跑 update，不该还要求他打路径。"""
+        home = os.path.join(self.tmp, "fromin", "eda_reduce")
+        os.makedirs(home)
+        subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
+        self.assertEqual(sh([BASH, "bootstrap.sh"], cwd=home).returncode, 0)
+        ipkg = os.path.join(self.tmp, "fromin", "upd")
+        os.makedirs(ipkg, exist_ok=True)
+        r = sh([sys.executable, os.path.join(ROOT, "deploy", "package.py"),
+                "incremental", "--out", self.dist])
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+        subprocess.check_call(
+            ["tar", "xzf", os.path.join(self.dist,
+                                        "eda_reduce_incremental.tar.gz"),
+             "-C", ipkg])
+        r = sh([BASH, os.path.join(ipkg, "update.sh")], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("更新完成", out)
 
     def test_explicit_prefix_and_env_var(self):
         home = os.path.join(self.tmp, "h2")

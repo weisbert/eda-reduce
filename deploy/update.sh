@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # 隔离区增量更新（incremental 包）：只换 app/ 源码，复用 .venv + wheels。
 #
-#     tar xzf eda_reduce_incremental.tar.gz -C pkg
-#     bash pkg/update.sh                  # 更新 ./eda_reduce
-#     bash pkg/update.sh ~/tools/wave     # 或者你当初装的那个位置
+#     mkdir -p ~/upd && tar xzf eda_reduce_incremental.tar.gz -C ~/upd
+#     bash ~/upd/update.sh ~/eda_reduce
 #
-# 默认找当前目录下的 eda_reduce/，也认 EDA_REDUCE_PREFIX。找不到会把
-# 找过哪些地方列出来，不猜。
+# **增量包不能解进安装目录**：app/ 会在备份之前就被新版盖掉，于是「备份」
+# 备的是新的那份，回滚点静默丢失。脚本会拦住。
+#
+# 找安装目录的顺序：$1 > $EDA_REDUCE_PREFIX > ./eda_reduce > 当前目录本身
+# （要有 INSTALL.json + app/）。都找不到会把找过哪些地方列出来，不猜。
 #
 # **用 `bash xxx.sh` 调，不要 `./xxx.sh`**（登录 shell 常是 tcsh，
 # 上传通道可能掉 exec 位）。
@@ -21,20 +23,45 @@
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PREFIX="${1:-${EDA_REDUCE_PREFIX:-$PWD/eda_reduce}}"
 KEEP=3
 
 echo "== eda-reduce 增量更新 =="
 [ -f "$HERE/MANIFEST.json" ] || { echo "错误：缺 MANIFEST.json"; exit 1; }
+
+# 找安装目录：显式参数 > 环境变量 > ./eda_reduce > 当前目录本身
+PREFIX="${1:-${EDA_REDUCE_PREFIX:-}}"
+if [ -z "$PREFIX" ]; then
+    if [ -f "$PWD/eda_reduce/INSTALL.json" ]; then
+        PREFIX="$PWD/eda_reduce"
+    elif [ -f "$PWD/INSTALL.json" ] && [ -d "$PWD/app" ]; then
+        PREFIX="$PWD"                    # 人就站在装好的那个目录里
+    else
+        PREFIX="$PWD/eda_reduce"
+    fi
+fi
 if [ ! -d "$PREFIX/app" ]; then
     echo "错误：$PREFIX 下没有已安装的 app/。"
     echo "      找过：\$1=${1:-（没给）}  \$EDA_REDUCE_PREFIX=${EDA_REDUCE_PREFIX:-（没设）}"
     echo "            \$PWD/eda_reduce=$PWD/eda_reduce"
+    echo "            \$PWD=$PWD（要有 INSTALL.json + app/ 才算）"
     echo "      装在别处就把路径传进来：bash $0 <你的安装目录>"
     echo "      从没装过就先用 full 包跑 bootstrap.sh"
     exit 1
 fi
 PREFIX="$(cd "$PREFIX" && pwd)"
+
+# 增量包**不能**解进安装目录：app/ 会在备份之前就被新版覆盖，
+# 于是「备份」备的是新的那份，回滚点静默丢失 —— 出事时才发现滚不回去。
+if [ "$PREFIX" = "$HERE" ]; then
+    echo "错误：增量包解在安装目录里了（$HERE）。"
+    echo "      app/ 已经被包里的新版盖掉，这时候再备份，备的是新的那份，"
+    echo "      回滚点就没了。**不能继续。**"
+    echo "      正确做法：把增量包解到别处再跑 ——"
+    echo "        mkdir -p ../upd && tar xzf eda_reduce_incremental.tar.gz -C ../upd"
+    echo "        bash ../upd/update.sh \"$PREFIX\""
+    echo "      如果 app/ 已经被盖了，从 $PREFIX/.backups/ 里挑一份滚回去再重来。"
+    exit 1
+fi
 
 _get() { grep -o "\"$2\"[^,]*" "$1" | head -1 | sed 's/.*: *"//; s/"//'; }
 
