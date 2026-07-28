@@ -551,9 +551,11 @@ class WaveGui(object):
                 "✓" if self.nbytes <= b else "✗ 超预算")
         else:
             fit = "%.1f KB（预算不限）" % (self.nbytes / 1024.0)
+        # 输入本身不可信的话，别的读数说得再准也没意义 —— WARN 顶到最前面
+        head = ("!! %s" % tr.warns[0].split("。")[0]) if tr.warns else ""
         self.status.set(
-            "%d 点  │  输出 %s │  %s  │  RDP %.0f ms  │  %s"
-            % (len(self.red.kept), fit,
+            "%s%d 点  │  输出 %s │  %s  │  RDP %.0f ms  │  %s"
+            % (head and head + "  │  ", len(self.red.kept), fit,
                ("max|err| %s (%.2f%%) rms %s  [%s]"
                 % (core.eng_str(w.maxerr, w.sig.unit, 3), w.pct,
                    core.eng_str(w.rms, w.sig.unit, 3), w.sig.name))

@@ -67,6 +67,7 @@ NOISE_K = 3.0                # eps 不低于 NOISE_K 倍噪声底：追噪声是
 MAX_CAND = 20000             # 预细化的候选点上限，GUI 的交互全在这个集合上做
 DT_COLLAPSE = 50.0           # dt 相对附近粗尺度塌掉这么多倍才看一眼
 DT_RUN_MIN = 4               # 连着这么多小步才算「挣扎」，两三步是栅格拼接痕迹
+DROP_WARN_FRAC = 0.01        # 丢掉的行超过这个比例就报 WARN，不再只写 note
 
 
 # --------------------------------------------------------------- 数值小工具
@@ -162,8 +163,8 @@ class Trace(object):
     """一列 x + 共享这列 x 的若干列 y。布局 B 会拆出多个 Trace。"""
 
     __slots__ = ("source", "xname", "xunit", "xunit_src", "x", "signals",
-                 "kind", "kind_src", "xscale", "notes", "dt_med", "dt_min",
-                 "dt_max", "index")
+                 "kind", "kind_src", "xscale", "notes", "warns", "dt_med",
+                 "dt_min", "dt_max", "index")
 
     def __init__(self, xname="x", index=0):
         self.source = ""
@@ -176,6 +177,7 @@ class Trace(object):
         self.kind_src = "unknown"
         self.xscale = "lin"
         self.notes = []
+        self.warns = []
         self.dt_med = self.dt_min = self.dt_max = 0.0
         self.index = index
 
@@ -185,6 +187,16 @@ class Trace(object):
     def note(self, msg):
         if msg not in self.notes:          # 重跑 set_eps/predecimate 不该刷屏
             self.notes.append(msg)
+
+    def warn(self, msg):
+        """比 note 高一级：**输入本身不足以支撑下面的数**。
+
+        note 是「我做了什么」，warn 是「你手上这份数据别照着往下推」。
+        分开是因为 note 有十几条，重要的那条埋在里面等于没说 ——
+        72% 的行被丢掉只写进 note，人就会拿着废数据往下分析。
+        """
+        if msg not in self.warns:
+            self.warns.append(msg)
 
     def __repr__(self):
         return "<Trace %s n=%d sig=%d kind=%s>" % (
@@ -479,21 +491,45 @@ def parse_csv(path, layout="auto", xcols=None, text=None):
     return traces
 
 
+def _sig_digits(s):
+    """'1.6377e-06' -> 5。数的是**写下来的**有效数字位数。
+
+    用来判「x 列是不是按有效数字导出的」。`%g` 会把尾零去掉，所以单看一行会低估，
+    取一批行的**最大值**才是导出精度。
+    """
+    s = s.strip().strip('"').strip().lstrip("+-")
+    for sep in ("e", "E"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+            break
+    s = s.replace(".", "").lstrip("0").rstrip("0")
+    return len(s)
+
+
 def _fill_trace(tr, rows, xi, yidx):
     x = tr.x
     ys = [s.y for s in tr.signals]
     n_blank = [0] * len(yidx)
-    n_nan = n_inf = n_dup = n_nonmono = n_badx = 0
+    n_nan = n_inf = n_dup = n_nonmono = n_badx = n_noxcell = 0
+    n_rows = 0
+    x_digits = 0
     last = None
     dec_votes = 0
     prev_raw = None
 
-    for r in rows:
+    for ri, r in enumerate(rows):
+        n_rows += 1
         if xi >= len(r):
+            n_noxcell += 1
             continue
         c = r[xi].strip().strip('"').strip()
         if not c:
+            n_noxcell += 1
             continue
+        if not (ri & 63):                  # 抽 1/64 行估导出精度，全量算是白花钱
+            d = _sig_digits(c)
+            if d > x_digits:
+                x_digits = d
         try:
             xv = float(c)
         except ValueError:
@@ -582,6 +618,53 @@ def _fill_trace(tr, rows, xi, yidx):
         tr.note("NaN 单元 %d 个" % n_nan)
     if n_inf:
         tr.note("inf 单元 %d 个" % n_inf)
+    _warn_on_drops(tr, n_rows, n_dup, n_nonmono, n_badx, n_noxcell, x_digits)
+
+
+def _warn_on_drops(tr, n_rows, n_dup, n_nonmono, n_badx, n_noxcell, x_digits):
+    """丢掉的行占比过高就**大声说**，并且尽量说清成因和怎么修。
+
+    这条闸门是拿真实文件换来的：一份 423153 行的 ViVA 导出里 72% 是重复时间戳
+    （x 列只有 5 位有效数字，t≈1.6 µs 处分辨率只剩 100 ps，而求解器步长约 5 ps），
+    工具照规则「重复点保留第一个」，等于把 5 GHz 的振荡按 10 GS/s 抽了样 ——
+    混叠出来的拍频包络看着特别像真实的起振包络。当时这件事只写进了一条 note，
+    人就拿着废数据往下分析了。北极星那条「丢一个模型需要的数就是失败」说的正是这个。
+    """
+    dropped = n_dup + n_nonmono + n_badx + n_noxcell
+    if not n_rows or dropped <= DROP_WARN_FRAC * n_rows:
+        return
+    kept = len(tr.x)
+    bits = []
+    for n, what in ((n_dup, "重复时间戳"), (n_nonmono, "非单调"),
+                    (n_badx, "x 无法解析"), (n_noxcell, "x 单元为空")):
+        if n:
+            bits.append("%s %d" % (what, n))
+    tr.warn("原始 %d 行里丢了 %d 行（%.1f%%：%s），只有 %d 个点进了下面的分析。"
+            % (n_rows, dropped, 100.0 * dropped / n_rows, "、".join(bits), kept))
+    if n_dup <= DROP_WARN_FRAC * n_rows:
+        return
+    # 重复时间戳占大头 —— 这几乎总是导出精度的锅，而且是**可判定**的：
+    # x 列写下来只有 N 位有效数字，末位就是那一带的时间分辨率。
+    quant = step = 0.0
+    top = max(abs(tr.x[0]), abs(tr.x[-1])) if len(tr.x) >= 2 else 0.0
+    if 0 < x_digits <= 9 and top > 0:
+        quant = 10.0 ** (math.floor(math.log10(top)) - x_digits + 1)
+        step = (tr.x[-1] - tr.x[0]) / float(max(1, n_rows - 1))
+    # 抽样比要报**最坏那一带**的，不是全文件平均：分辨率随 |x| 变粗，
+    # 平均值会把末段 20:1 的伤害稀释成 4:1，读的人就低估了
+    if quant > 0 and step > 0:
+        ratio, where = quant / step, "%s 那一带" % eng_str(top, tr.xunit, 2)
+    else:
+        ratio, where = n_rows / float(max(1, kept)), "平均"
+    tr.warn("重复的那部分等于把波形抽了样（%s约 %.0f:1），**高频内容会混叠**："
+            "抽样后冒出来的拍频包络看着很像真实的起振/幅度包络，别照着它下结论。"
+            % (where, ratio))
+    if quant > 0:
+        tr.warn("成因在导出侧：x 列最多只有 %d 位有效数字，%s 处的时间分辨率"
+                "只有 %s，而平均步长约 %s。重导时把 CSV 的精度调到 12 位以上"
+                "（OCEAN: ocnPrint ... ?precision 12），这几行消失就是修好了。"
+                % (x_digits, eng_str(top, tr.xunit, 2),
+                   eng_str(quant, tr.xunit, 3), eng_str(step, tr.xunit, 3)))
 
 
 def _all_nan(a):

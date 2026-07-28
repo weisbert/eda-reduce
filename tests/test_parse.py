@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """解析层。每一条都对应 wave-spec 第 6 节里点名「会咬人」的东西。"""
 
+import math
 import unittest
 
 import _common as C
@@ -126,6 +127,65 @@ class TestViVAXY(unittest.TestCase):
         core.analyze(tr)
         self.assertEqual([s.name for s in tr.signals], ["V(out)"])
         self.assertEqual(len(tr.x), 4)
+
+
+class TestDropWarning(unittest.TestCase):
+    """大面积丢行必须**大声说**，不能只写进 note。
+
+    真实教训（2026-07-28）：一份 423153 行的 ViVA 导出里 72% 是重复时间戳
+    （x 列只有 5 位有效数字），工具按规则「重复保留第一个」，等于把 5 GHz 的
+    振荡按 10 GS/s 抽了样。混叠出来的拍频包络看着就像真实的起振包络，
+    而这件事当时只在一条 note 里提了一句。
+    """
+
+    def _five_digit_export(self, n=4000, dt=4.7e-12):
+        rows = ["v /x; tran (V) X,v /x; tran (V) Y"]
+        for i in range(n):
+            t = i * dt
+            rows.append("%.5g,%.6g"                       # ViVA 默认 5 位有效数字
+                        % (t + 1.5e-6, 0.3 + 0.25 * math.sin(2e10 * t)))
+        return "\n".join(rows) + "\n"
+
+    def test_duplicate_flood_warns(self):
+        tr = core.parse_csv("<t>", text=self._five_digit_export())[0]
+        core.analyze(tr)
+        self.assertTrue(tr.warns, "72% 的行被丢掉，一条 WARN 都没有")
+        all_w = " ".join(tr.warns)
+        self.assertIn("混叠", all_w, "得说清后果，不能只报个数")
+        self.assertIn("有效数字", all_w, "得说清成因")
+        self.assertIn("12 位", all_w, "得说清怎么修")
+
+    def test_clean_export_has_no_warning(self):
+        """验收标准就是这条：精度够了 WARN 就该消失。"""
+        rows = ["v /x; tran (V) X,v /x; tran (V) Y"]
+        for i in range(4000):
+            t = 1.5e-6 + i * 4.7e-12
+            rows.append("%.12g,%.6g" % (t, 0.3 + 0.25 * math.sin(2e10 * i)))
+        tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+        core.analyze(tr)
+        self.assertEqual(tr.warns, [], "干净的文件不许报警")
+        self.assertEqual(len(tr.x), 4000)
+
+    def test_a_few_duplicates_stay_a_note(self):
+        """零星几个重复点是求解器的正常行为，报警会变成狼来了。"""
+        rows = ["time,V(o)"]
+        for i in range(500):
+            rows.append("%.12g,%.6g" % (i * 1e-9, 0.5 + 0.001 * i))
+        rows.insert(200, rows[200])                      # 就重复一个
+        tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+        core.analyze(tr)
+        self.assertEqual(tr.warns, [], "0.2% 的重复不该报警")
+        self.assertTrue(any("重复 x" in n for n in tr.notes), "但要留个 note")
+
+    def test_sig_digits_counts_what_was_written(self):
+        self.assertEqual(core._sig_digits("1.6377e-06"), 5)
+        self.assertEqual(core._sig_digits("0.00076333"), 5)
+        # 尾零不算：`%g` 本来就把它们去掉了，算进去会把 1.000000 判成 7 位。
+        # 导出精度取一批行的最大值，个别行短一点不影响
+        self.assertEqual(core._sig_digits("1.500000000000e-06"), 2)
+        self.assertEqual(core._sig_digits("1.234567890123e-06"), 13)
+        self.assertEqual(core._sig_digits("-3e-13"), 1)
+        self.assertEqual(core._sig_digits("0"), 0)
 
 
 class TestParseFailure(unittest.TestCase):

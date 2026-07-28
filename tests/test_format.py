@@ -7,6 +7,8 @@
 """
 
 import ast
+import io
+import math
 import os
 import sys
 import unittest
@@ -231,10 +233,42 @@ class TestWvContract(unittest.TestCase):
         self.assertTrue(self.lines[0].startswith("# WV1  tran  demo_tran"))
 
     def test_second_line_is_the_self_check(self):
-        """头部第二行是自检 —— 这是读 .wv 时第一个该看的东西。"""
+        """头部第二行起是自检 —— 读 .wv 时第一个该看的东西。
+
+        干净的输入上就是 `# recon:`；输入本身有问题时 `# WARN:` 插在它前面，
+        见 `test_warn_outranks_the_self_check`。
+        """
         self.assertTrue(self.lines[1].startswith("# recon:"))
         for k in ("max|err|", "% of range", "rms", "worst"):
             self.assertIn(k, self.lines[1])
+
+    def test_warn_outranks_the_self_check(self):
+        """输入撑不住时 WARN 排在 recon 前面。
+
+        recon 说的是「我压得准不准」，WARN 说的是「你这份输入根本不能用」。
+        后者更靠前一步 —— 一份 72% 的行被丢掉的文件，压得再准也没有意义。
+        """
+        import tempfile
+        rows = ["time,V(o)"]
+        for i in range(3000):                  # 5 位有效数字 -> 时间戳大面积重复
+            rows.append("%.5g,%.6g"
+                        % (1.5e-6 + i * 4.7e-12, 0.3 + 0.25 * math.sin(0.7 * i)))
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
+            _, txt = C.run_cli([path])
+            lines = txt.splitlines()
+            self.assertTrue(lines[1].startswith("# WARN:"), "\n".join(lines[:6]))
+            self.assertTrue(any(ln.startswith("# recon:") for ln in lines),
+                            "WARN 不该把 recon 挤掉")
+            self.assertLess([i for i, ln in enumerate(lines)
+                             if ln.startswith("# WARN:")][0],
+                            [i for i, ln in enumerate(lines)
+                             if ln.startswith("# recon:")][0])
+        finally:
+            os.unlink(path)
 
     def test_sections_present_and_marked_at_line_start(self):
         starts = [ln for ln in self.lines if ln.startswith("[")]

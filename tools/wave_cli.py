@@ -213,6 +213,11 @@ def main(argv=None):
     else:
         sys.stdout.write(result)
 
+    # WARN 也吼到 stderr：人跑完命令看的是终端，不会先去翻 .wv 头
+    for tr, _ in allinfo:
+        for wmsg in tr.warns:
+            sys.stderr.write("\n!! WARN [%s] %s\n" % (tr.source, wmsg))
+
     total = sum(os.path.getsize(p) for p in args.infile)
     outb = emit.nbytes(result)
     sys.stderr.write("\n---- %d -> %d bytes (%.0fx)  预算 %s\n"

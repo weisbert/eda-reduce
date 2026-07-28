@@ -176,6 +176,32 @@ class TestTranMetrics(unittest.TestCase):
         self.assertIn("共", tot[0].detail)
 
 
+class TestWidthHonesty(unittest.TestCase):
+    """`width 0 s` 是个不存在的物理量，不许打出来。
+
+    读的人（尤其是模型）会把它当成「一个无限陡的真实跳变」写进结论，
+    而它实际说的是「这个栅格解不出它的宽度」—— 那是该回去重导数据的信号。
+    真实文件上见过一次：`glitch1 -504.9 mV @ 1.691 us (width 0 s)`。
+    """
+
+    def setUp(self):
+        import wave_metrics_tran
+        self.f = wave_metrics_tran._width_txt
+
+    def test_measurable_width_prints_the_number(self):
+        self.assertEqual(self.f({"width": 2e-10, "dtl": 1e-10}, "s"), "200 ps")
+
+    def test_zero_width_prints_below_the_sample_spacing(self):
+        t = self.f({"width": 0.0, "dtl": 1e-10}, "s")
+        self.assertTrue(t.startswith("< 100 ps"), t)
+        self.assertNotIn("0 s", t)
+
+    def test_zero_width_without_spacing_still_refuses_to_print_zero(self):
+        t = self.f({"width": 0.0, "dtl": 0.0}, "s")
+        self.assertNotIn("0 s", t)
+        self.assertIn("解不出", t)
+
+
 class TestFreqSpectrum(unittest.TestCase):
     """spur 保护是 LOCKED 规则（wave-spec 第 4 节）。
 

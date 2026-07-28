@@ -9,7 +9,7 @@ wave_emit.py — `.wv` 三段格式 + 分析类型（kind）注册表。
                            丢了不可逆。别去 SHAPE 里量数。
     [SHAPE]                **降精度的形状**。量化过，只用来看走势。
 
-头部第二行是**自检**：输出声明自己的不确定度。等价于 `.ckt` 末尾那段推断标注——
+头部第二行起是**自检**：输出声明自己的不确定度。等价于 `.ckt` 末尾那段推断标注——
 先看那一行，再决定信不信下面的曲线。
 
 注册表：`register("tran", TranMetrics)`。加一种分析类型 = 加一个文件 + 一行注册，
@@ -228,6 +228,10 @@ def header(red, metrics=None, extra=None):
     out.append("# %s  %s  %s  %d sig  %s %s  %d -> %d pts (%.1fx)"
                % (WV_VERSION, tr.kind, _stem(tr), len(tr.signals), tr.xname,
                   eng_range(tr.x[0], tr.x[-1], tr.xunit), nin, nout, red.ratio))
+    # WARN 排在 recon 前面：recon 说的是「我压得准不准」，WARN 说的是
+    # 「你这份输入根本撑不住下面的数」。后者更靠前一步，先看。
+    for n in tr.warns:
+        out.append("# WARN: " + n)
     w = red.worst
     if w is not None:
         tail = ""

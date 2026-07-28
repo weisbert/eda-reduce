@@ -444,9 +444,13 @@ class TranMetrics(wave_emit.Metrics):
             pk = max(g, key=lambda k: abs(best[k][0]))
             d, m, w = best[pk]
             t, _ = _refine_peak(x, y, pk)
+            # 本地采样间隔：宽度量不出来时报的是「< 这个数」而不是 0。
+            # 宽度为 0 的跳变不是物理量，是「只落到了一个采样点上」。
+            dtl = min([x[k] - x[k - 1] for k in (pk, pk + 1)
+                       if 0 < k < n] or [0.0])
             st.glitches.append({
                 "at": t, "depth": d, "width": self._fwhm(x, y, pk, d, w),
-                "ratio": abs(d) / sigma, "win": w, "i": pk,
+                "ratio": abs(d) / sigma, "win": w, "i": pk, "dtl": dtl,
             })
             for k in (pk - m, pk, pk + m):       # 峰和两侧肩点都得留住
                 if 0 <= k < n:
@@ -560,7 +564,7 @@ class TranMetrics(wave_emit.Metrics):
                 out.append(wave_emit.Metric(
                     c, "glitch%d" % (k + 1), gl["depth"], u, gl["at"], "glitch",
                     note="width %s, %.1fx 噪声底, 窗口 %s"
-                         % (eng_str(gl["width"], tr.xunit, 3), gl["ratio"],
+                         % (_width_txt(gl, tr.xunit), gl["ratio"],
                             eng_str(gl["win"], tr.xunit, 2))))
         return out
 
@@ -615,8 +619,23 @@ class TranMetrics(wave_emit.Metrics):
                     gl["at"], c, "GLITCH",
                     "%s, %.1fx 噪声底, width %s"
                     % (eng_str(gl["depth"], u, 4), gl["ratio"],
-                       eng_str(gl["width"], tr.xunit, 3))))
+                       _width_txt(gl, tr.xunit))))
         return out
+
+
+def _width_txt(gl, xunit):
+    """半高宽量不出来时报 `< 该处采样间隔`，**不报 `0 s`**。
+
+    宽度为 0 的跳变不是物理量。读的人（尤其是模型）会把 `width 0 s` 当成
+    「一个无限陡的真实跳变」，而它实际说的是「相邻采样点里没有一个落在半高以上，
+    这个栅格解不出它的宽度」。后者是**该回去把数据重导一遍**的信号，
+    前者会被当成电路特性写进结论。
+    """
+    if gl["width"] > 0:
+        return eng_str(gl["width"], xunit, 3)
+    if gl.get("dtl"):
+        return "< %s（该处采样解不出宽度）" % eng_str(gl["dtl"], xunit, 3)
+    return "该处采样解不出宽度"
 
 
 def _rate(v, yu, xu):
