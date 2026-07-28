@@ -51,6 +51,10 @@ BAND_COLS = 1200          # 灰带的像素列数上限
 MAX_SEG = 4000            # Canvas 线段总数上限，多路信号时按它反推列数
 ERR_PTS = 1500            # 误差曲线画多少点（拖动时用抽样，松手再算精确的）
 PRECISE_MS = 250          # 松手多久之后算精确误差
+ZOOM_STEP = 0.8           # 滚一格视窗缩到 0.8 倍（反向就是 1/0.8）
+MIN_VIEW_PTS = 4          # 视窗里至少还剩这么多原始点，再放大就没东西可看了
+PAN_KEY_FRAC = 0.15       # 方向键一次平移视窗宽度的百分之几
+Y_EPS_FLOOR = 2.0         # 纵轴半宽的下限 = 这么多倍 eps，见 _yscale
 COLORS = ("#e01b24", "#1c71d8", "#2ec27e", "#e5a50a", "#9141ac", "#c64600")
 BG = "#ffffff"
 FG = "#1a1a1a"
@@ -185,6 +189,10 @@ class WaveGui(object):
         self.band_key = None
         self._precise_job = None
         self._sel = None
+        self._pan = None
+        # 纵轴默认跟视窗：放大就是为了看细节，按全局量程画的话横轴放大了、
+        # 纵向还是一条压平的直线，等于没放大
+        self.y_local = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="载入中…")
         self.prog = tk.DoubleVar(value=0.0)
         self.tol_v = tk.DoubleVar(value=(args.tol or core.DEFAULT_TOL) * 1000.0)
@@ -263,6 +271,9 @@ class WaveGui(object):
         tk.Checkbutton(fb, text="强制保留 spur/事件", variable=self.force_metrics,
                        bg=BG, fg=FG, selectcolor=BG,
                        command=self._recompute).pack(anchor="w")
+        tk.Checkbutton(fb, text="纵轴跟视窗", variable=self.y_local,
+                       bg=BG, fg=FG, selectcolor=BG,
+                       command=self._redraw).pack(anchor="w")
 
         # 下窗格的工具条。**复制到剪贴板**是这里最重要的一个按钮：
         # .wv 的归宿就是粘进聊天框，「先另存成文件、再打开、再全选、再复制」
@@ -298,6 +309,19 @@ class WaveGui(object):
         self.c_wave.bind("<B1-Motion>", self._sel_move)
         self.c_wave.bind("<ButtonRelease-1>", self._sel_end)
         self.c_wave.bind("<Double-Button-1>", lambda e: self._zoom_all())
+
+        # 滚轮绑在 root 上再按指针位置分派：Windows 的 <MouseWheel> 发给**有焦点的**
+        # 控件而不是指针底下那个，绑在画布上会时灵时不灵。X11 没有 MouseWheel，
+        # 滚轮是 Button-4/5 —— 隔离区是 Linux+X11，两套都得绑（本机只测得到前一套）。
+        r.bind_all("<MouseWheel>", self._wheel)
+        r.bind_all("<Button-4>", lambda e: self._wheel(e, 1))
+        r.bind_all("<Button-5>", lambda e: self._wheel(e, -1))
+        for c in (self.c_wave, self.c_err):
+            for b in (2, 3):                       # 中键/右键拖 = 平移
+                c.bind("<ButtonPress-%d>" % b, self._pan_start)
+                c.bind("<B%d-Motion>" % b, self._pan_move)
+                c.bind("<ButtonRelease-%d>" % b, self._pan_end)
+        r.bind("<Key>", self._key)
 
     # ------------------------------------------------------------ 载入
 
@@ -569,6 +593,95 @@ class WaveGui(object):
         self.band = None
         self._redraw()
 
+    def _set_view(self, x0, x1):
+        """夹进整条曲线，并挡住「放大到没有原始点」。-> 有没有真的动。
+
+        放大的下限用**还剩几个原始点**，不用一个绝对时间宽度：ps 级的 tran 和
+        MHz 级的 ac 上没有同一个合理的绝对值，点数有。
+        """
+        if not self.traces or not self.view or x1 <= x0:
+            return False
+        tr = self.traces[self.ti]
+        lo, hi = tr.x[0], tr.x[-1]
+        if x0 < lo:                          # 平移撞边就整体推回来，不把视窗压扁
+            x1, x0 = x1 + (lo - x0), lo
+        if x1 > hi:
+            x0, x1 = x0 - (x1 - hi), hi
+        x0, x1 = max(lo, x0), min(hi, x1)
+        if x1 <= x0:
+            return False
+        i0, i1 = fit_view(tr.x, x0, x1)
+        if i1 - i0 < MIN_VIEW_PTS and (x1 - x0) < (self.view[1] - self.view[0]):
+            return False
+        if (x0, x1) == self.view:
+            return False
+        self.view = (x0, x1)
+        self.band = None
+        self._redraw()
+        return True
+
+    def _zoom_at(self, canvas, px, factor):
+        """以指针处为锚点缩放。log 轴在 log 空间里做 —— 线性做的话滚一格就跑偏。"""
+        if not self.view or not self.traces:
+            return
+        xf = self._xform(canvas)
+        xa = xf.wx(px)
+        x0, x1 = self.view
+        if self.traces[self.ti].xscale == "log" and min(x0, x1, xa) > 0:
+            a0, a1 = core.math.log10(x0), core.math.log10(x1)
+            aa = core.math.log10(xa)
+            self._set_view(10.0 ** (aa - (aa - a0) * factor),
+                           10.0 ** (aa + (a1 - aa) * factor))
+        else:
+            self._set_view(xa - (xa - x0) * factor, xa + (x1 - xa) * factor)
+
+    def _pan_px(self, canvas, dpx):
+        """按**像素**平移。log 轴上这等价于按 decade 平移，正是想要的。"""
+        if not self.view:
+            return
+        xf = self._xform(canvas)
+        self._set_view(xf.wx(xf.l + dpx), xf.wx(xf.l + xf.pw + dpx))
+
+    def _wheel(self, e, step=None):
+        w = self.root.winfo_containing(e.x_root, e.y_root)
+        if w not in (self.c_wave, self.c_err):
+            return
+        if step is None:
+            step = 1 if getattr(e, "delta", 0) > 0 else -1
+        self._zoom_at(w, e.x_root - w.winfo_rootx(),
+                      ZOOM_STEP if step > 0 else 1.0 / ZOOM_STEP)
+
+    def _pan_start(self, e):
+        self._pan = e.x
+        e.widget.configure(cursor="fleur")
+
+    def _pan_move(self, e):
+        if self._pan is None:
+            return
+        self._pan_px(e.widget, self._pan - e.x)
+        self._pan = e.x
+
+    def _pan_end(self, e):
+        self._pan = None
+        e.widget.configure(cursor="")
+
+    def _key(self, e):
+        """键盘缩放/平移。焦点在输入框或滑块上时**不抢键** ——
+        那里 +/-/方向键是编辑操作，抢了就没法改预算了。"""
+        w = self.root.focus_get()
+        if isinstance(w, (tk.Entry, tk.Scale, tk.Text)):
+            return
+        k, c = e.keysym, self.c_wave
+        if k in ("plus", "equal", "KP_Add"):
+            self._zoom_at(c, c.winfo_width() // 2, ZOOM_STEP)
+        elif k in ("minus", "underscore", "KP_Subtract"):
+            self._zoom_at(c, c.winfo_width() // 2, 1.0 / ZOOM_STEP)
+        elif k in ("Left", "Right"):
+            d = self._xform(c).pw * PAN_KEY_FRAC
+            self._pan_px(c, -d if k == "Left" else d)
+        elif k in ("0", "Home"):
+            self._zoom_all()
+
     def _sel_start(self, e):
         self._sel = (e.x, e.x)
 
@@ -594,6 +707,29 @@ class WaveGui(object):
 
     # ------------------------------------------------------------ 绘制
 
+    def _yscale(self, s, lo, hi):
+        """-> (base, rng, 是否被 eps 兜底)。把这条信号映射进 0..1 的仿射变换。
+
+        默认按**视窗内**的原始包络定尺度。全局量程在放大之后没意义：
+        12 ps 的窗口里那段起伏可能只占全量程的 0.3%，横轴放大了、纵向还是直线。
+
+        半宽下限卡在 `Y_EPS_FLOOR × eps`：视窗里什么都没发生时，尺度不该被
+        容差以内的抖动撑开 —— 撑开了就会看见「红线到处跑出灰带」，
+        像是压缩把这段毁了，其实全在容差里。判「丢没丢东西」看误差窗格的 ±1，
+        那一格才是有刻度的；这一格是形状。
+        """
+        if not self.y_local.get():
+            return s.vmin, (s.rng or 1.0), False
+        vals = [v for v in lo if v is not None]
+        vals += [v for v in hi if v is not None]
+        if not vals:
+            return s.vmin, (s.rng or 1.0), False
+        v0, v1 = min(vals), max(vals)
+        data_half = 0.5 * (v1 - v0)
+        floor = Y_EPS_FLOOR * (s.eps if 0 < s.eps < float("inf") else 0.0)
+        half = max(data_half, floor, 1e-300)
+        return 0.5 * (v0 + v1) - half * 1.06, 2.12 * half, half > data_half
+
     def _xform(self, canvas, y0=0.0, y1=1.0):
         tr = self.traces[self.ti]
         return Xform(self.view[0], self.view[1], y0, y1,
@@ -616,7 +752,10 @@ class WaveGui(object):
         xf = self._xform(c)
         i0, i1 = fit_view(tr.x, self.view[0], self.view[1])
         key = (i0, i1, w, id(tr))
-        if self.band_key != key:
+        # `band is None` 也要重算：换视窗的地方都会把 band 置空，但**下标区间可能没变**
+        # （视窗缩在相邻两个原始点之间时 fit_view 给的是同一对下标）。
+        # 只比 key 的话那一下就会拿着 None 去画。
+        if self.band is None or self.band_key != key:
             # 线段总数要恒定：每条信号的包络是 2*ncol 个顶点，
             # 四路信号按 1200 列画就是 9600 段，拖动会开始掉帧。
             ncol = max(120, min(BAND_COLS, w,
@@ -629,8 +768,7 @@ class WaveGui(object):
         x0, x1 = tr.x[i0], tr.x[i1 - 1]
         for si, s in enumerate(tr.signals):
             lo, hi = self.band[si]
-            rng = s.rng or 1.0
-            base = s.vmin
+            base, rng, floored = self._yscale(s, lo, hi)
             pts_a, pts_b = [], []
             for cix in range(ncol):
                 if lo[cix] is None:
@@ -653,11 +791,15 @@ class WaveGui(object):
                 line += [xf.sx(tr.x[i]), xf.sy((s.y[i] - base) / rng)]
             if len(line) >= 4:
                 c.create_line(line, fill=COLORS[si % 6], width=1)
+            # 图例打的是**纵轴当前的上下限**，不是全局极值 —— 放大之后这两个
+            # 差着几个数量级，打错一个就会把局部幅度当成全局幅度读
             c.create_text(xf.l + 6, 12 + si * 13, anchor="w",
-                          text="c%d %s  [%s..%s]"
+                          text="c%d %s  纵轴 [%s..%s] %s%s"
                                % (si + 1, s.name,
-                                  core.eng_str(s.vmin, s.unit, 4),
-                                  core.eng_str(s.vmax, s.unit, 4)),
+                                  core.eng_str(base, s.unit, 4),
+                                  core.eng_str(base + rng, s.unit, 4),
+                                  "视窗" if self.y_local.get() else "全局",
+                                  "·eps 兜底" if floored else ""),
                           fill=COLORS[si % 6], font=("Consolas", 8))
         if self._sel:
             a, b = sorted(self._sel)
@@ -665,8 +807,8 @@ class WaveGui(object):
                                dash=(3, 2))
         c.create_text(w - 8, h - 8, anchor="se", fill="#888",
                       font=("Consolas", 8),
-                      text="灰带=原始 min/max 包络（各信号按自身量程归一化）；"
-                           "框选缩放，双击复位")
+                      text="灰带=原始 min/max 包络；框选或滚轮缩放，"
+                           "右键拖平移，+/- ←/→，双击或 0 复位")
 
     def _draw_err(self):
         c = self.c_err
@@ -780,6 +922,61 @@ def selftest(path, args, timeout=60.0):
                        % (core.eng_str(a, tr.xunit, 4),
                           core.eng_str(b, tr.xunit, 4),
                           len(app.c_wave.find_all()), len(app.c_err.find_all())))
+
+            # --- 缩放/平移。滚轮那层要按指针位置分派，无人值守里模拟不可靠，
+            # 所以直接打它调用的锚点缩放；键盘走真事件（那条不依赖指针位置）。
+            w2 = app.c_wave.winfo_width() // 2
+            sp0 = app.view[1] - app.view[0]
+            app._zoom_at(app.c_wave, w2, ZOOM_STEP)
+            root.update_idletasks()
+            sp1 = app.view[1] - app.view[0]
+            log.append("滚轮缩放: 跨度 %s -> %s (%.3fx)"
+                       % (core.eng_str(sp0, tr.xunit, 3),
+                          core.eng_str(sp1, tr.xunit, 3), sp1 / sp0))
+            mid0 = 0.5 * (app.view[0] + app.view[1])
+            app._pan_px(app.c_wave, app._xform(app.c_wave).pw * 0.25)
+            root.update_idletasks()
+            log.append("平移: 中心 %s -> %s"
+                       % (core.eng_str(mid0, tr.xunit, 4),
+                          core.eng_str(0.5 * (app.view[0] + app.view[1]),
+                                       tr.xunit, 4)))
+            # 纵轴两种尺度：在一个**窄**视窗上比才说明问题。宽视窗里两者差不多，
+            # 差距正是随着放大长出来的 —— 这个功能存在的全部理由。
+            # 取全长 40% 处的 0.5% 窗口（demo_tran 上正好是 120 ns 那根 glitch）。
+            mid = tr.x[0] + (tr.x[-1] - tr.x[0]) * 0.40
+            half = (tr.x[-1] - tr.x[0]) * 0.0025
+            app.view = (mid - half, mid + half)
+            app.band = None
+            app._redraw()
+            root.update_idletasks()
+            s0 = app.red.trace.signals[0]
+            b_l, r_l, fl = app._yscale(s0, *app.band[0])
+            app.y_local.set(False)
+            b_g, r_g, _ = app._yscale(s0, *app.band[0])
+            app.y_local.set(True)
+            app._redraw()
+            root.update_idletasks()
+            log.append("纵轴@窄视窗 %s: 视窗 %s / 全局 %s (%.1fx%s)"
+                       % (core.eng_str(2 * half, tr.xunit, 3),
+                          core.eng_str(r_l, s0.unit, 3),
+                          core.eng_str(r_g, s0.unit, 3),
+                          (r_g / r_l) if r_l else 0.0,
+                          "，eps 兜底" if fl else ""))
+            # 一直放大到底：必须自己停在「视窗里还剩几个原始点」上
+            for _ in range(80):
+                app._zoom_at(app.c_wave, w2, ZOOM_STEP)
+            root.update_idletasks()
+            i0, i1 = fit_view(app.red.trace.x, app.view[0], app.view[1])
+            log.append("深缩放到底: 视窗内原始点 %d (下限 %d)"
+                       % (i1 - i0, MIN_VIEW_PTS))
+            root.focus_set()                    # 键盘事件别落在预算输入框里
+            root.event_generate("<Key>", keysym="0")
+            root.update_idletasks()
+            log.append("按 0 复位: 视窗 == 全长 %s"
+                       % (app.view == (tr.x[0], tr.x[-1])))
+            app.view = (a, b)
+            app.band = None
+            app._redraw()
             # 预算可改 + 一键压到预算
             for kb in ("20", "40", "6"):
                 app.budget_v.set(kb)

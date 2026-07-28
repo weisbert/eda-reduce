@@ -10,6 +10,7 @@
 然后继续跑 mainloop，撞上就永远不退出（第一版就是这么挂住的）。
 """
 
+import math
 import os
 import re
 import subprocess
@@ -143,6 +144,162 @@ class TestGuiSelftest(unittest.TestCase):
                 time.sleep(0.02)
             self.assertEqual(len(app.colbox.winfo_children()), 4,
                              "换文件要把上一份的列选框清掉")
+        finally:
+            root.destroy()
+
+    def test_zoom_reported_in_selftest(self):
+        """缩放/平移/纵轴自适应都要在无人值守自检里留下痕迹。"""
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "tools", "wave_reduce.py"),
+             os.path.join(ROOT, "examples", "demo_tran.csv"),
+             "--gui", "--selftest"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("滚轮缩放", out)
+        self.assertIn("平移", out)
+        self.assertIn("按 0 复位: 视窗 == 全长 True", out, "键盘复位没生效")
+        # 深缩放必须自己停住，而不是缩到视窗里一个原始点都不剩
+        deep = [ln for ln in out.splitlines() if ln.startswith("深缩放到底")]
+        self.assertTrue(deep, out)
+        n_pts = int(re.search(r"原始点 (\d+)", deep[0]).group(1))
+        self.assertGreaterEqual(n_pts, 4, "缩到没有原始点了")
+        # 窄视窗上纵轴必须真的放大，否则「放大局部」只放大了横轴
+        y = [ln for ln in out.splitlines() if ln.startswith("纵轴@窄视窗")]
+        self.assertTrue(y, out)
+        ratio = float(re.search(r"\(([\d.]+)x", y[0]).group(1))
+        self.assertGreater(ratio, 5.0,
+                           "窄视窗里纵轴还是按全局量程画的（%s）" % y[0])
+
+    def _app(self, csv_name, w=900):
+        """开一个真窗口把文件读进去。-> (root, app)，调用方负责 destroy。"""
+        import tkinter as tk
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import wave_cli
+        import wave_gui
+        args = wave_cli.build_parser().parse_args([])
+        args.budget = 20480
+        root = tk.Tk()
+        app = wave_gui.WaveGui(root, os.path.join(ROOT, "examples", csv_name),
+                               args)
+        app.c_wave.configure(width=w, height=330)
+        for _ in range(400):
+            root.update()
+            if app.red:
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(app.red, "文件没读进来")
+        root.update()
+        return root, app
+
+    def test_zoom_is_anchored_and_bounded(self):
+        """指针底下那个点缩放前后必须还在指针底下 —— 否则每滚一格目标就跑掉。"""
+        import wave_gui
+        root, app = self._app("demo_tran.csv")
+        try:
+            w = app.c_wave.winfo_width()
+            px = int(w * 0.7)
+            anchor = app._xform(app.c_wave).wx(px)
+            span0 = app.view[1] - app.view[0]
+            app._zoom_at(app.c_wave, px, wave_gui.ZOOM_STEP)
+            span1 = app.view[1] - app.view[0]
+            self.assertAlmostEqual(span1 / span0, wave_gui.ZOOM_STEP, places=6)
+            self.assertAlmostEqual(app._xform(app.c_wave).wx(px), anchor,
+                                   delta=span1 * 1e-6, msg="锚点跑了")
+            # 一直放大：必须自己停在「视窗里还剩几个原始点」上，而不是缩成一条缝
+            for _ in range(200):
+                app._zoom_at(app.c_wave, w // 2, wave_gui.ZOOM_STEP)
+            i0, i1 = wave_gui.fit_view(app.traces[0].x, app.view[0],
+                                       app.view[1])
+            self.assertGreaterEqual(i1 - i0, wave_gui.MIN_VIEW_PTS,
+                                    "缩到视窗里没有原始点了")
+        finally:
+            root.destroy()
+
+    def test_zoom_on_log_axis_is_geometric(self):
+        """log 轴要在 log 空间里缩放。按线性缩，滚一格锚点就跑到几个 decade 外。"""
+        import wave_gui
+        root, app = self._app("demo_ac.csv")
+        try:
+            self.assertEqual(app.traces[0].xscale, "log", "夹具应当是 log 轴")
+            w = app.c_wave.winfo_width()
+            px = int(w * 0.35)
+            anchor = app._xform(app.c_wave).wx(px)
+            dec0 = math.log10(app.view[1] / app.view[0])
+            app._zoom_at(app.c_wave, px, wave_gui.ZOOM_STEP)
+            dec1 = math.log10(app.view[1] / app.view[0])
+            self.assertAlmostEqual(dec1 / dec0, wave_gui.ZOOM_STEP, places=6,
+                                   msg="log 轴上跨的 decade 数才是那个「跨度」")
+            self.assertAlmostEqual(app._xform(app.c_wave).wx(px) / anchor, 1.0,
+                                   delta=1e-6, msg="锚点跑了")
+        finally:
+            root.destroy()
+
+    def test_pan_clamps_and_keeps_span(self):
+        """平移只许挪，不许改跨度；撞到两端就停，不许把视窗压扁。"""
+        root, app = self._app("demo_tran.csv")
+        try:
+            tr = app.traces[0]
+            full = (tr.x[0], tr.x[-1])
+            app._zoom_all()
+            app._pan_px(app.c_wave, 10 ** 6)
+            self.assertEqual(app.view, full, "全视窗时平移应当是空操作")
+            app.view = (tr.x[0], tr.x[0] + (tr.x[-1] - tr.x[0]) * 0.2)
+            app.band = None
+            app._redraw()
+            span = app.view[1] - app.view[0]
+            app._pan_px(app.c_wave, 10 ** 6)                 # 一把推到最右
+            self.assertAlmostEqual(app.view[1], tr.x[-1], delta=span * 1e-6,
+                                   msg="推到底该贴住右端")
+            self.assertAlmostEqual(app.view[1] - app.view[0], span,
+                                   delta=span * 1e-6, msg="平移改了跨度")
+        finally:
+            root.destroy()
+
+    def test_y_axis_follows_the_view(self):
+        """窄视窗里纵轴必须跟着收 —— 这是「放大局部」有没有用的分水岭。"""
+        root, app = self._app("demo_tran.csv")
+        try:
+            tr = app.red.trace
+            s = tr.signals[0]           # V(vdd_pll)：120 ns 处有根 3.2 mV 的 glitch
+            span = tr.x[-1] - tr.x[0]
+            app.view = (tr.x[0] + span * 0.3975, tr.x[0] + span * 0.4025)
+            app.band = None
+            app._redraw()
+            root.update()
+            base_l, rng_l, _ = app._yscale(s, *app.band[0])
+            app.y_local.set(False)
+            base_g, rng_g, _ = app._yscale(s, *app.band[0])
+            self.assertEqual((base_g, rng_g), (s.vmin, s.rng or 1.0),
+                             "关掉之后必须原样回到全局量程")
+            self.assertLess(rng_l * 5, rng_g, "窄视窗里纵轴没跟着放大")
+            # 视窗内的原始包络必须完整落在纵轴范围里，否则画出来是被裁过的
+            lo, hi = app.band[0]
+            vals = [v for v in lo if v is not None]
+            vals += [v for v in hi if v is not None]
+            self.assertLessEqual(base_l, min(vals))
+            self.assertGreaterEqual(base_l + rng_l, max(vals))
+        finally:
+            root.destroy()
+
+    def test_y_scale_floors_at_eps(self):
+        """视窗里一片平的时候，纵轴尺度要被 eps 兜住。
+
+        不兜的话尺度会被容差以内的抖动撑开，红线看起来到处跑出灰带，
+        像是压缩把这段毁了 —— 其实全在容差里。判丢没丢东西看误差窗格的 ±1。
+        """
+        root, app = self._app("demo_tran.csv")
+        try:
+            class Flat(object):
+                vmin, vmax, rng, eps = 0.5, 0.5, 0.0, 1e-3
+
+            flat = [0.5] * 20
+            app.y_local.set(True)
+            base, rng, floored = app._yscale(Flat(), flat, flat)
+            self.assertTrue(floored, "全平的视窗没走 eps 兜底")
+            self.assertGreaterEqual(rng, 4.0 * Flat.eps)
+            self.assertLess(base, 0.5)
+            self.assertGreater(base + rng, 0.5)
         finally:
             root.destroy()
 
