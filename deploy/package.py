@@ -89,9 +89,16 @@ def dirty():
         return False
 
 
-def stage_app(stage):
+# 增量包里的载荷目录**故意不叫 app/**。
+# 叫 app/ 的话，人把增量包解进安装目录（这是很自然的做法）就会在
+# update.sh 跑起来之前把已装好的 app/ 盖掉，于是「备份」备的是新的那份，
+# 回滚点静默丢失。换个名字，解哪儿都安全。
+INCOMING = "app_incoming"
+
+
+def stage_app(stage, name="app"):
     """从 **committed blob** 导出 app，不碰工作树。"""
-    app = os.path.join(stage, "app")
+    app = os.path.join(stage, name)
     os.makedirs(app, exist_ok=True)
     have = []
     for p in EXPORT:
@@ -263,7 +270,7 @@ def build_incremental(out, last_path):
     shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage)
     print("[1/4] 从 committed blob 导出 app …")
-    _, info = stage_app(stage)
+    _, info = stage_app(stage, INCOMING)
     if info["worktree_dirty"]:
         print("      !! 工作树有未提交改动 —— 包里是 HEAD 的内容。先 commit。")
     print("[2/4] 核对 requirements 自上次 full 以来没变 …")
@@ -300,9 +307,9 @@ def build_incremental(out, last_path):
           "      带的 req-hash %s —— 跟已部署的对不上 update.sh 会中止"
           % (tar, os.path.getsize(tar) / 1024.0,
              man["requirements_hash"][:12]))
-    print("      隔离区：增量包要解到**安装目录外面**（不然 app/ 会在备份前被盖掉）：")
-    print("            mkdir -p ~/upd && tar xzf 这个包 -C ~/upd && "
-          "bash ~/upd/update.sh ~/eda_reduce")
+    print("      隔离区：解到哪儿都行，包括直接解进安装目录 ——")
+    print("            载荷目录叫 %s/，不会盖掉已装好的 app/。" % INCOMING)
+    print("            cd ~/eda_reduce && tar xzf 这个包 && bash update.sh")
     return 0
 
 

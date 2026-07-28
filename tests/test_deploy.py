@@ -152,24 +152,77 @@ class TestPackageAndInstall(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, "应当拒绝: " + out)
         self.assertIn("在包目录", out)
 
-    def test_incremental_must_not_be_extracted_into_install_dir(self):
-        """增量包解进安装目录 = app/ 在备份前就被盖掉，回滚点静默丢失。"""
-        home = os.path.join(self.tmp, "clobber", "eda_reduce")
+    def test_incremental_extracted_into_install_dir(self):
+        """增量包直接解进安装目录 —— 这是最自然的用法，必须支持。
+
+        能支持的前提是载荷目录叫 app_incoming/ 而不是 app/：不撞名，
+        解包就不会在 update.sh 跑起来之前把已装好的 app/ 盖掉，
+        备份才备得到**旧**版，回滚点才保得住。
+        这里用一个 marker 文件把「备份里到底是新是旧」钉死。
+        """
+        home = os.path.join(self.tmp, "inplace_upd", "eda_reduce")
         os.makedirs(home)
         subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
         self.assertEqual(sh([BASH, "bootstrap.sh"], cwd=home).returncode, 0)
+        marker = os.path.join(home, "app", "tools", "_marker.txt")
+        with open(marker, "w") as fh:
+            fh.write("OLD")
+
         r = sh([sys.executable, os.path.join(ROOT, "deploy", "package.py"),
                 "incremental", "--out", self.dist])
         self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
-        subprocess.check_call(
-            ["tar", "xzf", os.path.join(self.dist,
-                                        "eda_reduce_incremental.tar.gz"),
-             "-C", home])
+        itar = os.path.join(self.dist, "eda_reduce_incremental.tar.gz")
+        names = subprocess.check_output(["tar", "tzf", itar]).decode()
+        self.assertNotIn("\napp/", "\n" + names,
+                         "增量包里不许有顶层 app/，会盖掉安装好的那份")
+        self.assertIn("app_incoming/", names)
+
+        subprocess.check_call(["tar", "xzf", itar, "-C", home])
+        self.assertTrue(os.path.exists(marker), "解包不该碰到已装的 app/")
         r = sh([BASH, "update.sh"], cwd=home)
         out = r.stdout.decode("utf-8", "replace")
-        self.assertNotEqual(r.returncode, 0, "必须拒绝: " + out)
-        self.assertIn("回滚点", out, "要说清为什么不能继续")
-        self.assertIn(".backups", out, "要告诉人怎么救")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("更新完成", out)
+
+        bks = [d for d in os.listdir(os.path.join(home, ".backups"))]
+        self.assertTrue(bks, "应当留下备份")
+        got = [b for b in bks
+               if os.path.exists(os.path.join(home, ".backups", b, "tools",
+                                              "_marker.txt"))]
+        self.assertTrue(got, "备份里必须是**旧**版（带 marker）——"
+                             "备成新版就等于回滚点丢了")
+        self.assertFalse(os.path.exists(marker), "新 app/ 不该有旧 marker")
+        self.assertFalse(os.path.isdir(os.path.join(home, "app_incoming")),
+                         "成功之后载荷目录该收掉")
+        r = sh([BASH, os.path.join(home, "wave"), "--list-kinds"], cwd=home)
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+
+    def test_rollback_when_extracted_in_place(self):
+        """就地更新失败也要能滚回去。"""
+        home = os.path.join(self.tmp, "inplace_rb", "eda_reduce")
+        os.makedirs(home)
+        subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
+        self.assertEqual(sh([BASH, "bootstrap.sh"], cwd=home).returncode, 0)
+        with open(os.path.join(home, "app", "tools", "_marker.txt"), "w") as fh:
+            fh.write("OLD")
+        itar = os.path.join(self.dist, "eda_reduce_incremental.tar.gz")
+        if not os.path.exists(itar):
+            r = sh([sys.executable, os.path.join(ROOT, "deploy", "package.py"),
+                    "incremental", "--out", self.dist])
+            self.assertEqual(r.returncode, 0)
+        subprocess.check_call(["tar", "xzf", itar, "-C", home])
+        with open(os.path.join(home, "app_incoming", "tools",
+                               "wave_reduce.py"), "w") as fh:
+            fh.write("import nonexistent_module_xyz\n")
+        r = sh([BASH, "update.sh"], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("正在回滚", out)
+        self.assertTrue(
+            os.path.exists(os.path.join(home, "app", "tools", "_marker.txt")),
+            "滚回去的应当是带 marker 的旧版")
+        r = sh([BASH, os.path.join(home, "wave"), "--list-kinds"], cwd=home)
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
 
     def test_update_finds_install_when_run_from_inside_it(self):
         """人站在装好的目录里跑 update，不该还要求他打路径。"""
@@ -228,7 +281,8 @@ class TestPackageAndInstall(unittest.TestCase):
         self.assertIn("更新完成", out)
 
         # 把包里的工具改坏 -> 冒烟测试失败 -> 必须自动滚回去
-        with open(os.path.join(ipkg, "app", "tools", "wave_reduce.py"), "w",
+        with open(os.path.join(ipkg, "app_incoming", "tools",
+                               "wave_reduce.py"), "w",
                   encoding="utf-8", newline="\n") as fh:
             fh.write("import nonexistent_module_xyz\n")
         r = sh([BASH, os.path.join(ipkg, "update.sh")], cwd=home)

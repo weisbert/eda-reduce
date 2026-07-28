@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 隔离区增量更新（incremental 包）：只换 app/ 源码，复用 .venv + wheels。
 #
-#     mkdir -p ~/upd && tar xzf eda_reduce_incremental.tar.gz -C ~/upd
-#     bash ~/upd/update.sh ~/eda_reduce
+#     cd ~/eda_reduce && tar xzf eda_reduce_incremental.tar.gz && bash update.sh
 #
-# **增量包不能解进安装目录**：app/ 会在备份之前就被新版盖掉，于是「备份」
-# 备的是新的那份，回滚点静默丢失。脚本会拦住。
+# **解到哪儿都行，包括直接解进安装目录。** 增量包的载荷目录叫 app_incoming/，
+# 不叫 app/，所以解包本身不会碰到已装好的那份 —— 备份还是备的旧版，
+# 回滚点保得住。
 #
 # 找安装目录的顺序：$1 > $EDA_REDUCE_PREFIX > ./eda_reduce > 当前目录本身
 # （要有 INSTALL.json + app/）。都找不到会把找过哪些地方列出来，不猜。
@@ -50,18 +50,21 @@ if [ ! -d "$PREFIX/app" ]; then
 fi
 PREFIX="$(cd "$PREFIX" && pwd)"
 
-# 增量包**不能**解进安装目录：app/ 会在备份之前就被新版覆盖，
-# 于是「备份」备的是新的那份，回滚点静默丢失 —— 出事时才发现滚不回去。
-if [ "$PREFIX" = "$HERE" ]; then
-    echo "错误：增量包解在安装目录里了（$HERE）。"
-    echo "      app/ 已经被包里的新版盖掉，这时候再备份，备的是新的那份，"
-    echo "      回滚点就没了。**不能继续。**"
-    echo "      正确做法：把增量包解到别处再跑 ——"
-    echo "        mkdir -p ../upd && tar xzf eda_reduce_incremental.tar.gz -C ../upd"
-    echo "        bash ../upd/update.sh \"$PREFIX\""
-    echo "      如果 app/ 已经被盖了，从 $PREFIX/.backups/ 里挑一份滚回去再重来。"
-    exit 1
+# 载荷目录。新包是 app_incoming/（不会和已装好的 app/ 撞名，所以解进
+# 安装目录也安全）；老包是 app/，兼容一下。
+SRC="$HERE/app_incoming"
+if [ ! -d "$SRC" ]; then
+    SRC="$HERE/app"
+    if [ "$SRC" = "$PREFIX/app" ]; then
+        echo "错误：这是个老格式的增量包（载荷目录叫 app/），又解在了安装目录里。"
+        echo "      app/ 已经被盖掉了，没法再备份出旧版。"
+        echo "      要么用新版打的包（载荷目录是 app_incoming/），"
+        echo "      要么把这个包解到别处再跑：bash <包>/update.sh \"$PREFIX\""
+        echo "      已经被盖的话，从 $PREFIX/.backups/ 里挑一份滚回去。"
+        exit 1
+    fi
 fi
+[ -d "$SRC" ] || { echo "错误：包里找不到载荷目录（app_incoming/ 或 app/）"; exit 1; }
 
 _get() { grep -o "\"$2\"[^,]*" "$1" | head -1 | sed 's/.*: *"//; s/"//'; }
 
@@ -106,7 +109,7 @@ cp -r "$PREFIX/app" "$BK"
 
 echo "[2/4] 换 app/（.venv / wheels / results 都不动）…"
 rm -rf "$PREFIX/app"
-cp -r "$HERE/app" "$PREFIX/app"
+cp -r "$SRC" "$PREFIX/app"          # 用 cp 不用 mv：失败了还能重来
 mkdir -p "$PREFIX/results"
 ln -sfn "$PREFIX/results" "$PREFIX/app/results"
 
@@ -121,6 +124,10 @@ rm -f "$PREFIX/.smoke.wv"
 trap - ERR
 echo "[4/4] 记录 + 清理旧备份（留最近 $KEEP 份）…"
 cp "$HERE/MANIFEST.json" "$PREFIX/INSTALL.json"
+# 解在安装目录里的话，成功之后把载荷目录收掉，别留一份重复的源码占地方
+if [ "$SRC" = "$PREFIX/app_incoming" ]; then
+    rm -rf "$SRC"
+fi
 ls -1dt "$PREFIX"/.backups/app-* 2>/dev/null | tail -n +$((KEEP + 1)) \
     | while read -r d; do rm -rf "$d"; done
 
