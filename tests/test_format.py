@@ -123,6 +123,81 @@ class TestPureStdlib(unittest.TestCase):
         self.assertNotIn("[METRICS]", txt)
 
 
+class TestScriptEncoding(unittest.TestCase):
+    """BOM 的两个方向都会咬人，而且报错都指向别的地方。"""
+
+    def _walk(self, ext):
+        for base, dirs, files in os.walk(ROOT):
+            dirs[:] = [d for d in dirs if d not in (".git", "dist", "__pycache__")]
+            for f in files:
+                if f.endswith(ext):
+                    yield os.path.join(base, f)
+
+    def test_ps1_with_chinese_has_utf8_bom(self):
+        """PS 5.1 读**不带 BOM** 的 .ps1 会按 GBK 解码。
+
+        中文变乱码之后引号配对全乱，报出来的是一堆「Unexpected token」，
+        行号还是错的 —— 根本看不出真正原因是编码。实测踩过。
+        """
+        for p in self._walk(".ps1"):
+            with open(p, "rb") as fh:
+                raw = fh.read()
+            try:
+                raw.decode("ascii")
+                continue                      # 纯 ASCII 的不需要 BOM
+            except UnicodeDecodeError:
+                pass
+            self.assertTrue(
+                raw.startswith(b"\xef\xbb\xbf"),
+                "%s 含非 ASCII 字符但没有 UTF-8 BOM —— PS 5.1 会按 GBK 解码"
+                % os.path.relpath(p, ROOT))
+
+    def test_sh_has_no_bom(self):
+        """反过来：.sh **绝不能**有 BOM。
+
+        BOM 挡在 `#!/usr/bin/env bash` 前面，内核认不出 shebang，
+        报的是 `bad interpreter` —— 和 CRLF 那个坑一模一样的症状。
+        """
+        for p in self._walk(".sh"):
+            with open(p, "rb") as fh:
+                head = fh.read(4)
+            self.assertFalse(head.startswith(b"\xef\xbb\xbf"),
+                             "%s 带了 BOM，shebang 会失效"
+                             % os.path.relpath(p, ROOT))
+            self.assertTrue(head.startswith(b"#!"),
+                            "%s 第一行不是 shebang" % os.path.relpath(p, ROOT))
+
+    def test_shell_scripts_are_lf(self):
+        """.sh 带 \\r 到 Linux 上就是 bad interpreter。仓库 .gitattributes 管这个，
+        这里再兜一层 —— 打包链上这是最容易踩的坑。"""
+        for p in self._walk(".sh"):
+            with open(p, "rb") as fh:
+                self.assertNotIn(b"\r", fh.read(),
+                                 "%s 有 CRLF" % os.path.relpath(p, ROOT))
+
+    def test_ps1_parses_under_powershell(self):
+        """有 powershell 就真的让它解析一遍 —— 上面那条 BOM 断言只是必要条件。"""
+        import shutil
+        import subprocess
+        exe = shutil.which("powershell") or shutil.which("pwsh")
+        if not exe:
+            self.skipTest("这台机器没有 powershell")
+        for p in self._walk(".ps1"):
+            code = (
+                "$e=$null;$t=$null;"
+                "[System.Management.Automation.Language.Parser]::ParseFile("
+                "'%s',[ref]$t,[ref]$e)|Out-Null;"
+                "if($e.Count -gt 0){$e[0].Message;exit 1}else{exit 0}"
+                % p.replace("'", "''"))
+            r = subprocess.run([exe, "-NoProfile", "-NonInteractive",
+                                "-Command", code],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=120)
+            self.assertEqual(r.returncode, 0,
+                             "%s 解析失败: %s" % (os.path.relpath(p, ROOT),
+                                                 r.stdout.decode("utf-8", "replace")))
+
+
 class TestNoAdjectives(unittest.TestCase):
 
     def _scan(self, text, where):

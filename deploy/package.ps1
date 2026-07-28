@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   黄区（Windows，有网）一键打包 —— eda-reduce 离线气隙包。package.py 的薄包装。
 
