@@ -140,6 +140,25 @@
   ],
   "traces": 2
  },
+ "demo_tran_viva.csv": {
+  "delim": ",",
+  "kind": "tran",
+  "n": [
+   849,
+   364
+  ],
+  "signals": [
+   "v /vdd_pll",
+   "i /mp0"
+  ],
+  "traces": 2,
+  "units": {
+   "i /mp0": "A",
+   "v /vdd_pll": "V"
+  },
+  "x_unit": "s",
+  "x_unit_src": "inferred"
+ },
  "scale": 1.0,
  "seed": 20260727
 }

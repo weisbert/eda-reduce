@@ -42,6 +42,107 @@ class TestLayoutB(unittest.TestCase):
         self.assertEqual(len(trs), 1, "--layout a 应当强制按共享栅格读")
 
 
+class TestViVAXY(unittest.TestCase):
+    """ViVA「Export CSV」的真实形状：每条 trace 两列 `<表达式> X` / `<表达式> Y`。
+
+    真实文件里咬了一口的就是这个：列名 `v /gmp; tran (V) X` 自带分号，
+    分隔符按「表头里出现次数」判会判成分号，数据区一行都切不出数，
+    最后在 GUI 里表现成一句 `list index out of range`。
+    """
+
+    RAW = ("v /gmp; tran (V) X,v /gmp; tran (V) Y\n"
+           "0,0.00076333\n3e-13,-0.00086388\n6e-13,-0.0017263\n"
+           "9e-13,-0.0022337\n1.1677e-12,-0.0025453\n1.6449e-12,-0.0027668\n"
+           "2.4999e-12,-0.0025178\n3.3549e-12,-0.0018986\n")
+
+    def test_semicolon_in_name_does_not_win_delimiter(self):
+        head = "v /gmp; tran (V) X,v /gmp; tran (V) Y"
+        body = ["0,0.00076333", "3e-13,-0.00086388"]
+        self.assertEqual(core._sniff_delim(head, body), ",")
+
+    def test_real_export_parses(self):
+        trs = core.parse_csv("<t>", text=self.RAW)
+        self.assertEqual(len(trs), 1)
+        tr = trs[0]
+        core.analyze(tr)
+        self.assertEqual(len(tr.x), 8)
+        self.assertEqual([s.name for s in tr.signals], ["v /gmp"])
+        self.assertEqual(tr.signals[0].unit, "V")
+        self.assertEqual(tr.signals[0].unit_src, "declared")
+
+    def test_x_unit_comes_from_analysis_not_from_the_y_unit(self):
+        # `(V)` 是 Y 的单位，横轴是秒。照搬过去整条 x 轴的量纲就错了
+        tr = core.parse_csv("<t>", text=self.RAW)[0]
+        core.analyze(tr)
+        self.assertEqual(tr.xunit, "s")
+        self.assertEqual(tr.xunit_src, "inferred")
+        self.assertEqual(tr.kind, "tran")
+        self.assertTrue(any("ViVA X/Y" in n for n in tr.notes), "认了要说出来")
+
+    def test_pairs_split_into_traces(self):
+        trs = core.parse_csv(C.ex("demo_tran_viva.csv"))
+        want = C.truth()["demo_tran_viva.csv"]
+        self.assertEqual(len(trs), want["traces"])
+        self.assertEqual([len(t.x) for t in trs], want["n"])
+        self.assertEqual([s.name for t in trs for s in t.signals],
+                         want["signals"])
+        for t in trs:
+            core.analyze(t)
+            self.assertEqual(len(t.signals), 1)
+            self.assertEqual(t.xunit, want["x_unit"])
+            self.assertEqual(t.kind, want["kind"])
+            self.assertEqual(t.signals[0].unit, want["units"][t.signals[0].name])
+
+    def test_freq_analysis_names_map_to_hz(self):
+        txt = ("dB20(v /out); ac (dB) X,dB20(v /out); ac (dB) Y\n"
+               + "".join("%g,%g\n" % (10.0 * 10 ** (i / 8.0), 40 - i)
+                         for i in range(24)))
+        tr = core.parse_csv("<t>", text=txt)[0]
+        core.analyze(tr)
+        self.assertEqual((tr.xunit, tr.kind, tr.xscale), ("Hz", "freq", "log"))
+        self.assertEqual(tr.signals[0].unit, "dB")
+
+    def test_unknown_analysis_is_not_guessed(self):
+        # pss 在 ViVA 里既可能出时域也可能出频域 —— 不猜，留 unknown
+        txt = ("v /o; pss (V) X,v /o; pss (V) Y\n"
+               + "".join("%g,%g\n" % (i * 1e-9, i) for i in range(12)))
+        tr = core.parse_csv("<t>", text=txt)[0]
+        core.analyze(tr)
+        self.assertEqual(tr.xunit_src, "unknown")
+        self.assertTrue(any("认不出分析类型" in n for n in tr.notes))
+
+    def test_declared_overrides_win(self):
+        # 人给了 --xcols / --layout a 就听人的，不许自作主张按 X/Y 拆
+        trs = core.parse_csv(C.ex("demo_tran_viva.csv"), layout="a")
+        self.assertEqual(len(trs), 1)
+        self.assertEqual(len(trs[0].signals), 3)
+        trs = core.parse_csv(C.ex("demo_tran_viva.csv"), xcols=[0])
+        self.assertEqual(len(trs), 1)
+
+    def test_semicolon_delimited_file_still_works(self):
+        # 真的用分号分隔的文件不能被上面那条修坏
+        txt = "time;V(out)\n0;0.8\n1e-9;0.81\n2e-9;0.82\n3e-9;0.83\n"
+        tr = core.parse_csv("<t>", text=txt)[0]
+        core.analyze(tr)
+        self.assertEqual([s.name for s in tr.signals], ["V(out)"])
+        self.assertEqual(len(tr.x), 4)
+
+
+class TestParseFailure(unittest.TestCase):
+    """解析不出东西时要**说清楚为什么**，不能静默返回空列表。"""
+
+    def test_no_trace_raises_with_diagnosis(self):
+        txt = "a;b;c\nnot,a,number\nstill,not,one\n"
+        try:
+            core.parse_csv("<t>", text=txt)
+        except ValueError as exc:
+            msg = str(exc)
+        else:
+            self.fail("解析不出 trace 必须抛异常，不能返回 []")
+        self.assertIn("分隔符判为", msg)
+        self.assertIn("表头", msg)
+
+
 class TestDirty(unittest.TestCase):
     """脏数据：每一样都要被**正确处理且报进 notes**，不许静默。"""
 

@@ -353,7 +353,13 @@ class WaveGui(object):
                 self.prog.set(it)
                 continue
             if it[0] == "err":
-                self.status.set("载入失败: %s" % it[1])
+                # 状态栏只有一行，解析失败的诊断是多行的 —— 全文进文本框，
+                # 否则「切错列」这种一眼能定位的问题只剩一句 IndexError
+                msg = "%s: %s" % (type(it[1]).__name__, it[1])
+                self.status.set("载入失败: " + msg.splitlines()[0])
+                self.txt.delete("1.0", "end")
+                self.txt.insert("1.0", "载入失败\n\n" + msg)
+                self.prog.set(0.0)
                 return
             _, trs, m, cand, tol = it
             self.traces, self.metrics, self.cand = trs, m, cand

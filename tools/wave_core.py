@@ -247,8 +247,39 @@ def _unit_of(name, declared):
     return "", "unknown"
 
 
+def _sniff_delim(head, body):
+    """认分隔符。**不能只数表头里出现几次**——ViVA 的列名自己就带分号
+    （`v /gmp; tran (V) X`），只数表头会判成分号，然后整个数据区一行都切不出数，
+    最后表现成「一条 trace 都没解析出来」。
+
+    判据换成「哪个候选能把数据行切成数字格」：数据行是纯数字的，切错了就切不出数。
+    表头只用来定列数、并排除根本没出现过的候选（欧洲那种 `;` 分隔 + `0,5` 小数的
+    文件靠这一条不会被逗号骗走）。
+    """
+    probe = [ln for ln in body if ln.strip()][:20]
+    best, best_score = None, 0.0
+    for d in (",", ";", "\t"):
+        if d not in head:
+            continue
+        ncol = head.count(d) + 1
+        score = 0.0
+        for ln in probe:
+            cells = ln.split(d)
+            n = sum(1 for c in cells if _isnum(c))
+            score += n / float(max(ncol, len(cells)))
+        if probe:
+            score /= len(probe)
+        if score > best_score:
+            best, best_score = d, score
+    if best is not None:
+        return best
+    # 数据区是空的、或整块都不是数（只有表头 / 纯文本表）—— 退回数表头
+    d = max(",;\t", key=head.count)
+    return d if head.count(d) else ","
+
+
 def _read_table(path_or_text, is_text=False):
-    """-> (header:list[str], rows:iterator of list[str])。认逗号/分号/制表符。"""
+    """-> (header:list[str], rows:list[list[str]], delim)。认逗号/分号/制表符。"""
     if is_text:
         fh = io.StringIO(path_or_text)
     else:
@@ -260,37 +291,108 @@ def _read_table(path_or_text, is_text=False):
                               or lines[i].lstrip()[:1] in (";", "#")):
         i += 1
     if i >= len(lines):
-        return [], []
+        return [], [], ","
     head = lines[i]
-    delim = max(",;\t", key=head.count)
-    if head.count(delim) == 0:
-        delim = ","
     body = lines[i + 1:]
+    delim = _sniff_delim(head, body)
     quoted = '"' in head or any('"' in ln for ln in body[:5])
     if quoted:
         rdr = list(csv.reader([head] + body, delimiter=delim))
-        return rdr[0], rdr[1:]
-    return head.split(delim), [ln.split(delim) for ln in body if ln.strip()]
+        return rdr[0], rdr[1:], delim
+    return head.split(delim), [ln.split(delim) for ln in body if ln.strip()], delim
+
+
+def _isnum(c):
+    c = c.strip().strip('"').strip()
+    if not c:
+        return False
+    try:
+        float(c)
+        return True
+    except ValueError:
+        return False
 
 
 def _looks_numeric(cells):
     ok = bad = 0
     for c in cells:
-        c = c.strip().strip('"').strip()
-        if not c:
+        if not c.strip().strip('"').strip():
             continue
-        try:
-            float(c)
+        if _isnum(c):
             ok += 1
-        except ValueError:
+        else:
             bad += 1
     return ok >= bad and ok > 0
 
 
-def _find_x_columns(names, layout, xcols):
+# ViVA 的「Export CSV」按 trace 成对写列：`<表达式> X` 是横轴，`<表达式> Y` 是纵轴，
+# 两列名字除了后缀一模一样。表达式里还带分析名和单位：`v /gmp; tran (V)`。
+_VIVA_XY = re.compile(r"^(.*\S)[ \t_]([XY])$")
+_VIVA_ANALYSIS = re.compile(r";\s*([A-Za-z][A-Za-z0-9_]*)\s*$")
+# 分析名 -> 规范轴名。**只列横轴能确定是什么的**：pss 在 ViVA 里既可能出时域也可能
+# 出频域，不猜——认不出就留 unknown，让人用 --kind / --unit x= 定。
+_VIVA_AXIS = {"tran": "time", "ac": "freq", "sp": "freq", "noise": "freq",
+              "stb": "freq", "xf": "freq", "pac": "freq", "pxf": "freq",
+              "pnoise": "freq", "dc": "dc", "dcop": "dc"}
+
+
+def _viva_xy(names):
+    """ViVA 成对导出 -> ([去掉 X/Y 后缀的名字], [x 列下标])，不成对就返回 None。
+
+    要求**每一列**都配得上对，否则不认——认错了整张图的横轴就读反了。
+    """
+    if len(names) < 2 or len(names) % 2:
+        return None
+    bases, tags = [], []
+    for n in names:
+        m = _VIVA_XY.match(n.strip())
+        if not m:
+            return None
+        bases.append(m.group(1).strip())
+        tags.append(m.group(2))
+    for k in range(0, len(names), 2):
+        if tags[k] != "X" or tags[k + 1] != "Y" or bases[k] != bases[k + 1]:
+            return None
+    return bases, list(range(0, len(names), 2))
+
+
+def _viva_rewrite(names):
+    """ViVA 的 X/Y 列对 -> (改写后的列名, x 列下标, [每对一条说明])；认不出返回 None。
+
+    X 列的名字换成 time / freq 这种规范轴名，因为原名括号里的单位是 **Y 的**：
+    `v /gmp; tran (V) X` 里那个 V 是电压，横轴却是秒，照搬过去整条 x 轴的量纲就错了。
+    换成规范轴名之后，下游那套「x 名字 -> 单位 / kind」的现成规则直接接手。
+    """
+    pair = _viva_xy(names)
+    if not pair:
+        return None
+    bases, xidx = pair
+    out, notes = [], []
+    for k in xidx:
+        base, unit = _split_unit(bases[k])
+        m = _VIVA_ANALYSIS.search(base)
+        ana = m.group(1) if m else ""
+        axis = _VIVA_AXIS.get(ana.lower(), "")
+        net = base[:m.start()].strip() if (m and axis) else base
+        out.append(axis or "x")
+        out.append(("%s (%s)" % (net, unit)) if unit else (net or base))
+        if axis:
+            notes.append("ViVA X/Y 列对：`%s` 按分析名 `%s` 把横轴认成 %s"
+                         % (net or base, ana, axis))
+        else:
+            notes.append("ViVA X/Y 列对：`%s` 认不出分析类型，横轴单位未知"
+                         "（用 --kind / --unit x=s 声明）" % base)
+    return out, xidx, notes
+
+
+def _find_x_columns(names, layout, xcols, viva_x=None):
     """-> 每条 trace 的 x 列下标。布局 B 的判据见 wave-spec 第 6 节。"""
     if xcols:
         return sorted(set(xcols)), "declared"
+    if layout == "a":
+        return [0], "forced"
+    if viva_x:
+        return viva_x, "ViVA X/Y"
     norm = [_norm(n) for n in names]
     first = norm[0]
     cand = [0]
@@ -299,8 +401,6 @@ def _find_x_columns(names, layout, xcols):
             cand.append(j)
     if layout == "b":
         return (cand if len(cand) > 1 else list(range(0, len(norm), 2))), "forced"
-    if layout == "a":
-        return [0], "forced"
     return (cand, "dup-name") if len(cand) > 1 else ([0], "single")
 
 
@@ -310,7 +410,8 @@ def parse_csv(path, layout="auto", xcols=None, text=None):
     脏数据全部**报出来而不是静默处理**：重复 t / 非单调 / NaN / inf / 空单元 /
     dt 坍缩，每一样都进 trace.notes，最后印在 .wv 头里。
     """
-    names, rows = _read_table(text if text is not None else path, is_text=text is not None)
+    names, rows, delim = _read_table(text if text is not None else path,
+                                     is_text=text is not None)
     if not names:
         raise ValueError("空文件或读不出表头: %s" % path)
     names = [n.strip().strip('"').strip() for n in names]
@@ -318,13 +419,20 @@ def parse_csv(path, layout="auto", xcols=None, text=None):
         names.pop()
     ncol = len(names)
 
+    # ViVA 的 X/Y 列对。人给了 --xcols / --layout a 就听人的，不自作主张
+    viva_x, viva_notes = None, []
+    if not xcols and layout != "a":
+        rw = _viva_rewrite(names)
+        if rw:
+            names, viva_x, viva_notes = rw
+
     unit_row = None
     if rows and not _looks_numeric(rows[0][:ncol]):
         unit_row = [c.strip().strip('"').strip() for c in rows[0][:ncol]]
         rows = rows[1:]
         unit_row += [""] * (ncol - len(unit_row))
 
-    xidx, xsrc = _find_x_columns(names, layout, xcols)
+    xidx, xsrc = _find_x_columns(names, layout, xcols, viva_x)
     blocks = []
     for k, xi in enumerate(xidx):
         end = xidx[k + 1] if k + 1 < len(xidx) else ncol
@@ -342,6 +450,8 @@ def parse_csv(path, layout="auto", xcols=None, text=None):
         tr = Trace(base or "x", index=bi)
         tr.source = src
         tr.xunit, tr.xunit_src = _unit_of(names[xi], declared)
+        if viva_x and bi < len(viva_notes):
+            tr.note(viva_notes[bi])
         for j in yidx:
             nb, nd = _split_unit(names[j])
             if unit_row and unit_row[j]:
@@ -355,6 +465,17 @@ def parse_csv(path, layout="auto", xcols=None, text=None):
         for tr in traces:
             tr.note("布局 B（%s）：这是第 %d/%d 条独立 trace"
                     % (xsrc, tr.index + 1, len(blocks)))
+    if not traces:
+        # 空手而归几乎总是**切错列**（列名里带分隔符是头号原因），
+        # 静默返回 [] 会在上层变成一句没头没脑的 IndexError。把证据摆出来。
+        raise ValueError(
+            "一条 trace 都没解析出来（每条至少要 2 个有效点）: %s\n"
+            "  分隔符判为 %r；表头 %d 列: %s\n"
+            "  数据第一行切成 %d 格: %s\n"
+            "  列名里带分隔符时，可以用 --xcols 指定 x 列，或把表头改干净再导。"
+            % (path, delim, ncol, " | ".join(names[:6]),
+               len(rows[0]) if rows else 0,
+               " | ".join(c.strip() for c in rows[0][:6]) if rows else "(无数据行)"))
     return traces
 
 

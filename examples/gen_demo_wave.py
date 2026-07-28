@@ -494,6 +494,38 @@ def write_layout_b(path, t, cols):
     return len(a), len(b)
 
 
+def write_viva(path, t, cols):
+    """ViVA「Export CSV」的真实样子：每条 trace 两列 `<表达式> X` / `<表达式> Y`。
+
+    表达式里带**分号**（`v /gmp; tran (V)`）——这是个陷阱夹具：按「表头里哪个符号
+    出现得多」认分隔符会判成分号，整个数据区一行都切不出数。括号里的 V 是 **Y 的**
+    单位，横轴其实是秒，照搬到 x 轴上量纲就错了。两条长度还不等。
+    """
+    a = list(range(0, len(t), 3))
+    b = list(range(0, len(t), 7))
+    n = max(len(a), len(b))
+    lines = ["v /vdd_pll; tran (V) X,v /vdd_pll; tran (V) Y,"
+             "i /mp0; tran (A) X,i /mp0; tran (A) Y"]
+    for i in range(n):
+        c = []
+        c.append("%.10g" % t[a[i]] if i < len(a) else "")
+        c.append("%.7g" % cols[0][a[i]] if i < len(a) else "")
+        c.append("%.10g" % t[b[i]] if i < len(b) else "")
+        c.append("%.7g" % cols[2][b[i]] if i < len(b) else "")
+        lines.append(",".join(c))
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return len(a), len(b)
+
+
+VIVA_TRUTH = {
+    "traces": 2,
+    "signals": ["v /vdd_pll", "i /mp0"],
+    "units": {"v /vdd_pll": "V", "i /mp0": "A"},
+    "x_unit": "s", "x_unit_src": "inferred", "kind": "tran",
+    "delim": ",",
+}
+
 DIRTY = '''"time","V(out)","I(load)",
 "s","V","A",
 0,0.8000,1.0e-3,
@@ -555,6 +587,9 @@ def main():
     na, nb = write_layout_b(os.path.join(d, "demo_tran_layoutb.csv"), t, cols)
     print("demo_tran_layoutb.csv  trace1=%d pts  trace2=%d pts (ragged)" % (na, nb))
 
+    write_viva(os.path.join(d, "demo_tran_viva.csv"), t, cols)
+    print("demo_tran_viva.csv     ViVA X/Y 列对，列名里带分号（分隔符陷阱）")
+
     with open(os.path.join(d, "demo_dirty.csv"), "w",
               encoding="utf-8", newline="\n") as fh:
         fh.write(DIRTY)
@@ -590,6 +625,7 @@ def main():
         "demo_ac.csv": {"kind": "freq", "signals": {"dB20(V(out))": ac_truth(AC, arows)}},
         "demo_spec.csv": {"kind": "freq", "signals": {"V(vco_out)": spec_truth(SPEC)}},
         "demo_tran_layoutb.csv": {"traces": 2, "n": [na, nb]},
+        "demo_tran_viva.csv": dict(VIVA_TRUTH, n=[na, nb]),
         "demo_dirty.csv": DIRTY_TRUTH,
     }
     tp = os.path.join(d, "demo_truth.json")
