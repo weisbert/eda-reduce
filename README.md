@@ -63,9 +63,11 @@ tests/                unittest 全套（见 tests/README.md）
 python tools/drawio_reduce.py my.drawio -o my.rd
 python tools/drawio_reduce.py my.drawio --bbox 400,300,800,700   # 只导出一个区域
 
-python tools/wave_reduce.py my.csv -o my.wv        # 自动压到 20 KB 以内
+python tools/wave_reduce.py my.csv -o my.wv        # 默认压到 20 KB 以内
 python tools/wave_reduce.py my.csv --gui           # 拖滑块看丢了什么、看字节数
-python tools/wave_reduce.py my.csv --tol 0.002 --budget 20480
+python tools/wave_reduce.py my.csv --budget 51200  # 通道宽就多带点
+python tools/wave_reduce.py my.csv --budget 0      # 不限，先看完整的长什么样
+export EDA_REDUCE_BUDGET=32k                       # 定成你那条通道的常态
 python tools/plot_digitize.py shot.png --xaxis 0,300n --yaxis 0.7,0.87 \
     --trace '#e01b24=vdd_pll' -o dig.csv           # 截图兜底
 ```
@@ -104,6 +106,23 @@ c2    period 6.40004 ns   jitter_rms 3.84155 ps   jitter_pp 15.6873 ps (N=46 cyc
 ```
 
 实测：134 KB 的瞬态 CSV → 20.4 KB；95 KB 的谱 → 15 KB；32 KB 的 AC → 2 KB。
+
+### 20 KB 是**这条通道**的宽度，不是普适真理
+
+换个通道（能贴附件、字数上限不同、换个模型）这个数就该跟着变，所以三个地方都能改：
+
+```bash
+python tools/wave_reduce.py my.csv --budget 51200   # 这一次
+export EDA_REDUCE_BUDGET=32k                        # 你的常态（支持 32k / 32kb / 32768）
+```
+
+GUI 里有输入框 + **「自动压到预算」**按钮，二分点数、结果和命令行同一个数
+（`tests/test_gui.py` 在守这个一致性——两边给不出同一个数的话，
+GUI 里调好的参数拿到命令行就不作数了）。
+
+压不进去时**不会偷偷截断全精度测量**：`[METRICS]`/`[EVENTS]` 和强制保留点
+（spur 峰及其包络、极值、事件）是丢了不可逆的东西，宁可超也要在输出里
+声明超了多少、为什么下不来、建议怎么办。
 
 ## 波形那条分工线不一样
 

@@ -22,6 +22,25 @@ import wave_emit as emit                                        # noqa: E402
 DEFAULT_BUDGET = 20 * 1024
 
 
+def default_budget():
+    """20 KB 是**这条通道**的宽度，不是普适真理。
+
+    换个通道（能贴附件、字数上限不同、换个模型）这个数就该跟着变，
+    所以既能用 --budget 临时改，也能用环境变量定成你自己的常态。
+    """
+    v = os.environ.get("EDA_REDUCE_BUDGET")
+    if not v:
+        return DEFAULT_BUDGET
+    try:
+        n = int(float(v.lower().rstrip("bk").strip()) *
+                (1024 if v.strip().lower().endswith(("k", "kb")) else 1))
+        return max(0, n)
+    except ValueError:
+        sys.stderr.write("EDA_REDUCE_BUDGET=%r 看不懂，用默认 %d\n"
+                         % (v, DEFAULT_BUDGET))
+        return DEFAULT_BUDGET
+
+
 def _apply_units(tr, decls):
     """--unit c1=V,x=s：单位由人声明，脚本不猜。"""
     if not decls:
@@ -137,8 +156,10 @@ def build_parser():
     p.add_argument("--tol", type=float, default=None,
                    help="RDP 相对容差，占量程比例（默认 %g；某些 kind 会自荐"
                         "更合适的值）" % core.DEFAULT_TOL)
-    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
-                   help="输出字节上限，0 = 不限（默认 %(default)s）")
+    p.add_argument("--budget", type=int, default=default_budget(),
+                   help="输出字节上限，0 = 不限（默认 %(default)s，"
+                        "可用环境变量 EDA_REDUCE_BUDGET 改成你那条通道的宽度，"
+                        "支持 '32k' 这种写法）")
     p.add_argument("--max-points", type=int, default=None,
                    help="SHAPE 段最多多少行（再叠加 --budget）")
     p.add_argument("--kind", help="强制分析类型: " + (", ".join(emit.registered())
@@ -166,15 +187,18 @@ def main(argv=None):
     if args.list_kinds:
         print("已注册的 kind: " + (", ".join(emit.registered()) or "无"))
         return 0
+    # 参数归一化必须在 --gui 分支**之前**：GUI 走的是同一个 args。
+    # 放在后面的话 --gui --xcols 0,2 传进去的是字符串，
+    # parse_csv 里 set("0,2") 会变成 [',','0','2']。
+    if args.xcols:
+        args.xcols = [int(v) for v in str(args.xcols).split(",")]
+    if not args.budget:
+        args.budget = None
     if args.gui:
         import wave_gui
         return wave_gui.run(args.infile[0] if args.infile else None, args)
     if not args.infile:
         build_parser().error("要么给一个 CSV，要么用 --gui")
-    if args.xcols:
-        args.xcols = [int(v) for v in args.xcols.split(",")]
-    if not args.budget:
-        args.budget = None
 
     texts, allinfo = [], []
     for path in args.infile:

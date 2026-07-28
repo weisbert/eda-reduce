@@ -189,6 +189,8 @@ class WaveGui(object):
         self.prog = tk.DoubleVar(value=0.0)
         self.tol_v = tk.DoubleVar(value=(args.tol or core.DEFAULT_TOL) * 1000.0)
         self.mp_v = tk.IntVar(value=0)
+        b0 = args.budget if args.budget else 0
+        self.budget_v = tk.StringVar(value=("%g" % (b0 / 1024.0)) if b0 else "0")
         self.force_extrema = tk.BooleanVar(value=True)
         self.force_metrics = tk.BooleanVar(value=True)
         self.cols = []
@@ -231,8 +233,21 @@ class WaveGui(object):
                               length=250, bg=BG, fg=FG, highlightthickness=0,
                               command=self._on_tol)
         self.s_tol.grid(row=0, column=3, padx=4)
+        # 预算是整个工具在优化的那个数，必须能在这里改 ——
+        # 20 KB 是「聊天框这条通道」的宽度，换条通道就该跟着变。
+        bb = tk.Frame(ctl, bg=BG)
+        bb.grid(row=1, column=3, sticky="w", pady=(4, 0))
+        tk.Label(bb, text="预算", bg=BG, fg=FG).pack(side="left")
+        e = tk.Entry(bb, textvariable=self.budget_v, width=6, bg="#fff", fg=FG)
+        e.pack(side="left", padx=(4, 2))
+        e.bind("<Return>", lambda _: self._on_budget())
+        e.bind("<FocusOut>", lambda _: self._on_budget())
+        tk.Label(bb, text="KB (0=不限)", bg=BG, fg=FG).pack(side="left")
+        tk.Button(bb, text="自动压到预算", command=self._fit).pack(side="left",
+                                                                  padx=6)
+
         self.colbox = tk.Frame(ctl, bg=BG)
-        self.colbox.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.colbox.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
         fb = tk.Frame(ctl, bg=BG)
         fb.grid(row=0, column=4, rowspan=2, padx=12)
         tk.Checkbutton(fb, text="强制保留极值", variable=self.force_extrema,
@@ -323,9 +338,7 @@ class WaveGui(object):
         sub.signals = keep
         return sub
 
-    def _recompute(self, precise=True):
-        if not self.traces:
-            return
+    def _reduce(self, max_points, check=True):
         tr = self._sub_trace()
         tol = self.tol_v.get() / 1000.0
         core.set_eps(tr, tol)
@@ -334,11 +347,15 @@ class WaveGui(object):
             names = set(id(s) for s in tr.signals)
             if all(id(s) in names for s in self.traces[self.ti].signals):
                 forced = list(self.metrics.forced())
+        return core.reduce_trace(tr, tol, max_points, self.cand, forced,
+                                 keep_extrema=self.force_extrema.get(),
+                                 check=check)
+
+    def _recompute(self, precise=True):
+        if not self.traces:
+            return
         t0 = time.time()
-        self.red = core.reduce_trace(tr, tol, self.mp_v.get(), self.cand,
-                                     forced,
-                                     keep_extrema=self.force_extrema.get(),
-                                     check=precise)
+        self.red = self._reduce(self.mp_v.get(), check=precise)
         self.ms = (time.time() - t0) * 1000.0
         if precise:
             txt = emit.emit(self.red, self.metrics)
@@ -357,20 +374,74 @@ class WaveGui(object):
             blk = ["[METRICS] （这个 kind 没有注册 metrics 模块）"]
         self.txt.insert("1.0", "\n".join(blk))
 
+    def budget(self):
+        """-> 字节数，0/空 = 不限。输入看不懂就退回启动时的值并说一声。"""
+        s = (self.budget_v.get() or "").strip()
+        if not s:
+            return 0
+        try:
+            kb = float(s)
+        except ValueError:
+            self.budget_v.set("%g" % ((self.args.budget or 0) / 1024.0))
+            return self.args.budget or 0
+        return max(0, int(kb * 1024))
+
+    def _on_budget(self):
+        b = self.budget()
+        self.args.budget = b or None
+        self._status()
+
+    def _fit(self):
+        """二分 max_points 压到当前预算。和 CLI 里那套是同一个做法。
+
+        固定开销（头部 + METRICS + EVENTS）先量一次，之后只对 SHAPE 行数二分，
+        所以中间那十几次不跑 O(n) 的重建自检。
+        """
+        if not self.red or not self.cand:
+            return
+        b = self.budget()
+        if not b:
+            self.status.set("预算设成了不限，没什么可压的")
+            return
+        self._recompute(True)                     # 先拿到准确的 fixed_bytes
+        if self.fixed_bytes >= b:
+            self.status.set(
+                "压不进去：头部+METRICS+EVENTS 本身就要 %.1f KB > 预算 %.1f KB。"
+                "那些是全精度事实，不能为预算牺牲 —— 放宽预算或调大 tol。"
+                % (self.fixed_bytes / 1024.0, b / 1024.0))
+            return
+        lo, hi, best = 2, len(self.cand), 2
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            r = self._reduce(mid, check=False)
+            if self.fixed_bytes + emit.shape_bytes(r) <= b:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        self.mp_v.set(best)
+        self._recompute(True)
+        if self.nbytes > b:                       # 强制点撑住了，压不下去
+            self.status.set(self.status.get() + "  ← 强制保留点撑住了下限")
+
     def _status(self):
         w = self.red.worst if self.red.err else None
         tr = self.red.trace
-        budget = self.args.budget or 20480
+        b = self.budget()
+        if b:
+            fit = "%.1f KB / %.1f KB %s" % (
+                self.nbytes / 1024.0, b / 1024.0,
+                "✓" if self.nbytes <= b else "✗ 超预算")
+        else:
+            fit = "%.1f KB（预算不限）" % (self.nbytes / 1024.0)
         self.status.set(
-            "%d 点  │  输出 %.1f KB / %d KB %s │  %s  │  RDP %.0f ms  │  %s"
-            % (len(self.red.kept), self.nbytes / 1024.0, budget // 1024,
-               "✓" if self.nbytes <= budget else "✗ 超预算",
+            "%d 点  │  输出 %s │  %s  │  RDP %.0f ms  │  %s"
+            % (len(self.red.kept), fit,
                ("max|err| %s (%.2f%%) rms %s  [%s]"
                 % (core.eng_str(w.maxerr, w.sig.unit, 3), w.pct,
                    core.eng_str(w.rms, w.sig.unit, 3), w.sig.name))
                if w else "误差计算中…",
                self.ms, os.path.basename(tr.source or "")))
-        self.prog.set(min(1.0, self.nbytes / float(budget)))
+        self.prog.set(min(1.0, self.nbytes / float(b)) if b else 0.0)
 
     # ------------------------------------------------------------ 交互
 
@@ -610,6 +681,18 @@ def selftest(path, args, timeout=60.0):
                        % (core.eng_str(a, tr.xunit, 4),
                           core.eng_str(b, tr.xunit, 4),
                           len(app.c_wave.find_all()), len(app.c_err.find_all())))
+            # 预算可改 + 一键压到预算
+            for kb in ("20", "40", "6"):
+                app.budget_v.set(kb)
+                app._on_budget()
+                app._fit()
+                root.update_idletasks()
+                log.append("预算 %-3s KB -> kept %-5d bytes %-6d %s"
+                           % (kb, len(app.red.kept), app.nbytes,
+                              "OK" if app.nbytes <= app.budget() else "压不进(已声明)"))
+            app.budget_v.set("0")
+            app._on_budget()
+            log.append("预算不限 -> " + app.status.get())
             log.append("状态栏: " + app.status.get())
             log.append("METRICS 窗格 %d 行"
                        % len(app.txt.get("1.0", "end").splitlines()))

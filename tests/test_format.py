@@ -234,6 +234,62 @@ class TestBudget(unittest.TestCase):
         if len(txt.encode("utf-8")) > 900:
             self.assertIn("超预算", txt, "超了必须在输出里声明")
 
+    def test_budget_is_user_definable(self):
+        """20 KB 是**这条通道**的宽度，不是普适真理 —— 必须能改。"""
+        sizes = {}
+        for b in (8192, 20480, 51200):
+            _, txt = C.run_cli([C.ex("demo_tran.csv"), "--budget", str(b)])
+            sizes[b] = len(txt.encode("utf-8"))
+        self.assertLess(sizes[20480], sizes[51200], "预算放大要真的多带点")
+        self.assertLessEqual(sizes[51200], 51200)
+        self.assertLessEqual(sizes[20480], 20480)
+
+    def test_budget_zero_means_unlimited(self):
+        _, txt = C.run_cli([C.ex("demo_tran.csv"), "--budget", "0"])
+        self.assertGreater(len(txt.encode("utf-8")), 20 * 1024)
+
+    def test_budget_env_default(self):
+        """换条通道就该换个常态值，不用每次敲 --budget。"""
+        import importlib
+        import wave_cli
+        old = os.environ.get("EDA_REDUCE_BUDGET")
+        try:
+            for val, want in (("8k", 8192), ("51200", 51200), ("32kb", 32768)):
+                os.environ["EDA_REDUCE_BUDGET"] = val
+                importlib.reload(wave_cli)
+                self.assertEqual(wave_cli.default_budget(), want, val)
+            os.environ["EDA_REDUCE_BUDGET"] = "看不懂的东西"
+            self.assertEqual(wave_cli.default_budget(), 20 * 1024,
+                             "看不懂就退回默认，不该炸")
+        finally:
+            if old is None:
+                os.environ.pop("EDA_REDUCE_BUDGET", None)
+            else:
+                os.environ["EDA_REDUCE_BUDGET"] = old
+            importlib.reload(wave_cli)
+
+    def test_gui_path_normalizes_xcols(self):
+        """--gui --xcols 0,2 曾经把字符串直接传下去，set('0,2') 变成 [',','0','2']。"""
+        import wave_cli
+        seen = {}
+
+        class FakeGui(object):
+            @staticmethod
+            def run(path, args):
+                seen["xcols"] = args.xcols
+                seen["budget"] = args.budget
+                return 0
+
+        sys.modules["wave_gui"] = FakeGui
+        try:
+            rc = wave_cli.main([C.ex("demo_tran_layoutb.csv"), "--gui",
+                                "--xcols", "0,2", "--budget", "0"])
+        finally:
+            del sys.modules["wave_gui"]
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["xcols"], [0, 2], "GUI 也要拿到解析好的下标")
+        self.assertIsNone(seen["budget"], "--budget 0 = 不限")
+
     def test_multi_trace_shares_budget(self):
         rc, txt = C.run_cli([C.ex("demo_tran_layoutb.csv")])
         self.assertLessEqual(len(txt.encode("utf-8")), 20 * 1024)

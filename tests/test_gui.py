@@ -42,6 +42,35 @@ class TestGuiSelftest(unittest.TestCase):
         self.assertIn("框选缩放", out)
         self.assertIn("状态栏", out)
 
+    def test_budget_is_editable_and_matches_cli(self):
+        """预算在 GUI 里必须能改，而且「一键压到预算」要和命令行给同一个结果。
+
+        两边给不出同一个数的话，GUI 里调好的参数拿到命令行就不作数了 ——
+        这个工具存在的理由（在数据所在的机器上把参数调好）就没了。
+        """
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "tools", "wave_reduce.py"),
+             os.path.join(ROOT, "examples", "demo_tran.csv"),
+             "--gui", "--selftest"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        out = p.stdout.decode("utf-8", "replace")
+        rows = {}
+        for ln in out.splitlines():
+            if ln.startswith("预算 ") and "->" in ln and "kept" in ln:
+                kb = ln.split()[1]
+                rows[kb] = (int(ln.split("kept")[1].split()[0]),
+                            int(ln.split("bytes")[1].split()[0]))
+        self.assertIn("20", rows, out)
+        self.assertIn("40", rows, "预算能改大")
+        self.assertIn("6", rows, "预算能改小")
+        self.assertGreater(rows["40"][0], rows["20"][0], "预算大了点数该多")
+        self.assertLess(rows["6"][0], rows["20"][0], "预算小了点数该少")
+
+        import _common as CC
+        _, txt = CC.run_cli([CC.ex("demo_tran.csv"), "--budget", "20480"])
+        self.assertEqual(rows["20"][1], len(txt.encode("utf-8")),
+                         "GUI 压到 20 KB 和命令行 --budget 20480 结果不一致")
+
     def test_canvas_segment_budget(self):
         """Canvas 上的图元数要恒定 —— 拖动时才不掉帧。"""
         p = subprocess.run(
