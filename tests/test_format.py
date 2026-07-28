@@ -30,7 +30,11 @@ STDLIB_OK = set("""
     heapq io itertools json math os platform random re shutil struct subprocess
     sys tarfile tempfile threading time traceback unittest zlib
     wave_core wave_emit wave_cli wave_gui wave_metrics_tran wave_metrics_freq
+    wave_demod
 """.split())
+# `wave_demod` 出现在 wave_cli 里，但那是**函数内的 try/except 导入**：
+# 只有 --demod 才会走到，缺了它三件套照常跑。放行名字，
+# 由 test_escape_hatch_survives_a_missing_demod 去守真正那条性质。
 
 
 def imports_of(path):
@@ -116,6 +120,35 @@ class TestPureStdlib(unittest.TestCase):
         self.assertTrue(os.path.exists(out))
         with open(out, encoding="utf-8") as fh:
             self.assertGreater(len(fh.readlines()), 1000)
+
+    def test_escape_hatch_survives_a_missing_demod(self):
+        """`wave_demod.py` 缺席时，三件套必须照常出 .wv，只是没有 --demod。
+
+        逃生舱的定义是「scp 三个文件过去就能跑」。新加一个可选模块不许把这条
+        性质吃掉，所以这里真的把它从 import 路径上藏起来再跑一遍。
+        """
+        import wave_cli
+        hidden = sys.modules.pop("wave_demod", None)
+
+        class Blocker(object):
+            def find_module(self, name, path=None):
+                return self if name == "wave_demod" else None
+
+            def load_module(self, name):
+                raise ImportError("wave_demod 被测试藏起来了")
+
+        b = Blocker()
+        sys.meta_path.insert(0, b)
+        try:
+            rc, txt = C.run_cli([C.ex("demo_tran.csv")])
+            self.assertEqual(rc, 0)
+            self.assertIn("[SHAPE]", txt)
+            self.assertRaises(SystemExit, wave_cli.main,
+                              [C.ex("demo_tran.csv"), "--demod"])
+        finally:
+            sys.meta_path.remove(b)
+            if hidden is not None:
+                sys.modules["wave_demod"] = hidden
 
     def test_escape_hatch_runs_without_metrics_modules(self):
         """metrics 模块缺席时也要能出 .wv —— 这是逃生舱的定义。"""

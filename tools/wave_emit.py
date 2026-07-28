@@ -29,6 +29,7 @@ MAX_EVENTS = 250
 LINE_W = 108
 MIN_PTS_PER_CYCLE = 4     # 低于这个数，SHAPE 画出来就不像正弦了
 MIN_CYCLES = 20           # 周期数少于这个就不提 —— 几个周期的振铃本来就该逐点画
+FLAT_REL = 1e-4           # 起伏不到自身量级的这个比例，就当它是平的
 
 
 # --------------------------------------------------------------- 测量/事件
@@ -239,6 +240,12 @@ def carrier_warn(red):
     for s in tr.signals:
         if s.cycles < MIN_CYCLES:
             continue
+        # 整条曲线的起伏还不到自身量级的万分之一 -> 它实质上是平的，
+        # 「画不出正弦」这句话对它没有意义。派生量上会遇到：一条恒定载频的
+        # f_inst，全部起伏就是 2e-6 的测量残差，照样能数出上百个「周期」。
+        mid = abs(0.5 * (s.vmin + s.vmax))
+        if mid > 0 and s.rng < FLAT_REL * mid:
+            continue
         ppc = nk / float(s.cycles)
         if ppc < MIN_PTS_PER_CYCLE and (worst is None or ppc < worst[1]):
             worst = (s, ppc)
@@ -368,11 +375,13 @@ def shape_block(red):
 def emit(red, metrics=None, extra_notes=None):
     """-> .wv 文本（一条 trace）。"""
     parts = header(red, metrics, extra_notes)
+    # 附加段排在 SHAPE 之后：它们是「原始样点」，比量化过的形状更贵也更准，
+    # 但读的顺序仍然是 先自检 -> 再测量 -> 再形状 -> 最后细节
     for blk in (metrics_block(red, metrics), events_block(red, metrics),
-                shape_block(red)):
+                shape_block(red)) + tuple(red.trace.extra):
         if blk:
             parts.append("")
-            parts.extend(blk)
+            parts.extend(blk if isinstance(blk, list) else blk.splitlines())
     return "\n".join(parts) + "\n"
 
 

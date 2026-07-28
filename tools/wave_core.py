@@ -182,7 +182,7 @@ class Trace(object):
 
     __slots__ = ("source", "xname", "xunit", "xunit_src", "x", "signals",
                  "kind", "kind_src", "xscale", "notes", "warns", "dt_med",
-                 "dt_min", "dt_max", "index", "window")
+                 "dt_min", "dt_max", "index", "window", "extra")
 
     def __init__(self, xname="x", index=0):
         self.source = ""
@@ -199,6 +199,9 @@ class Trace(object):
         self.dt_med = self.dt_min = self.dt_max = 0.0
         self.index = index
         self.window = None                # (lo, hi, 原文件 lo, 原文件 hi)
+        # 附加段（现在只有 --demod 的 [CYCLES]）。**跟着同一份文档走** ——
+        # 一键复制是硬要求，不许把一次分析拆成几个文件
+        self.extra = []
 
     def __len__(self):
         return len(self.x)

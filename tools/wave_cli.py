@@ -111,13 +111,42 @@ def _why_tol(tr, tol):
     return "相当于 %s 的容差" % core.eng_str(tol * r, u, 3)
 
 
+def _demod(tr, args):
+    """--demod：把载波解调掉。-> [trace, ...]（不生效就返回 [原 trace]）。
+
+    解调必须在 analyze **之后**（要 vmin/vmax/噪声底才切得出周期），
+    在 reduce **之前**（后面整条管道都跑在派生信号上）。
+    """
+    try:
+        import wave_demod
+    except ImportError:                          # 逃生舱模式：只有三个文件时
+        raise SystemExit("--demod 需要 tools/wave_demod.py，这份部署里没有")
+    out, cycles = wave_demod.demod(tr, 0, min_cycles=args.demod_min)
+    if not out:
+        tr.note("--demod 没生效：只切出 %d 个载波周期（要 >= %d）。"
+                "这条信号可能不是准正弦，或者时间分辨率不够撑起周期"
+                % (len(cycles), args.demod_min))
+        return [tr]
+    for t in out:
+        core.analyze(t, kind=args.kind, xscale=args.xscale)
+    picks = wave_demod.pick_representative(cycles, args.demod_cycles)
+    if picks:
+        core.set_eps(tr, args.tol or core.DEFAULT_TOL)
+        cs = core.make_colspec(tr, args.tol or core.DEFAULT_TOL)[0]
+        cs.label = "c_raw"
+        cap = int((args.budget or 0) * wave_demod.CYCLE_BUDGET_FRAC) or None
+        out[0].extra.append(wave_demod.cycles_block(tr, 0, picks, cs,
+                                                    tr.xunit, cap))
+    return out
+
+
 def process(path, args):
     """-> (text, [(trace, reduction), ...])"""
     traces = core.parse_csv(path, layout=args.layout, xcols=args.xcols)
     if not traces:
         raise ValueError("没解析出任何 trace: %s" % path)
-    per = args.budget // len(traces) if args.budget else None
-    chunks, info = [], []
+    # 预处理（切窗口 / 解调）会改变 trace 的条数，所以预算要等条数定下来再摊
+    prepared = []
     for tr in traces:
         _apply_units(tr, args.unit)
         if args.xrange:
@@ -125,11 +154,16 @@ def process(path, args):
             # 拿整条的极值去定窗口内的容差会差出量级
             core.slice_trace(tr, *args.xrange)
         core.analyze(tr, kind=args.kind, xscale=args.xscale)
+        prepared.extend(_demod(tr, args) if args.demod else [tr])
+
+    per = args.budget // len(prepared) if args.budget else None
+    chunks, info = [], []
+    for tr in prepared:
+        notes = []
         m = None
         if not args.no_metrics:
             m = emit.run_metrics(tr)
         tol = args.tol
-        notes = []
         if tol is None:
             tol = core.DEFAULT_TOL
             sug = m.suggest_tol() if m else None
@@ -182,6 +216,16 @@ def build_parser():
                         "代价是 RDP 变慢（GUI 交互会卡）")
     p.add_argument("--unit", action="append", default=[], metavar="C=U",
                    help="声明单位，如 --unit c1=V,x=s。脚本不猜单位")
+    p.add_argument("--demod", action="store_true",
+                   help="解调：SHAPE 改画上下包络 + 瞬时频率，另附几个代表性周期的"
+                        "原始样点。振荡波形的正解——2515 个周期折线要 218 KB，"
+                        "解调后约 26 KB，且回答的是「包络」和「频率牵引」")
+    p.add_argument("--demod-cycles", type=int, default=None, dest="demod_cycles",
+                   metavar="N", help="附几个代表性周期（默认 %d）。挑在极值处："
+                                     "包络最大/最小、频率偏离最大、残差最大"
+                                     % 6)
+    p.add_argument("--demod-min", type=int, default=None, dest="demod_min",
+                   metavar="N", help="少于这么多周期就不解调（默认 %d）" % 20)
     p.add_argument("--no-metrics", action="store_true",
                    help="只出 SHAPE，不跑测量")
     p.add_argument("--no-offset", action="store_true", help="不扣基线")
@@ -216,6 +260,16 @@ def main(argv=None):
             build_parser().error("--xrange 看不懂: %r" % args.xrange)
     if not args.budget:
         args.budget = None
+    # 默认值放在这里而不是 add_argument 里：wave_demod 可能缺席（逃生舱模式），
+    # 那时 build_parser() 也不该炸
+    if args.demod_cycles is None or args.demod_min is None:
+        try:
+            import wave_demod
+            dc, dm = wave_demod.N_REPRESENT, wave_demod.MIN_CYCLES
+        except ImportError:
+            dc, dm = 6, 20
+        args.demod_cycles = args.demod_cycles or dc
+        args.demod_min = args.demod_min or dm
     if args.gui:
         import wave_gui
         return wave_gui.run(args.infile[0] if args.infile else None, args)

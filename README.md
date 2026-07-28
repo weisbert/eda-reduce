@@ -67,6 +67,9 @@ python tools/drawio_reduce.py my.drawio --bbox 400,300,800,700   # 只导出一�
 python tools/wave_reduce.py my.csv -o my.wv        # 默认压到 20 KB 以内
 python tools/wave_reduce.py my.csv --gui           # 拖滑块看丢了什么、看字节数
                                                    # 滚轮/框选缩放，右键拖平移，双击或 0 复位
+python tools/wave_reduce.py my.csv --demod         # 振荡波形：传调制不传载波
+                                                   # 包络 + 瞬时频率 + 几个代表性周期，
+                                                   # 全在同一份 txt 里。实测 218 KB -> 22 KB
 python tools/wave_reduce.py my.csv --xrange 1.6u:1.62u   # 只导这一段
                                                    # 振荡波形必须这么看：预算摊在
                                                    # 2500 个周期上是 1.6 点/周期，
