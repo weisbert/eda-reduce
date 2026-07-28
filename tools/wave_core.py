@@ -219,7 +219,7 @@ class Trace(object):
 
     __slots__ = ("source", "xname", "xunit", "xunit_src", "x", "signals",
                  "kind", "kind_src", "xscale", "notes", "warns", "dt_med",
-                 "dt_min", "dt_max", "index", "window", "extra")
+                 "dt_min", "dt_max", "index", "window", "extra", "picks")
 
     def __init__(self, xname="x", index=0):
         self.source = ""
@@ -239,6 +239,10 @@ class Trace(object):
         # 附加段（现在只有 --demod 的 [CYCLES]）。**跟着同一份文档走** ——
         # 一键复制是硬要求，不许把一次分析拆成几个文件
         self.extra = []
+        # 代表性周期的原始样点（--demod 填）。GUI 要画得出来 ——
+        # `[CYCLES]` 段是输出里唯一一块**没有任何画面**的东西，
+        # 而它恰恰是判断「波形失真没失真」该看的那块
+        self.picks = []
 
     def __len__(self):
         return len(self.x)
@@ -255,6 +259,7 @@ class Trace(object):
         t.kind, t.kind_src, t.xscale = self.kind, self.kind_src, self.xscale
         t.x = array("d", self.x)
         t.notes = list(self.notes)
+        t.picks = list(self.picks)
         t.warns = list(self.warns)
         for s in self.signals:
             d = Signal(s.name, s.unit, s.unit_src)

@@ -208,6 +208,8 @@ class WaveGui(object):
         # 「用 --gui --demod 去开一个 GUI 模式」本身就是设计错了
         self.demod_v = tk.BooleanVar(value=bool(getattr(args, 'demod', False)))
         self.win_v = tk.BooleanVar(value=False)
+        self.ev_v = tk.BooleanVar(value=True)      # 波形上标 EVENTS
+        self.low_v = tk.StringVar(value="err")     # 下窗格画什么
         self.view_full = tk.BooleanVar(value=False)
         self._build()
         # 没给文件也要能开窗。开窗和选文件是两件事，绑死了不合理 ——
@@ -288,6 +290,9 @@ class WaveGui(object):
         tk.Checkbutton(mb, text="只压当前视窗", variable=self.win_v,
                        bg=BG, fg=FG, selectcolor=BG,
                        command=self._remode).pack(anchor="w")
+        tk.Checkbutton(mb, text="波形上标出 EVENTS", variable=self.ev_v,
+                       bg=BG, fg=FG, selectcolor=BG,
+                       command=self._redraw).pack(anchor="w")
 
         # 下窗格的工具条。**复制到剪贴板**是这里最重要的一个按钮：
         # .wv 的归宿就是粘进聊天框，「先另存成文件、再打开、再全选、再复制」
@@ -299,6 +304,11 @@ class WaveGui(object):
         tk.Button(tb, text="复制全文到剪贴板", command=self._copy).pack(
             side="left", padx=(8, 2))
         tk.Button(tb, text="另存 .wv…", command=self._save).pack(side="left")
+        tk.Label(tb, text="  下格:", bg=BG, fg=FG).pack(side="left", padx=(12, 0))
+        for val, lab in (("err", "误差"), ("cycles", "代表周期")):
+            tk.Radiobutton(tb, text=lab, variable=self.low_v, value=val,
+                           bg=BG, fg=FG, selectcolor=BG,
+                           command=self._redraw).pack(side="left")
         tk.Radiobutton(tb, text="METRICS", variable=self.view_full, value=False,
                        bg=BG, fg=FG, selectcolor=BG,
                        command=self._fill_text).pack(side="left", padx=(16, 0))
@@ -974,12 +984,89 @@ class WaveGui(object):
             a, b = sorted(self._sel)
             c.create_rectangle(a, xf.t, b, h - xf.b, outline="#1c71d8",
                                dash=(3, 2))
+        self._draw_events(c, xf, h)
         c.create_text(w - 8, h - 8, anchor="se", fill="#888",
                       font=("Consolas", 8),
                       text="灰带=原始 min/max 包络；框选或滚轮缩放，"
                            "右键拖平移，+/- ←/→，双击或 0 复位")
 
+    def _draw_events(self, c, xf, h):
+        """把 `[EVENTS]` 画到波形上。
+
+        EVENTS 是输出里**全精度的时间轴**（glitch 在哪、什么时候 settle、
+        极值落在哪一点），但在界面上一条都看不见 —— 人得对着下面的文本
+        自己往图上换算。竖线一画，METRICS 和图就接上了。
+        """
+        if not (self.ev_v.get() and self.metrics):
+            return
+        try:
+            evs = self.metrics.events()
+        except Exception:                           # noqa: BLE001
+            return
+        lo, hi = self.view
+        seen = {}
+        for e in evs:
+            if not (lo <= e.x <= hi):
+                continue
+            px = xf.sx(e.x)
+            # 同一个 x 上挤了好几个事件就往下错开，否则标签叠成一坨
+            k = int(px / 60)
+            row = seen.get(k, 0)
+            seen[k] = row + 1
+            col = COLORS[(hash(e.col) if e.col else 0) % 6]
+            c.create_line(px, xf.t, px, h - xf.b, fill=col, dash=(2, 3))
+            c.create_text(px + 3, xf.t + 6 + row * 11, anchor="nw",
+                          text="%s %s" % (e.col, e.tag), fill=col,
+                          font=("Consolas", 7))
+
+    def _draw_cycles(self):
+        """下窗格：代表性周期叠在一起（横轴对齐到各自周期起点）。
+
+        `[CYCLES]` 是输出里唯一**一块画面都没有**的段，而它恰恰是判断
+        「波形失真没失真」该看的那块 —— 解调把包络抹平了，畸变只在这里看得见。
+        叠着画是刻意的：几个周期重合得好不好，一眼就知道形状稳不稳。
+        """
+        c = self.c_err
+        c.delete("all")
+        picks = getattr(self.red.trace, "picks", None) or []
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 50 or h < 50:
+            return
+        if not picks:
+            c.create_text(w // 2, h // 2, fill="#888", font=("Consolas", 9),
+                          text="没有代表性周期 —— 勾上「解调」才有"
+                               "（这一格画的是 CYCLES 段）")
+            return
+        tmax = max(max(p["t"]) for p in picks if p["t"]) or 1.0
+        ylo = min(min(p["y"]) for p in picks if p["y"])
+        yhi = max(max(p["y"]) for p in picks if p["y"])
+        if yhi <= ylo:
+            yhi = ylo + 1.0
+        xf = Xform(0.0, tmax, ylo, yhi, w, h)
+        self._grid(c, xf, w, h)
+        u = self.red.trace.signals[0].unit if self.red.trace.signals else ""
+        for i, p in enumerate(picks):
+            col = COLORS[i % 6]
+            line = []
+            for t, y in zip(p["t"], p["y"]):
+                line += [xf.sx(t), xf.sy(y)]
+            if len(line) >= 4:
+                c.create_line(line, fill=col, width=1)
+            c.create_text(xf.l + 6, 10 + i * 11, anchor="w", fill=col,
+                          font=("Consolas", 7),
+                          text="@%s 幅度 %s 残差 %.1f%% (%s)"
+                               % (core.eng_str(p["at"], self.red.trace.xunit, 4),
+                                  core.eng_str(p["amp"], u, 3),
+                                  100.0 * p["resid"], p["why"]))
+        c.create_text(w - 8, h - 8, anchor="se", fill="#888",
+                      font=("Consolas", 8),
+                      text="代表性周期的原始样点，横轴对齐到各自周期起点；"
+                           "重合得好=形状稳，散开=有畸变")
+
     def _draw_err(self):
+        if self.low_v.get() == "cycles":
+            self._draw_cycles()
+            return
         c = self.c_err
         c.delete("all")
         tr = self.red.trace

@@ -499,6 +499,25 @@ def apply(tr, tol, budget=None, n_cycles=N_REPRESENT, min_cycles=MIN_CYCLES,
         cs.label = "c_raw"
         cap = int((budget or 0) * CYCLE_BUDGET_FRAC) or None
         out[0].extra.append(cycles_block(tr, 0, picks, cs, tr.xunit, cap))
+        out[0].picks = pick_data(tr, 0, picks)
+    return out
+
+
+def pick_data(tr, si, picks):
+    """代表性周期 -> 画得出来的纯数据。
+
+    直接把样点抄出来，而不是存下标：显示用的是**派生** trace（包络），
+    下标是**原始** trace 的，两边对不上。几个周期几十个点，抄一份最省心。
+    """
+    x, y = tr.x, tr.signals[si].y
+    out = []
+    for c in picks:
+        out.append({
+            "at": c.at, "why": c.why, "amp": c.amp, "period": c.period,
+            "resid": c.resid,
+            "t": [x[i] - c.t0 for i in range(c.i0, c.i1)],
+            "y": [y[i] for i in range(c.i0, c.i1)],
+        })
     return out
 
 

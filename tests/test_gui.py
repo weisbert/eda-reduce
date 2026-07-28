@@ -433,6 +433,73 @@ class TestGuiSelftest(unittest.TestCase):
         finally:
             os.unlink(p)
 
+    def test_every_exported_section_has_a_view(self):
+        """导出的每一段都得看得见。
+
+        原来只有 SHAPE 和误差有画面：`[EVENTS]`（全精度时间轴）一条看不见，
+        `[CYCLES]`（代表性周期）更是完全没有视图 —— 而后者恰恰是判断
+        「波形失真没失真」该看的那块。
+        """
+        import math
+        import os
+        import tempfile
+        rows = ["i /VCO/VDD; tran (I) X,i /VCO/VDD; tran (I) Y"]
+        t = 0.0
+        while t < 4e-7:
+            a = 2e-3 * (1 - math.exp(-(t - 1e-7) / 2e-8)) if t > 1e-7 else 0.0
+            rows.append("%.12g,%.9g"
+                        % (t, 4e-4 + a * math.sin(2 * math.pi * 5.03e9 * t)))
+            t += 1e-11
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            with open(p, "w", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
+            import tkinter as tk
+            import wave_cli
+            import wave_gui
+            args = wave_cli.build_parser().parse_args([])
+            args.budget = 51200
+            args.demod_cycles, args.demod_min = 6, 20
+            root = tk.Tk()
+            try:
+                app = wave_gui.WaveGui(root, p, args)
+                app.c_wave.configure(width=900, height=330)
+                app.c_err.configure(width=900, height=180)
+                for _ in range(500):
+                    root.update()
+                    if app.red:
+                        break
+                    time.sleep(0.02)
+                # EVENTS 叠加：开关一关，图元必须变少（证明真画了）
+                app.ev_v.set(True)
+                app._redraw()
+                root.update()
+                with_ev = len(app.c_wave.find_all())
+                app.ev_v.set(False)
+                app._redraw()
+                root.update()
+                self.assertLess(len(app.c_wave.find_all()), with_ev,
+                                "EVENTS 开关没起作用")
+                # 代表周期视图：没解调时给一句提示，解调后真画出来
+                app.low_v.set("cycles")
+                app._redraw()
+                root.update()
+                bare = len(app.c_err.find_all())
+                app.demod_v.set(True)
+                app._remode()
+                root.update()
+                self.assertTrue(app.red.trace.picks, "解调后应当有代表性周期")
+                self.assertGreater(len(app.c_err.find_all()), bare,
+                                   "代表周期没画出来")
+                for pk in app.red.trace.picks:
+                    self.assertEqual(len(pk["t"]), len(pk["y"]))
+                    self.assertTrue(pk["why"], "每个代表周期都要说清为什么被选中")
+            finally:
+                root.destroy()
+        finally:
+            os.unlink(p)
+
     def test_window_title_shows_the_build(self):
         """「我跑的是哪一版」在窗口里就该看得见，不用回命令行。"""
         root, app = self._app("demo_tran.csv")
@@ -443,19 +510,24 @@ class TestGuiSelftest(unittest.TestCase):
             root.destroy()
 
     def test_canvas_segment_budget(self):
-        """Canvas 上的图元数要恒定 —— 拖动时才不掉帧。"""
+        """拖 max-points 时 Canvas 图元数要恒定 —— 那是掉帧的来源。
+
+        只比**拖滑块**那几行。缩放会改变图元数是对的：EVENTS 标注只画视窗内的，
+        窗口小了事件自然少几条。把缩放也算进「恒定」里，等于禁止任何
+        跟视窗有关的绘制 —— 那不是这条测试想守的东西。
+        """
         p = subprocess.run(
             [sys.executable, os.path.join(ROOT, "tools", "wave_reduce.py"),
              os.path.join(ROOT, "examples", "demo_tran.csv"),
              "--gui", "--selftest"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
         out = p.stdout.decode("utf-8", "replace")
-        counts = []
-        for ln in out.splitlines():
-            if "canvas items" in ln:
-                counts.append(ln.split("canvas items")[1].strip())
-        self.assertTrue(counts)
-        self.assertEqual(len(set(counts)), 1, "图元数应当恒定: %s" % counts)
+        counts = [ln.split("canvas items")[1].strip()
+                  for ln in out.splitlines()
+                  if ln.startswith("max_points=") and "canvas items" in ln]
+        self.assertGreaterEqual(len(counts), 4, out)
+        self.assertEqual(len(set(counts)), 1,
+                         "拖滑块时图元数应当恒定: %s" % counts)
 
 
 class TestGuiPureCompute(unittest.TestCase):
