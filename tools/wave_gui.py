@@ -203,6 +203,11 @@ class WaveGui(object):
         self.force_metrics = tk.BooleanVar(value=True)
         self.cols = []
         self.ti_v = tk.IntVar(value=0)
+        self.raw = []
+        # 这两个是**模式**，不是命令行开关：用户的入口是这个窗口，
+        # 「用 --gui --demod 去开一个 GUI 模式」本身就是设计错了
+        self.demod_v = tk.BooleanVar(value=bool(getattr(args, 'demod', False)))
+        self.win_v = tk.BooleanVar(value=False)
         self.view_full = tk.BooleanVar(value=False)
         self._build()
         # 没给文件也要能开窗。开窗和选文件是两件事，绑死了不合理 ——
@@ -217,7 +222,7 @@ class WaveGui(object):
 
     def _build(self):
         r = self.root
-        r.title("wave_reduce — 预览")
+        r.title("wave_reduce — 预览    [build %s]" % core.build_id())
         r.configure(bg=BG)
         r.geometry("1180x820")
 
@@ -275,6 +280,14 @@ class WaveGui(object):
         tk.Checkbutton(fb, text="纵轴跟视窗", variable=self.y_local,
                        bg=BG, fg=FG, selectcolor=BG,
                        command=self._redraw).pack(anchor="w")
+        mb = tk.Frame(ctl, bg=BG)
+        mb.grid(row=0, column=5, rowspan=2, padx=12)
+        tk.Checkbutton(mb, text="解调（包络+频率+代表周期）", variable=self.demod_v,
+                       bg=BG, fg=FG, selectcolor=BG,
+                       command=self._remode).pack(anchor="w")
+        tk.Checkbutton(mb, text="只压当前视窗", variable=self.win_v,
+                       bg=BG, fg=FG, selectcolor=BG,
+                       command=self._remode).pack(anchor="w")
 
         # 下窗格的工具条。**复制到剪贴板**是这里最重要的一个按钮：
         # .wv 的归宿就是粘进聊天框，「先另存成文件、再打开、再全选、再复制」
@@ -355,23 +368,20 @@ class WaveGui(object):
             try:
                 trs = core.parse_csv(path, layout=self.args.layout,
                                      xcols=self.args.xcols)
-                prepared = []
                 for tr in trs:
                     if getattr(self.args, "xrange", None):
                         core.slice_trace(tr, *self.args.xrange)
                     core.analyze(tr, kind=self.args.kind, xscale=self.args.xscale)
-                    prepared.extend(self._demod(tr))
-                trs = prepared
-                tr = trs[0]
+                # 到此为止：**解析和 analyze 是重活，放线程；模式切换不能放。**
+                # `_build_traces` 要读 self.demod_v / self.win_v 这些 Tk 变量，
+                # 跨线程碰 Tk 变量是未定义行为（实测：整个载入静默卡死，
+                # app.red 永远是 None，也不报错）。模式的事回主线程做。
                 m = None
                 if not self.args.no_metrics:
-                    m = emit.run_metrics(tr)
+                    m = emit.run_metrics(trs[0])
                 tol = self.args.tol or (m.suggest_tol() if m else None) \
                     or core.DEFAULT_TOL
-                core.set_eps(tr, tol)
-                cand = core.predecimate(tr, tol, max_cand=self._max_cand(),
-                                       progress=lambda f: q.append(f))
-                q.append(("done", trs, m, cand, tol))
+                q.append(("done", trs, tol))
             except Exception as exc:                    # noqa: BLE001
                 q.append(("err", exc))
 
@@ -393,11 +403,12 @@ class WaveGui(object):
                 self.txt.insert("1.0", "载入失败\n\n" + msg)
                 self.prog.set(0.0)
                 return
-            _, trs, m, cand, tol = it
-            self.traces, self.metrics, self.cand = trs, m, cand
+            _, raw, tol = it
+            self.raw = raw
             self.tol_v.set(tol * 1000.0)
+            self.traces = self._build_traces(raw)
             self.ti_v.set(0)
-            self._use_trace(0)
+            self._use_trace(0)             # metrics / 候选集在这里面算
             return
         self.root.after(40, lambda: self._poll(q))
 
@@ -639,6 +650,43 @@ class WaveGui(object):
     def _max_cand(self):
         return getattr(self.args, "max_cand", None) or core.MAX_CAND
 
+    def _build_traces(self, raw):
+        """原始 trace -> 当前模式下要展示/输出的 trace 列表。
+
+        顺序跟命令行**必须**一致：先切窗口再 analyze 再解调。
+        切完窗口要重新 analyze —— 极值、噪声底、周期数都得是窗口内的，
+        拿整条的极值去定窗口内的容差会差出量级。
+        """
+        win = self.view if (self.win_v.get() and self.view) else None
+        out = []
+        for tr in raw:
+            t = tr
+            if win:
+                t = tr.clone()
+                try:
+                    core.slice_trace(t, win[0], win[1])
+                except ValueError:
+                    t = tr                     # 窗口里没点：当没切
+                core.analyze(t, kind=self.args.kind, xscale=self.args.xscale)
+            out.extend(self._demod(t) if self.demod_v.get() else [t])
+        return out
+
+    def _remode(self):
+        """解调 / 只压当前视窗 —— 这两个开关一动就整条重来。
+
+        重来一次是 O(n)（切窗口 + analyze + 找周期），几十万点上一两秒。
+        点一下等一下可以接受；**不能接受的是让人为了换个模式回命令行重开窗口**。
+        """
+        if not self.raw:
+            return
+        self.status.set("重算中…（解调 %s，视窗 %s）"
+                        % ("开" if self.demod_v.get() else "关",
+                           "只压当前" if self.win_v.get() else "全长"))
+        self.root.update_idletasks()
+        self.traces = self._build_traces(self.raw)
+        self.ti_v.set(0)
+        self._use_trace(0)
+
     def _demod(self, tr):
         """`--demod` 在 GUI 里也要生效，而且走**命令行同一条路**。
 
@@ -647,8 +695,8 @@ class WaveGui(object):
         而且没有任何提示。同一个功能有两个入口就迟早分叉，所以现在共用
         `wave_demod.apply()`。
         """
-        if not getattr(self.args, "demod", False):
-            return [tr]
+        # 要不要解调由**调用方**（窗口里那个勾）决定，不再看 args.demod ——
+        # 留着那个早退会让命令行开关把界面开关按死，勾了也没反应
         try:
             import wave_demod
         except ImportError:

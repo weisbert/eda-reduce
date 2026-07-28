@@ -371,6 +371,77 @@ class TestGuiSelftest(unittest.TestCase):
         finally:
             os.unlink(p)
 
+    def test_modes_are_toggles_in_the_window(self):
+        """解调 / 只压当前视窗是**窗口里的开关**，不是命令行标志。
+
+        用户的入口是 GUI：「为了换个模式回命令行重开窗口」这件事本身就是设计错了。
+        而且勾了要能取消 —— 所以原始 trace 必须留着。
+        """
+        import math
+        import os
+        import tempfile
+        rows = ["i /VCO/VDD; tran (I) X,i /VCO/VDD; tran (I) Y"]
+        t = 0.0
+        while t < 4e-7:
+            a = 2e-3 * (1 - math.exp(-(t - 1e-7) / 2e-8)) if t > 1e-7 else 0.0
+            rows.append("%.12g,%.9g"
+                        % (t, 4e-4 + a * math.sin(2 * math.pi * 5.03e9 * t)))
+            t += 1e-11
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            with open(p, "w", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
+            import tkinter as tk
+            import wave_cli
+            import wave_gui
+            args = wave_cli.build_parser().parse_args([])
+            args.budget = 51200
+            args.demod_cycles, args.demod_min = 6, 20
+            root = tk.Tk()
+            try:
+                app = wave_gui.WaveGui(root, p, args)
+                for _ in range(500):
+                    root.update()
+                    if app.red:
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(app.red)
+                full = (app.red.trace.x[0], app.red.trace.x[-1])
+                self.assertEqual(len(app.traces), 1)
+
+                app.demod_v.set(True)
+                app._remode()
+                self.assertEqual(len(app.traces), 2, "包络块 + 频率块")
+                self.assertTrue(app.red.trace.signals[0].name.startswith("env_hi"))
+                self.assertIn("[CYCLES]", app.wv_text())
+
+                app.view = (1.5e-7, 1.7e-7)
+                app.win_v.set(True)
+                app._remode()
+                self.assertGreater(app.red.trace.x[0], 1.4e-7, "窗口没生效")
+                self.assertLess(app.red.trace.x[-1], 1.8e-7)
+
+                app.win_v.set(False)
+                app.demod_v.set(False)
+                app._remode()
+                self.assertEqual(len(app.traces), 1, "取消不掉就是单向门")
+                self.assertAlmostEqual(app.red.trace.x[0], full[0], delta=1e-12)
+                self.assertAlmostEqual(app.red.trace.x[-1], full[1], delta=1e-12)
+            finally:
+                root.destroy()
+        finally:
+            os.unlink(p)
+
+    def test_window_title_shows_the_build(self):
+        """「我跑的是哪一版」在窗口里就该看得见，不用回命令行。"""
+        root, app = self._app("demo_tran.csv")
+        try:
+            from wave_core import build_id
+            self.assertIn(build_id(), root.title())
+        finally:
+            root.destroy()
+
     def test_canvas_segment_budget(self):
         """Canvas 上的图元数要恒定 —— 拖动时才不掉帧。"""
         p = subprocess.run(

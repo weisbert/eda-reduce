@@ -67,6 +67,8 @@ python tools/drawio_reduce.py my.drawio --bbox 400,300,800,700   # 只导出一�
 python tools/wave_reduce.py my.csv -o my.wv        # 默认压到 20 KB 以内
 python tools/wave_reduce.py my.csv --gui           # 拖滑块看丢了什么、看字节数
                                                    # 滚轮/框选缩放，右键拖平移，双击或 0 复位
+                                                   # 解调 / 只压当前视窗是窗口里的勾选框，
+                                                   # 不用回命令行；标题栏显示 build 号
 python tools/wave_reduce.py my.csv --demod         # 振荡波形：传调制不传载波
                                                    # 包络 + 瞬时频率 + 几个代表性周期，
                                                    # 全在同一份 txt 里。实测 218 KB -> 22 KB

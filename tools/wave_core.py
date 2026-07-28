@@ -247,6 +247,21 @@ class Trace(object):
         if msg not in self.notes:          # 重跑 set_eps/predecimate 不该刷屏
             self.notes.append(msg)
 
+    def clone(self):
+        """深拷一份（x 和每列 y 都复制）。GUI 里切「只压当前视窗」要用：
+        切窗口是就地改的，原始那份得留着，不然关掉开关就回不去了。"""
+        t = Trace(self.xname, index=self.index)
+        t.source, t.xunit, t.xunit_src = self.source, self.xunit, self.xunit_src
+        t.kind, t.kind_src, t.xscale = self.kind, self.kind_src, self.xscale
+        t.x = array("d", self.x)
+        t.notes = list(self.notes)
+        t.warns = list(self.warns)
+        for s in self.signals:
+            d = Signal(s.name, s.unit, s.unit_src)
+            d.y = array("d", s.y)
+            t.signals.append(d)
+        return t
+
     def warn(self, msg):
         """比 note 高一级：**输入本身不足以支撑下面的数**。
 
