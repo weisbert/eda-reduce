@@ -54,6 +54,7 @@ examples/gen_demo_wave.py  合成波形生成器 —— 真值已知，所以测
 examples/demo_*.csv   合成波形样例（瞬态 / AC / 谱 / 布局B / 脏数据）
 examples/demo_*.wv    压缩结果，同时充当回归基准
 deploy/               隔离区双包部署管道（见 deploy/README.md）
+                      日常更新就一条命令：tar 传进安装目录，bash update
 tests/                unittest 全套（见 tests/README.md）
 ```
 

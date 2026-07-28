@@ -5,6 +5,11 @@
 所以这里是**真的打包、真的解开、真的跑 bootstrap.sh**，不是读代码猜。
 
 需要 bash（Windows 上 Git Bash 就行）和 git 仓库，缺了会跳过并说明。
+
+**注意：这些测试测的是 HEAD，不是工作树。** 打包读的是 committed blob
+（`git archive HEAD`，为的是躲开黄区 autocrlf），所以改了 deploy/ 里的脚本
+要先 commit，测试才看得见。这不是 bug，正是那条 git 卫生闸在起作用 ——
+它同时也保证了「你以为打进包的改动」和「真的打进包的改动」是同一件事。
 """
 
 import os
@@ -196,6 +201,65 @@ class TestPackageAndInstall(unittest.TestCase):
                          "成功之后载荷目录该收掉")
         r = sh([BASH, os.path.join(home, "wave"), "--list-kinds"], cwd=home)
         self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+
+    def test_one_command_update_launcher(self):
+        """日常唯一要记的命令：把 tar 传进安装目录，`bash update`。
+
+        校验 / 解包 / 换 app/ / 清理，全在启动器里。这是 LDO_modeling 那套
+        `deploy/update` 的做法 —— 少一步 tar，就少一次记错。
+        """
+        home = os.path.join(self.tmp, "oneshot", "eda_reduce")
+        os.makedirs(home)
+        subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
+        self.assertEqual(sh([BASH, "bootstrap.sh"], cwd=home).returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(home, "update")),
+                        "bootstrap 要把 update 启动器铺到安装目录根下")
+        with open(os.path.join(home, "app", "tools", "_marker.txt"), "w") as fh:
+            fh.write("OLD")
+
+        r = sh([sys.executable, os.path.join(ROOT, "deploy", "package.py"),
+                "incremental", "--out", self.dist])
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+        for ext in ("", ".sha256"):
+            shutil.copy(os.path.join(
+                self.dist, "eda_reduce_incremental.tar.gz" + ext), home)
+
+        r = sh([BASH, "update"], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("校验 sha256", out, "旁文件在就得校验")
+        self.assertIn("更新完成", out)
+        self.assertFalse(os.path.isdir(os.path.join(home, ".bundle_incr")),
+                         "临时解包目录要清掉")
+        bk = os.path.join(home, ".backups")
+        self.assertTrue(any(
+            os.path.exists(os.path.join(bk, d, "tools", "_marker.txt"))
+            for d in os.listdir(bk)), "备份里必须是旧版")
+
+    def test_launcher_refuses_full_package(self):
+        """full 包带轮子、要动 venv，那是 bootstrap.sh 的活。
+        从 update 这条路进去只会换 app/，依赖那半边悄悄没做。"""
+        home = os.path.join(self.tmp, "wrongpkg", "eda_reduce")
+        os.makedirs(home)
+        subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
+        self.assertEqual(sh([BASH, "bootstrap.sh"], cwd=home).returncode, 0)
+        shutil.copy(self.tar,
+                    os.path.join(home, "eda_reduce_incremental.tar.gz"))
+        r = sh([BASH, "update"], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("full 包", out)
+        self.assertIn("bootstrap.sh", out, "要指路")
+
+    def test_launcher_without_tarball(self):
+        home = os.path.join(self.tmp, "notar", "eda_reduce")
+        os.makedirs(home)
+        subprocess.check_call(["tar", "xzf", self.tar, "-C", home])
+        self.assertEqual(sh([BASH, "bootstrap.sh"], cwd=home).returncode, 0)
+        r = sh([BASH, "update"], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("没有 eda_reduce_incremental", out)
 
     def test_rollback_when_extracted_in_place(self):
         """就地更新失败也要能滚回去。"""

@@ -112,6 +112,12 @@ rm -rf "$PREFIX/app"
 cp -r "$SRC" "$PREFIX/app"          # 用 cp 不用 mv：失败了还能重来
 mkdir -p "$PREFIX/results"
 ln -sfn "$PREFIX/results" "$PREFIX/app/results"
+# 启动器每次一起刷新，否则它自己的修复永远传不到已部署的机器上
+for L in update; do
+    [ -f "$PREFIX/app/deploy/$L" ] && {
+        cp "$PREFIX/app/deploy/$L" "$PREFIX/$L"
+        chmod +x "$PREFIX/$L" 2>/dev/null || true; }
+done
 
 echo "[3/4] 冒烟测试 …"
 PY="$PREFIX/.venv/bin/python"; [ -x "$PY" ] || PY="$(command -v python3)"

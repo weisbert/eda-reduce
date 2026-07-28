@@ -119,6 +119,12 @@ PY="$P/.venv/bin/python"; [ -x "$PY" ] || PY="$(command -v python3)"
 exec "$PY" "$P/app/tools/wave_reduce.py" "$@"
 EOF
 chmod +x "$PREFIX/wave" 2>/dev/null || true
+# 一键更新启动器：日常唯一要记的命令就是「传个 tar 进来，bash update」
+for L in update; do
+    [ -f "$PREFIX/app/deploy/$L" ] && {
+        cp "$PREFIX/app/deploy/$L" "$PREFIX/$L"
+        chmod +x "$PREFIX/$L" 2>/dev/null || true; }
+done
 
 echo "[4/5] 冒烟测试 …"
 PY_RUN="$PREFIX/.venv/bin/python"; [ -x "$PY_RUN" ] || PY_RUN="$PY"
@@ -132,6 +138,9 @@ echo "[5/5] 记录 INSTALL.json …"
 cp "$HERE/MANIFEST.json" "$PREFIX/INSTALL.json"
 echo
 echo "装好了。版本：$(cat "$PREFIX/app/VERSION" 2>/dev/null || echo unknown)"
-echo "用法： $PREFIX/wave my.csv -o my.wv"
-echo "      $PREFIX/wave my.csv --gui        # 有 tkinter 才行"
-echo "以后改代码只推增量包，跑 bash update.sh $PREFIX"
+echo "用法： cd $PREFIX && bash wave my.csv -o my.wv"
+echo "      cd $PREFIX && bash wave my.csv --gui        # 有 tkinter + X 才行"
+echo
+echo "以后日常更新：把 eda_reduce_incremental.tar.gz 传进这个目录，然后"
+echo "      cd $PREFIX && bash update"
+echo "  （校验、解包、换 app/、备份回滚，它全包了）"

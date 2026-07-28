@@ -19,7 +19,7 @@
 | 内容 | wheels + `requirements.lock` + `app/` + `bootstrap.sh` + `update.sh` | 只有 `app_incoming/` + `update.sh` |
 | 体积 | 有几个依赖就多大；**现在依赖为空，几十 KB** | 几十 KB |
 | 什么时候用 | 首次安装、**依赖变了** | 日常改代码（绝大多数时候） |
-| 隔离区上跑 | 解进一个目录后 `bash bootstrap.sh`（就地装） | 解进安装目录后 `bash update.sh` |
+| 隔离区上跑 | 解进一个目录后 `bash bootstrap.sh`（就地装） | tar 传进安装目录后 `bash update` |
 
 > 现在 `requirements.txt` 是空的（`wave_core` / `wave_emit` / `wave_cli` 硬性纯标准库），
 > 所以两种包看起来没差别。**但管道现在就按双包建**——哪天要加 numpy 加速
@@ -122,10 +122,21 @@ export EDA_REDUCE_PREFIX=~/tools/wave    # 或者设成常态，update.sh 也认
 不传参、又不在包目录里时，默认装到 `./eda_reduce`。
 
 ```bash
-# 日常更新：解到哪儿都行，包括直接解进安装目录
+# 日常更新：把 tar 传进安装目录，一条命令
 cd ~/eda_reduce
-tar xzf /path/to/eda_reduce_incremental.tar.gz
-bash update.sh
+bash update
+```
+
+**`bash update` 是日常唯一要记的命令。** 它自己校验 sha256、解到临时目录、
+调包里的 `update.sh` 更新本目录、再清理干净。tar 那一步不用你操心。
+（和 `LDO_modeling` / `cadence-skill-tools` 那套一样，`update` 是装在
+安装目录根下的启动器，每次更新会连它自己一起刷新。）
+
+想自己控制的话，底下那层也照样能直接用：
+
+```bash
+cd ~/eda_reduce && tar xzf eda_reduce_incremental.tar.gz && bash update.sh
+mkdir -p ~/upd && tar xzf ... -C ~/upd && bash ~/upd/update.sh ~/eda_reduce
 ```
 
 > 增量包的载荷目录叫 **`app_incoming/`**，不叫 `app/`——所以解包本身**碰不到**

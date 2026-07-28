@@ -94,6 +94,8 @@ def dirty():
 # update.sh 跑起来之前把已装好的 app/ 盖掉，于是「备份」备的是新的那份，
 # 回滚点静默丢失。换个名字，解哪儿都安全。
 INCOMING = "app_incoming"
+# 无后缀的启动器，打包时也要给 exec 位
+EXEC_NAMES = {"update", "wave", "run_gui"}
 
 
 def stage_app(stage, name="app"):
@@ -196,7 +198,7 @@ def _make_tar(stage, tar):
             ti.uid = ti.gid = 0
             ti.uname = ti.gname = "root"
             ti.mtime = 0                     # 可复现：同一个 commit 出同一个包
-            if arc.endswith(".sh"):
+            if arc.endswith(".sh") or os.path.basename(arc) in EXEC_NAMES:
                 ti.mode = 0o755
             with open(p, "rb") as fh:
                 t.addfile(ti, fh)

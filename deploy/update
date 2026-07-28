@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# 一键增量更新。**这是日常唯一要记的命令。**
+#
+#     把 eda_reduce_incremental.tar.gz 传进安装目录，然后：
+#     cd <安装目录> && bash update
+#
+# 它自己做完这些：校验 sha256 -> 解到临时目录 -> 拿包里的 update.sh 更新
+# 本目录 -> 清理。tar 那一步不用你操心。
+#
+# 也可以显式给包：bash update /path/to/eda_reduce_incremental.tar.gz
+#
+# 搬自 LDO_modeling/deploy/update（那套已经在真实 airgap 上跑顺了）。
+# 用 `bash update` 调，不要 `./update` —— 登录 shell 常是 tcsh，
+# 上传通道还经常把 exec 位掉了。
+set -eu
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE"
+
+TAR="${1:-}"
+if [ -z "$TAR" ]; then
+    # 没给就在安装目录里找。找到多个就报出来让人挑，不猜
+    set -- eda_reduce_incremental*.tar.gz
+    if [ ! -f "$1" ]; then
+        echo "错误：$HERE 里没有 eda_reduce_incremental*.tar.gz。"
+        echo "      先把增量包传进这个目录，或者显式指定："
+        echo "        bash update /path/to/eda_reduce_incremental.tar.gz"
+        exit 1
+    fi
+    if [ "$#" -gt 1 ]; then
+        echo "错误：找到 $# 个增量包，不知道该用哪个："
+        for f in "$@"; do echo "        $f"; done
+        echo "      显式指定一个：bash update <包名>"
+        exit 1
+    fi
+    TAR="$1"
+fi
+[ -f "$TAR" ] || { echo "错误：找不到 $TAR"; exit 1; }
+
+echo "== 一键增量更新 =="
+echo "   安装目录 : $HERE"
+echo "   包       : $TAR"
+
+# sha256 旁文件在就校验。传输损坏硬装上去，症状会千奇百怪
+if [ -f "$TAR.sha256" ]; then
+    echo "[0/1] 校验 sha256 …"
+    # sed 去 \r：旁文件可能过了一趟 Windows 工具
+    sed 's/\r$//' "$TAR.sha256" | sha256sum -c -
+else
+    echo "   （没有 $TAR.sha256，跳过校验 —— 建议连旁文件一起传）"
+fi
+
+STAGE="$HERE/.bundle_incr"
+trap 'rm -rf "$STAGE"' EXIT INT TERM
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+tar xzf "$TAR" -C "$STAGE"
+[ -f "$STAGE/update.sh" ] || {
+    echo "错误：包里没有 update.sh，这不像一个可用的包。"; exit 1; }
+
+# full 包别当增量包使。它带轮子、要建/更新 venv，那些是 bootstrap.sh 的活；
+# 从这条路进去只会换掉 app/，依赖那半边悄悄没做。
+mode="$(grep -o '"mode"[^,]*' "$STAGE/MANIFEST.json" 2>/dev/null \
+        | head -1 | sed 's/.*: *"//; s/"//')"
+if [ "$mode" = "full" ]; then
+    echo "错误：$TAR 是 **full 包**，不是增量包。"
+    echo "      full 包要走 bootstrap.sh（它还要处理 venv 和 wheels）："
+    echo "        mkdir -p bundle && tar xzf \"$TAR\" -C bundle"
+    echo "        bash bundle/bootstrap.sh \"$HERE\""
+    exit 1
+fi
+
+bash "$STAGE/update.sh" "$HERE"
