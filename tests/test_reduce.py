@@ -187,5 +187,130 @@ class TestNoiseFloor(unittest.TestCase):
                                msg="干净通道该由 tol 说了算")
 
 
+def _osc(t0=0.0, t1=4e-8, dt=1e-11, f=5.03e9, amp=0.28, dc=0.3):
+    """一段干净的正弦，每周期 20 个原始点。振荡通道是一等公民的场景。"""
+    rows = ["time (s),V(o) (V)"]
+    t = t0
+    while t < t1:
+        rows.append("%.12g,%.9g" % (t, dc + amp * math.sin(2 * math.pi * f * t)))
+        t += dt
+    tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+    core.analyze(tr)
+    return tr
+
+
+class TestCarrierResolution(unittest.TestCase):
+    """振荡波形上的三条天花板。真实困惑：「max-points 拖到最大还是差很多」。"""
+
+    def test_cycle_count_is_close(self):
+        tr = _osc()
+        want = 4e-8 * 5.03e9
+        self.assertAlmostEqual(tr.signals[0].cycles, want, delta=0.05 * want,
+                               msg="周期数要数得准，报「几点/周期」全靠它")
+
+    def test_noise_does_not_fake_cycles(self):
+        """滞回没做对的话，平信号上的噪声能数出成千上万个假周期。"""
+        import random
+        random.seed(3)
+        rows = ["time (s),V(o) (V)"]
+        for i in range(4000):
+            rows.append("%.12g,%.9g" % (i * 1e-11, 0.8 + 1e-4 * random.gauss(0, 1)))
+        tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+        core.analyze(tr)
+        self.assertLess(tr.signals[0].cycles, 100, "噪声被数成了振荡")
+
+    def test_candidate_cap_does_not_overshoot(self):
+        """候选集是**质量上限**，冲过头就是白丢分辨率。
+
+        原来的乘法放大在正弦上会一步冲过头（实测上限 20000 只拿到 9448）：
+        阈值一旦越过正弦的单步变化量，候选数就断崖式塌到每周期两三个。
+        """
+        tr = _osc(t1=2e-7)                       # 1000 个周期，20000 个原始点
+        core.set_eps(tr, 0.005)
+        cap = 4000
+        cand = core.predecimate(tr, 0.005, max_cand=cap)
+        self.assertLessEqual(len(cand), cap, "不许超上限")
+        self.assertGreater(len(cand), 0.6 * cap,
+                           "冲过头了：只拿到 %d / %d" % (len(cand), cap))
+        self.assertTrue(any("候选集是质量上限" in n for n in tr.notes),
+                        "压了要说出来，而且要说清是质量上限不是性能参数")
+
+    def test_warns_when_shape_cannot_draw_the_carrier(self):
+        import wave_emit
+        tr = _osc(t1=4e-7)                       # 2000 个周期
+        core.set_eps(tr, 0.005)
+        red = core.reduce_trace(tr, 0.005, 800, core.predecimate(tr, 0.005), [])
+        w = wave_emit.carrier_warn(red)
+        self.assertTrue(w, "800 点画 2000 个周期，必须报出来")
+        self.assertIn("点/周期", w)
+        self.assertIn("--xrange", w, "得给出做得到的路径")
+
+    def test_no_carrier_warning_when_resolution_is_enough(self):
+        tr = _osc(t1=4e-8)                       # 200 个周期
+        core.set_eps(tr, 0.005)
+        red = core.reduce_trace(tr, 0.005, None, core.predecimate(tr, 0.005), [])
+        import wave_emit
+        self.assertGreaterEqual(len(red.kept) / float(tr.signals[0].cycles),
+                                wave_emit.MIN_PTS_PER_CYCLE)
+        self.assertEqual(wave_emit.carrier_warn(red), "", "够用就别啰嗦")
+
+
+class TestWindow(unittest.TestCase):
+    """`--xrange`：把预算花在你要看的那一段上。"""
+
+    def test_slice_keeps_only_the_window_and_declares_it(self):
+        tr = _osc(t1=4e-7)
+        n_full = len(tr.x)
+        core.slice_trace(tr, 1e-7, 1.2e-7)
+        core.analyze(tr)
+        self.assertLess(len(tr.x), n_full / 5)
+        self.assertGreaterEqual(tr.x[0], 1e-7)
+        self.assertLessEqual(tr.x[-1], 1.2e-7)
+        self.assertEqual(tr.window[2:], (0.0, tr.window[3]))
+        self.assertTrue(any("只导出了窗口" in n for n in tr.notes))
+        self.assertTrue(any("窗口末态" in n for n in tr.notes),
+                        "末态语义变了必须说 —— 模型会把窗口末态当仿真末态读")
+
+    def test_window_beats_full_range_on_the_same_budget(self):
+        """同样的字节预算，窗口能把每周期点数抬上去 —— 这是这个功能的全部理由。"""
+        import wave_emit
+        full = _osc(t1=4e-7)
+        core.set_eps(full, 0.005)
+        r1 = core.reduce_trace(full, 0.005, 800, core.predecimate(full, 0.005), [])
+        ppc1 = len(r1.kept) / float(full.signals[0].cycles)
+
+        win = _osc(t1=4e-7)
+        core.slice_trace(win, 1e-7, 1.2e-7)
+        core.analyze(win)
+        core.set_eps(win, 0.005)
+        r2 = core.reduce_trace(win, 0.005, 800, core.predecimate(win, 0.005), [])
+        ppc2 = len(r2.kept) / float(win.signals[0].cycles)
+        self.assertGreater(ppc2, 4 * ppc1,
+                           "窗口没换来分辨率（%.2f -> %.2f 点/周期）" % (ppc1, ppc2))
+        self.assertLess(r2.worst.pct, r1.worst.pct / 2.0)
+
+    def test_window_covering_everything_is_not_a_window(self):
+        tr = _osc()
+        core.slice_trace(tr, -1.0, 1.0)
+        self.assertIsNone(tr.window, "盖住全长就不该声称自己是窗口")
+
+    def test_empty_window_raises_with_the_numbers(self):
+        tr = _osc()
+        try:
+            core.slice_trace(tr, 1.0, 2.0)
+        except ValueError as exc:
+            self.assertIn("窗口", str(exc))
+            self.assertIn("整条", str(exc))
+        else:
+            self.fail("窗口里没有点必须报错")
+
+    def test_parse_eng(self):
+        self.assertAlmostEqual(core.parse_eng("1.6u"), 1.6e-6)
+        self.assertAlmostEqual(core.parse_eng("300n"), 300e-9)
+        self.assertAlmostEqual(core.parse_eng("-5m"), -5e-3)
+        self.assertAlmostEqual(core.parse_eng("1.2G"), 1.2e9)
+        self.assertAlmostEqual(core.parse_eng("1e-9"), 1e-9)
+
+
 if __name__ == "__main__":
     unittest.main()

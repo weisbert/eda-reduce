@@ -354,6 +354,8 @@ class WaveGui(object):
                 trs = core.parse_csv(path, layout=self.args.layout,
                                      xcols=self.args.xcols)
                 for tr in trs:
+                    if getattr(self.args, "xrange", None):
+                        core.slice_trace(tr, *self.args.xrange)
                     core.analyze(tr, kind=self.args.kind, xscale=self.args.xscale)
                 tr = trs[0]
                 m = None
@@ -362,7 +364,8 @@ class WaveGui(object):
                 tol = self.args.tol or (m.suggest_tol() if m else None) \
                     or core.DEFAULT_TOL
                 core.set_eps(tr, tol)
-                cand = core.predecimate(tr, tol, progress=lambda f: q.append(f))
+                cand = core.predecimate(tr, tol, max_cand=self._max_cand(),
+                                       progress=lambda f: q.append(f))
                 q.append(("done", trs, m, cand, tol))
             except Exception as exc:                    # noqa: BLE001
                 q.append(("err", exc))
@@ -553,6 +556,8 @@ class WaveGui(object):
             fit = "%.1f KB（预算不限）" % (self.nbytes / 1024.0)
         # 输入本身不可信的话，别的读数说得再准也没意义 —— WARN 顶到最前面
         head = ("!! %s" % tr.warns[0].split("。")[0]) if tr.warns else ""
+        if not head:
+            head = self._ceiling_hint()
         self.status.set(
             "%s%d 点  │  输出 %s │  %s  │  RDP %.0f ms  │  %s"
             % (head and head + "  │  ", len(self.red.kept), fit,
@@ -562,6 +567,30 @@ class WaveGui(object):
                if w else "误差计算中…",
                self.ms, os.path.basename(tr.source or "")))
         self.prog.set(min(1.0, self.nbytes / float(b)) if b else 0.0)
+
+    def _max_cand(self):
+        return getattr(self.args, "max_cand", None) or core.MAX_CAND
+
+    def _ceiling_hint(self):
+        """滑块拖到头之后**是什么在挡着**。不说的话工具只是「不再变好」。
+
+        真实困惑：「max-points 拖到最大了，波形还是跟原数据差很多」。
+        三个天花板叠着，从里到外：预算 -> 候选集上限 -> 波形本身的周期数。
+        最外面那个是信息量不是参数，拖滑块永远拖不过去。
+        """
+        if not self.red or not self.cand:
+            return ""
+        tr = self.red.trace
+        cw = emit.carrier_warn(self.red)
+        if cw:                                # 信息量不够：最外面那层，先说它
+            return "!! " + cw.split("。")[0] + "，缩小视窗或换 --xrange 导一段"
+        b = self.budget()
+        if b and self.nbytes > 0.98 * b and self.mp_v.get() < len(self.cand):
+            return "预算封顶（%.0f KB）" % (b / 1024.0)
+        if self.mp_v.get() >= len(self.cand) and len(self.cand) < len(tr.x):
+            return ("候选集封顶（%d 点 / 原始 %d）—— 候选集是质量上限，"
+                    "命令行可用 --max-cand 开大" % (len(self.cand), len(tr.x)))
+        return ""
 
     # ------------------------------------------------------------ 交互
 
@@ -573,7 +602,8 @@ class WaveGui(object):
         tr = self.traces[self.ti] if self.traces else None
         if tr is not None:
             core.set_eps(tr, self.tol_v.get() / 1000.0)
-            self.cand = core.predecimate(tr, self.tol_v.get() / 1000.0)
+            self.cand = core.predecimate(tr, self.tol_v.get() / 1000.0,
+                                         max_cand=self._max_cand())
         self._live()
 
     def _live(self):

@@ -27,6 +27,8 @@ from wave_core import eng_fmt, eng_str
 WV_VERSION = "WV1"
 MAX_EVENTS = 250
 LINE_W = 108
+MIN_PTS_PER_CYCLE = 4     # 低于这个数，SHAPE 画出来就不像正弦了
+MIN_CYCLES = 20           # 周期数少于这个就不提 —— 几个周期的振铃本来就该逐点画
 
 
 # --------------------------------------------------------------- 测量/事件
@@ -220,6 +222,38 @@ def eng_range(lo, hi, unit):
     return "%s .. %s %s" % (b, c, u)
 
 
+def carrier_warn(red):
+    """SHAPE 的点数撑不撑得起这段波形里的**周期数**。撑不起就说出来。
+
+    这条是拿一个真实的困惑换来的：「max-points 拖到最大了，波形还是跟原数据差很多」。
+    答案是三个天花板叠在一起，而且最外面那个是**信息量**不是参数：
+    2515 个振荡周期要画得像正弦至少要 6 点/周期 = 15000 点 ≈ 150 KB，
+    20 KB 装不下，拖滑块永远拖不到。工具当时什么都没说，只是不再变好。
+
+    所以这里报的是「每周期几个点」而不是误差百分比 —— 误差百分比对振荡信号
+    没有直觉（差半个周期就是 100%），点/周期直接对得上「画出来像不像」。
+    """
+    tr = red.trace
+    nk = len(red.kept)
+    worst = None
+    for s in tr.signals:
+        if s.cycles < MIN_CYCLES:
+            continue
+        ppc = nk / float(s.cycles)
+        if ppc < MIN_PTS_PER_CYCLE and (worst is None or ppc < worst[1]):
+            worst = (s, ppc)
+    if worst is None:
+        return ""
+    s, ppc = worst
+    per_pt = shape_bytes(red) / float(max(1, nk))
+    need_kb = MIN_PTS_PER_CYCLE * s.cycles * per_pt / 1024.0
+    return ("SHAPE 只有 %.1f 点/周期（%s 在这段里约 %d 个振荡周期，%d 个保留点）。"
+            "画出来不会像正弦，也别拿它数周期或量摆幅。"
+            "**这是预算和周期数的矛盾，拖大 max-points 解决不了** —— "
+            "要看波形就用 --xrange 缩到几十个周期，或者把预算开到 %.0f KB 以上。"
+            % (ppc, s.name, s.cycles, nk, need_kb))
+
+
 def header(red, metrics=None, extra=None):
     tr = red.trace
     x = red.xspec
@@ -228,10 +262,20 @@ def header(red, metrics=None, extra=None):
     out.append("# %s  %s  %s  %d sig  %s %s  %d -> %d pts (%.1fx)"
                % (WV_VERSION, tr.kind, _stem(tr), len(tr.signals), tr.xname,
                   eng_range(tr.x[0], tr.x[-1], tr.xunit), nin, nout, red.ratio))
+    if tr.window:
+        out.append("# window: %s .. %s   ← **只是一段**，原文件 %s .. %s。"
+                   "下面所有 METRICS 都是在这个窗口内量的"
+                   % (eng_str(tr.window[0], tr.xunit, 5),
+                      eng_str(tr.window[1], tr.xunit, 5),
+                      eng_str(tr.window[2], tr.xunit, 5),
+                      eng_str(tr.window[3], tr.xunit, 5)))
     # WARN 排在 recon 前面：recon 说的是「我压得准不准」，WARN 说的是
     # 「你这份输入根本撑不住下面的数」。后者更靠前一步，先看。
     for n in tr.warns:
         out.append("# WARN: " + n)
+    cw = carrier_warn(red)
+    if cw:
+        out.append("# WARN: " + cw)
     w = red.worst
     if w is not None:
         tail = ""

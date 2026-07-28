@@ -120,6 +120,10 @@ def process(path, args):
     chunks, info = [], []
     for tr in traces:
         _apply_units(tr, args.unit)
+        if args.xrange:
+            # 切窗口要在 analyze 之前：极值/噪声底/周期数都得是窗口内的，
+            # 拿整条的极值去定窗口内的容差会差出量级
+            core.slice_trace(tr, *args.xrange)
         core.analyze(tr, kind=args.kind, xscale=args.xscale)
         m = None
         if not args.no_metrics:
@@ -134,7 +138,7 @@ def process(path, args):
                              "%s" % (tr.kind, sug, _why_tol(tr, sug)))
                 tol = sug
         core.set_eps(tr, tol)
-        cand = core.predecimate(tr, tol)
+        cand = core.predecimate(tr, tol, max_cand=args.max_cand)
         forced = list(m.forced()) if m else []
         if m is None and not args.no_metrics:
             notes.append("kind=%s 没有注册的 metrics 模块，本文件只有 SHAPE 段"
@@ -168,6 +172,14 @@ def build_parser():
     p.add_argument("--layout", choices=("auto", "a", "b"), default="auto",
                    help="CSV 布局；b = 每条 trace 自带 x 列")
     p.add_argument("--xcols", help="手指定 x 列下标，逗号分隔（从 0 数）")
+    p.add_argument("--xrange", metavar="LO:HI",
+                   help="只导出这一段，吃工程记数：--xrange 1.6u:1.62u。"
+                        "预算摊在几十个周期上才看得清波形；一头留空表示到端点")
+    p.add_argument("--max-cand", type=int, default=core.MAX_CAND,
+                   dest="max_cand",
+                   help="预细化候选点上限（默认 %(default)s）。候选集是**质量上限**："
+                        "RDP 只能从候选点里挑。振荡波形想要更高分辨率就开大它，"
+                        "代价是 RDP 变慢（GUI 交互会卡）")
     p.add_argument("--unit", action="append", default=[], metavar="C=U",
                    help="声明单位，如 --unit c1=V,x=s。脚本不猜单位")
     p.add_argument("--no-metrics", action="store_true",
@@ -192,6 +204,16 @@ def main(argv=None):
     # parse_csv 里 set("0,2") 会变成 [',','0','2']。
     if args.xcols:
         args.xcols = [int(v) for v in str(args.xcols).split(",")]
+    if args.xrange:
+        s = str(args.xrange).replace("..", ":")
+        if ":" not in s:
+            build_parser().error("--xrange 要写成 LO:HI，比如 1.6u:1.62u")
+        a, b = s.split(":", 1)
+        try:
+            args.xrange = (core.parse_eng(a) if a.strip() else None,
+                           core.parse_eng(b) if b.strip() else None)
+        except ValueError:
+            build_parser().error("--xrange 看不懂: %r" % args.xrange)
     if not args.budget:
         args.budget = None
     if args.gui:

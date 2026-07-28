@@ -73,6 +73,23 @@ DROP_WARN_FRAC = 0.01        # 丢掉的行超过这个比例就报 WARN，不�
 # --------------------------------------------------------------- 数值小工具
 
 
+_SUFFIX = {"f": 1e-15, "p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "m": 1e-3,
+           "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+
+
+def parse_eng(s):
+    """吃 '300n' / '1e-9' / '1.2G' / '-5m'。手打时间范围时工程记数是常态。
+
+    （`plot_digitize` 里有一份同样的实现。没有合并是刻意的：那个工具要能单独
+    scp 出去跑，`wave_core` 也是——为省 6 行把两个逃生舱绑在一起不划算。）
+    """
+    s = s.strip()
+    m = re.match(r"^([-+]?[0-9.]+(?:[eE][-+]?\d+)?)\s*([fpnuµmkKMGT]?)$", s)
+    if not m:
+        return float(s)
+    return float(m.group(1)) * _SUFFIX.get(m.group(2), 1.0)
+
+
 def pow10_floor(v):
     """<= v 的最大 10 的整数次幂。q 取 10 的幂而不是 1/2/5，
     因为定点文本里只有 10 的幂才真的省字节。"""
@@ -139,7 +156,7 @@ def strip_num(s, dec):
 
 class Signal(object):
     __slots__ = ("name", "unit", "unit_src", "y", "vmin", "vmax", "vmin_at",
-                 "vmax_at", "noise", "eps")
+                 "vmax_at", "noise", "eps", "cycles")
 
     def __init__(self, name, unit="", unit_src="unknown"):
         self.name = name
@@ -150,6 +167,7 @@ class Signal(object):
         self.vmin_at = self.vmax_at = 0
         self.noise = 0.0                  # 估出来的噪声底（自然单位）
         self.eps = 0.0                    # RDP 的绝对容差（自然单位）
+        self.cycles = 0                   # 绕中线的振荡周期数（analyze 里数的）
 
     @property
     def rng(self):
@@ -164,7 +182,7 @@ class Trace(object):
 
     __slots__ = ("source", "xname", "xunit", "xunit_src", "x", "signals",
                  "kind", "kind_src", "xscale", "notes", "warns", "dt_med",
-                 "dt_min", "dt_max", "index")
+                 "dt_min", "dt_max", "index", "window")
 
     def __init__(self, xname="x", index=0):
         self.source = ""
@@ -180,6 +198,7 @@ class Trace(object):
         self.warns = []
         self.dt_med = self.dt_min = self.dt_max = 0.0
         self.index = index
+        self.window = None                # (lo, hi, 原文件 lo, 原文件 hi)
 
     def __len__(self):
         return len(self.x)
@@ -695,6 +714,74 @@ def _interp_nan(x, y):
     return len(idx)
 
 
+def slice_trace(tr, lo=None, hi=None):
+    """截出 [lo, hi] 的子区间，**就地改** tr，并记下原文件跨度。
+
+    存在的理由是预算：20 KB 摊在 2 µs / 2500 个振荡周期上是 1.6 点/周期，
+    画出来必然不像正弦；同样 20 KB 摊在 20 ns / 100 个周期上是 6 点/周期，
+    看得清清楚楚。**窗口不是省事，是把分辨率花在你要看的地方。**
+
+    代价是 `.wv` 从此有两种语义（整条 / 一段），所以 `tr.window` 一定要传到头部
+    声明出来 —— 模型把窗口末态当成仿真末态读，结论就全歪了。
+    """
+    if not tr.x:
+        return tr
+    n_full = len(tr.x)
+    full = (tr.x[0], tr.x[-1])
+    lo = full[0] if lo is None else lo
+    hi = full[1] if hi is None else hi
+    if lo > hi:
+        lo, hi = hi, lo
+    i0 = bisect.bisect_left(tr.x, lo)
+    i1 = bisect.bisect_right(tr.x, hi)
+    if i1 - i0 < 2:
+        raise ValueError("窗口 %s..%s 里只有 %d 个点（整条 %s..%s，共 %d 点）"
+                         % (eng_str(lo, tr.xunit, 4), eng_str(hi, tr.xunit, 4),
+                            i1 - i0, eng_str(full[0], tr.xunit, 4),
+                            eng_str(full[1], tr.xunit, 4), len(tr.x)))
+    if i1 - i0 == len(tr.x):
+        return tr                          # 窗口盖住了全长，不算窗口
+    tr.x = array("d", tr.x[i0:i1])
+    for s in tr.signals:
+        s.y = array("d", s.y[i0:i1])
+    tr.window = (tr.x[0], tr.x[-1], full[0], full[1])
+    tr.note("只导出了窗口 %s..%s（原文件 %s..%s 的 %.2g%%，%d/%d 点）；"
+            "METRICS 全部是**在这个窗口内**量的，settle/final/drift 这类末态量"
+            "说的是窗口末态，不是仿真末态"
+            % (eng_str(tr.x[0], tr.xunit, 4), eng_str(tr.x[-1], tr.xunit, 4),
+               eng_str(full[0], tr.xunit, 4), eng_str(full[1], tr.xunit, 4),
+               100.0 * (tr.x[-1] - tr.x[0]) / (full[1] - full[0] or 1.0),
+               i1 - i0, n_full))
+    return tr
+
+
+def count_cycles(y, vmin, vmax, noise=0.0):
+    """信号绕自己中线的过零次数 / 2 —— 大致有多少个振荡周期。
+
+    纯计数，不做 FFT（变步长栅格上 FFT 的混叠风险不可见，见 wave-spec 第 8 节）。
+    用中线而不是均值：起振过程里均值会被前半段的直流拖偏。
+
+    滞回取 `max(5% 量程, 3×噪声底)`。只用 5% 量程不够：一路纯噪声的平信号，
+    它的「量程」本身就是噪声的 ±4σ，5% 只有 0.4σ，实测 4000 个点能数出 703 个
+    假周期（测试钉着这条）。拿噪声底当尺子才是对的——它量的正是同一个东西。
+    """
+    rng = vmax - vmin
+    if rng <= 0 or len(y) < 4:
+        return 0
+    mid = 0.5 * (vmin + vmax)
+    hyst = max(0.05 * rng, NOISE_K * noise)
+    if hyst >= 0.5 * rng:                 # 滞回宽过半个量程：没有可数的振荡
+        return 0
+    state = 0
+    n = 0
+    for v in y:
+        if state <= 0 and v > mid + hyst:
+            state, n = 1, n + 1
+        elif state >= 0 and v < mid - hyst:
+            state, n = -1, n + 1
+    return n // 2
+
+
 # --------------------------------------------------------------- 轴/类型判定
 
 
@@ -733,6 +820,7 @@ def analyze(tr, kind=None, xscale=None):
                 hi, hi_i = v, i
         s.vmin, s.vmax, s.vmin_at, s.vmax_at = lo, hi, li, hi_i
         s.noise = noise_floor(tr.x, y)
+        s.cycles = count_cycles(y, lo, hi, s.noise)
 
     if tr.xscale == "log":
         # log 轴上 dt 本来就跨几个数量级，坍缩判据不成立；改报每 decade 多少点
@@ -915,6 +1003,39 @@ def _predec_pass(x_n, ys, thr, progress=None):
     return keep
 
 
+def _fit_cand(n, ys, base, max_cand, n0):
+    """把阈值放大到候选点刚好落进 [0.6*max_cand, max_cand]。-> (放大倍数, 候选)
+
+    原来是 `k *= max(1.6, len(keep)/max_cand)` 反复乘。那条假设「候选数 ∝ 1/阈值」，
+    在噪声通道上大致成立，在**振荡**通道上完全不成立：阈值一旦越过正弦的
+    单步变化量，候选数就断崖式塌到每周期两三个。实测 200000 点的 5 GHz 正弦，
+    上限 20000 时它一步冲到 9448（每周期 3.76 点，max|err| 75%），
+    而 49945 个候选是够用的（17 点/周期，0.5%）。**冲过头的那一半是白丢的分辨率。**
+
+    改成对 log(k) 二分：塌得再陡也能收在上限底下一点点。
+    """
+    lo_k, hi_k = 1.0, 2.0
+    best = None
+    for _ in range(24):                       # 先找一个能压到上限以下的 hi_k
+        keep = _predec_pass(n, ys, [t * hi_k for t in base])
+        if len(keep) <= max_cand:
+            best = (hi_k, keep)
+            break
+        lo_k, hi_k = hi_k, hi_k * 2.0
+    if best is None:
+        return hi_k, keep
+    for _ in range(18):                       # 再往回逼近上限
+        mid = math.sqrt(lo_k * hi_k)
+        keep = _predec_pass(n, ys, [t * mid for t in base])
+        if len(keep) > max_cand:
+            lo_k = mid
+        else:
+            best, hi_k = (mid, keep), mid
+        if len(best[1]) >= 0.6 * max_cand:
+            break
+    return best
+
+
 def predecimate(tr, tol=DEFAULT_TOL, max_cand=MAX_CAND, progress=None):
     """O(n) 一遍扫，扛 1e5–1e7 点。产出几千个候选点，之后所有交互只在候选集上做。
 
@@ -933,16 +1054,18 @@ def predecimate(tr, tol=DEFAULT_TOL, max_cand=MAX_CAND, progress=None):
         set_eps(tr, tol)
     ys = [s.y for s in tr.signals]
     base = [PREDEC_FRAC * s.eps for s in tr.signals]
-    k = 1.0
     keep = _predec_pass(n, ys, base, progress)
-    for _ in range(12):
-        if len(keep) <= max_cand:
-            break
-        k *= max(1.6, len(keep) / float(max_cand))
-        keep = _predec_pass(n, ys, [t * k for t in base])
-    if k > 1.0:
-        tr.note("预细化阈值放大 %.0fx 才把候选点压到 %d（%d 原始点）"
-                "—— 噪声主导的通道会这样" % (k, len(keep), n))
+    k = 1.0
+    if len(keep) > max_cand:
+        k, keep = _fit_cand(n, ys, base, max_cand, len(keep))
+        # 候选集是**质量上限**，不只是性能参数：RDP 只能从候选点里挑，
+        # 挑不到的形状后面再怎么加预算也回不来。所以这里要说清楚被压到了多少，
+        # 而不是像原来那样说一句「噪声主导的通道会这样」——振荡通道也会撞上，
+        # 而且对它来说这些候选点是**信号**不是噪声。
+        tr.note("预细化阈值放大 %.0fx 才把候选点压到 %d（%d 原始点，上限 %d）。"
+                "候选集是质量上限：RDP 只能从这些点里挑。振荡波形撞上这条时"
+                "要么开大 --max-cand，要么用 --xrange 缩小窗口"
+                % (k, len(keep), n, max_cand))
     if progress is not None:
         progress(1.0)
     return keep

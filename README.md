@@ -67,6 +67,10 @@ python tools/drawio_reduce.py my.drawio --bbox 400,300,800,700   # 只导出一�
 python tools/wave_reduce.py my.csv -o my.wv        # 默认压到 20 KB 以内
 python tools/wave_reduce.py my.csv --gui           # 拖滑块看丢了什么、看字节数
                                                    # 滚轮/框选缩放，右键拖平移，双击或 0 复位
+python tools/wave_reduce.py my.csv --xrange 1.6u:1.62u   # 只导这一段
+                                                   # 振荡波形必须这么看：预算摊在
+                                                   # 2500 个周期上是 1.6 点/周期，
+                                                   # 摊在 100 个周期上是 10 点/周期
 python tools/wave_reduce.py my.csv --budget 51200  # 通道宽就多带点
 python tools/wave_reduce.py my.csv --budget 0      # 不限，先看完整的长什么样
 export EDA_REDUCE_BUDGET=32k                       # 定成你那条通道的常态
