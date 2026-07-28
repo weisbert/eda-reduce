@@ -202,6 +202,7 @@ class WaveGui(object):
         self.force_extrema = tk.BooleanVar(value=True)
         self.force_metrics = tk.BooleanVar(value=True)
         self.cols = []
+        self.ti_v = tk.IntVar(value=0)
         self.view_full = tk.BooleanVar(value=False)
         self._build()
         # 没给文件也要能开窗。开窗和选文件是两件事，绑死了不合理 ——
@@ -281,6 +282,7 @@ class WaveGui(object):
         tb = tk.Frame(r, bg=BG)
         tb.pack(fill="x", padx=8, pady=(4, 0))
         tk.Button(tb, text="打开 CSV…", command=self._open).pack(side="left")
+        self.tracebar = tk.Frame(tb, bg=BG)
         tk.Button(tb, text="复制全文到剪贴板", command=self._copy).pack(
             side="left", padx=(8, 2))
         tk.Button(tb, text="另存 .wv…", command=self._save).pack(side="left")
@@ -353,10 +355,13 @@ class WaveGui(object):
             try:
                 trs = core.parse_csv(path, layout=self.args.layout,
                                      xcols=self.args.xcols)
+                prepared = []
                 for tr in trs:
                     if getattr(self.args, "xrange", None):
                         core.slice_trace(tr, *self.args.xrange)
                     core.analyze(tr, kind=self.args.kind, xscale=self.args.xscale)
+                    prepared.extend(self._demod(tr))
+                trs = prepared
                 tr = trs[0]
                 m = None
                 if not self.args.no_metrics:
@@ -391,17 +396,8 @@ class WaveGui(object):
             _, trs, m, cand, tol = it
             self.traces, self.metrics, self.cand = trs, m, cand
             self.tol_v.set(tol * 1000.0)
-            tr = trs[0]
-            self.s_mp.configure(to=max(10, len(cand)))
-            self.mp_v.set(min(len(cand), max(50, len(cand) // 4)))
-            self.cols = [tk.BooleanVar(value=True) for _ in tr.signals]
-            for i, s in enumerate(tr.signals):
-                tk.Checkbutton(self.colbox, text="c%d %s" % (i + 1, s.name),
-                               variable=self.cols[i], bg=BG, fg=COLORS[i % 6],
-                               selectcolor=BG,
-                               command=self._recompute).pack(side="left")
-            self._zoom_all()
-            self._recompute()
+            self.ti_v.set(0)
+            self._use_trace(0)
             return
         self.root.after(40, lambda: self._poll(q))
 
@@ -450,10 +446,82 @@ class WaveGui(object):
         self._redraw()
 
     def wv_text(self):
-        """当前参数下的完整 .wv —— 就是要粘进聊天框的那份东西。"""
+        """当前参数下的完整 .wv —— 就是要粘进聊天框的那份东西。
+
+        **所有 trace 都得在里面。** 原来只发当前这一条：布局 B（两个 time 列）
+        和 `--demod`（包络块 + 频率块）都会产生多条 trace，粘出去的东西是残的，
+        而且残得看不出来 —— 头部长得一模一样，只是少了一块。
+        这条按钮是整个工具的出口，不能是残的。
+        """
         if not self.red:
             return ""
-        return emit.emit(self.red, self.metrics)
+        parts = []
+        for i, tr in enumerate(self.traces):
+            if i == self.ti:
+                parts.append(emit.emit(self.red, self.metrics))
+            else:
+                parts.append(self._emit_other(tr))
+        return "\n".join(parts)
+
+    def _emit_other(self, tr):
+        """非当前 trace：按当前参数压一遍再出文本。
+
+        每次复制都重算一遍（O(n)）。可以缓存，但复制是点一下的事，
+        而缓存要跟 tol / max-points / 强制保留三个开关同步失效 —— 不值。
+        """
+        tol = self.tol_v.get() / 1000.0
+        core.set_eps(tr, tol)
+        m = None if self.args.no_metrics else emit.run_metrics(tr)
+        cand = core.predecimate(tr, tol, max_cand=self._max_cand())
+        forced = list(m.forced()) if (m and self.force_metrics.get()) else []
+        red = core.reduce_trace(tr, tol, self.mp_v.get() or None, cand, forced,
+                                keep_extrema=self.force_extrema.get(),
+                                keep_offset=not self.args.no_offset)
+        return emit.emit(red, m)
+
+    def _use_trace(self, i):
+        """切到第 i 条 trace：候选集、metrics、列选框、视窗全部重来。"""
+        if not self.traces:
+            return
+        self.ti = max(0, min(i, len(self.traces) - 1))
+        tr = self.traces[self.ti]
+        tol = self.tol_v.get() / 1000.0
+        core.set_eps(tr, tol)
+        self.metrics = None if self.args.no_metrics else emit.run_metrics(tr)
+        self.cand = core.predecimate(tr, tol, max_cand=self._max_cand())
+        for w in self.colbox.winfo_children():
+            w.destroy()
+        self.cols = [tk.BooleanVar(value=True) for _ in tr.signals]
+        for k, s in enumerate(tr.signals):
+            tk.Checkbutton(self.colbox, text="c%d %s" % (k + 1, s.name),
+                           variable=self.cols[k], bg=BG, fg=COLORS[k % 6],
+                           selectcolor=BG,
+                           command=self._recompute).pack(side="left")
+        self.s_mp.configure(to=max(10, len(self.cand)))
+        self.mp_v.set(min(len(self.cand), max(50, len(self.cand) // 4)))
+        self.band = self.band_key = None
+        self._sync_trace_bar()
+        self._zoom_all()
+        self._recompute()
+
+    def _sync_trace_bar(self):
+        """多条 trace 时才显示切换条 —— 单条时它是纯噪音。"""
+        for w in self.tracebar.winfo_children():
+            w.destroy()
+        if len(self.traces) < 2:
+            self.tracebar.pack_forget()
+            return
+        self.tracebar.pack(side="left", padx=(16, 0))
+        tk.Label(self.tracebar, text="块", bg=BG, fg=FG).pack(side="left")
+        for i, tr in enumerate(self.traces):
+            name = tr.signals[0].name if tr.signals else "?"
+            tk.Radiobutton(self.tracebar,
+                           text="%d/%d %s" % (i + 1, len(self.traces),
+                                              name.split("(")[0]),
+                           variable=self.ti_v, value=i, bg=BG, fg=FG,
+                           selectcolor=BG,
+                           command=lambda: self._use_trace(self.ti_v.get())
+                           ).pack(side="left")
 
     def _fill_text(self):
         self.txt.delete("1.0", "end")
@@ -570,6 +638,27 @@ class WaveGui(object):
 
     def _max_cand(self):
         return getattr(self.args, "max_cand", None) or core.MAX_CAND
+
+    def _demod(self, tr):
+        """`--demod` 在 GUI 里也要生效，而且走**命令行同一条路**。
+
+        上一轮 `--xrange` / `--max-cand` 是分别接进两边的，结果 `--demod` 只接了
+        命令行，GUI 静默忽略——用户拿 `--gui --demod` 开窗，看到的还是原始波形，
+        而且没有任何提示。同一个功能有两个入口就迟早分叉，所以现在共用
+        `wave_demod.apply()`。
+        """
+        if not getattr(self.args, "demod", False):
+            return [tr]
+        try:
+            import wave_demod
+        except ImportError:
+            tr.note("--demod 需要 tools/wave_demod.py，这份部署里没有")
+            return [tr]
+        tol = self.args.tol or core.DEFAULT_TOL
+        return wave_demod.apply(tr, tol, self.args.budget,
+                                getattr(self.args, "demod_cycles", None) or 6,
+                                getattr(self.args, "demod_min", None) or 20,
+                                self.args.kind, self.args.xscale)
 
     def _ceiling_hint(self):
         """滑块拖到头之后**是什么在挡着**。不说的话工具只是「不再变好」。

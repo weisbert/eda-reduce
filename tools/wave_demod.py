@@ -477,6 +477,31 @@ def cycles_block(tr, si, picks, colspec, xunit, budget=None):
     return out
 
 
+def apply(tr, tol, budget=None, n_cycles=N_REPRESENT, min_cycles=MIN_CYCLES,
+          kind=None, xscale=None):
+    """解调 + 挂上 `[CYCLES]`。-> [trace, ...]；没生效就返回 `[原 trace]`。
+
+    **命令行和 GUI 走同一条路**。上一轮 `--xrange` / `--max-cand` 是分别接进两边的，
+    结果 `--demod` 只接了命令行、GUI 静默忽略——同一个功能有两个入口就迟早分叉。
+    """
+    out, cycles = demod(tr, 0, min_cycles=min_cycles)
+    if not out:
+        tr.note("--demod 没生效：只切出 %d 个载波周期（要 >= %d）。"
+                "这条信号可能不是准正弦，或者时间分辨率不够撑起周期"
+                % (len(cycles), min_cycles))
+        return [tr]
+    for t in out:
+        core.analyze(t, kind=kind, xscale=xscale)
+    picks = pick_representative(cycles, n_cycles)
+    if picks:
+        core.set_eps(tr, tol)
+        cs = core.make_colspec(tr, tol)[0]
+        cs.label = "c_raw"
+        cap = int((budget or 0) * CYCLE_BUDGET_FRAC) or None
+        out[0].extra.append(cycles_block(tr, 0, picks, cs, tr.xunit, cap))
+    return out
+
+
 def _tq(picks):
     """代表周期的时间刻度：拿中位周期定词头，让 t_rel 是 0..200 这种好读的数。"""
     per = sorted(c.period for c in picks)

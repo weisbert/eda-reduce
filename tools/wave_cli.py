@@ -121,23 +121,9 @@ def _demod(tr, args):
         import wave_demod
     except ImportError:                          # 逃生舱模式：只有三个文件时
         raise SystemExit("--demod 需要 tools/wave_demod.py，这份部署里没有")
-    out, cycles = wave_demod.demod(tr, 0, min_cycles=args.demod_min)
-    if not out:
-        tr.note("--demod 没生效：只切出 %d 个载波周期（要 >= %d）。"
-                "这条信号可能不是准正弦，或者时间分辨率不够撑起周期"
-                % (len(cycles), args.demod_min))
-        return [tr]
-    for t in out:
-        core.analyze(t, kind=args.kind, xscale=args.xscale)
-    picks = wave_demod.pick_representative(cycles, args.demod_cycles)
-    if picks:
-        core.set_eps(tr, args.tol or core.DEFAULT_TOL)
-        cs = core.make_colspec(tr, args.tol or core.DEFAULT_TOL)[0]
-        cs.label = "c_raw"
-        cap = int((args.budget or 0) * wave_demod.CYCLE_BUDGET_FRAC) or None
-        out[0].extra.append(wave_demod.cycles_block(tr, 0, picks, cs,
-                                                    tr.xunit, cap))
-    return out
+    return wave_demod.apply(tr, args.tol or core.DEFAULT_TOL, args.budget,
+                            args.demod_cycles, args.demod_min,
+                            args.kind, args.xscale)
 
 
 def process(path, args):

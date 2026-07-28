@@ -18,6 +18,7 @@ import sys
 import time
 import unittest
 
+import _common as C
 from _common import ROOT
 
 RUN = os.environ.get("EDA_REDUCE_GUI_TEST") == "1"
@@ -302,6 +303,73 @@ class TestGuiSelftest(unittest.TestCase):
             self.assertGreater(base + rng, 0.5)
         finally:
             root.destroy()
+
+    def test_copy_contains_every_block(self):
+        """「复制全文」必须是**全文**。
+
+        原来只发当前那一条 trace：布局 B（两个 time 列）和 --demod（包络块+频率块）
+        都会产生多条，粘出去的东西是残的，而且残得看不出来 —— 头部长得一模一样，
+        只是少了一块。这个按钮是整个工具的出口。
+        """
+        root, app = self._app("demo_tran_layoutb.csv")
+        try:
+            self.assertEqual(len(app.traces), 2)
+            txt = app.wv_text()
+            _, cli = C.run_cli([C.ex("demo_tran_layoutb.csv")])
+            self.assertEqual(txt.count("# WV1"), cli.count("# WV1"),
+                             "GUI 复制出来的块数跟命令行对不上")
+            for tr in app.traces:
+                self.assertIn(tr.signals[0].name, txt)
+        finally:
+            root.destroy()
+
+    def test_gui_honors_demod(self):
+        """--demod 在 GUI 里也要生效，并且跟命令行给出同样的块。
+
+        它曾经只接了命令行：`--gui --demod` 开出来的还是原始波形，没有任何提示。
+        """
+        import math
+        import os
+        import tempfile
+        rows = ["time (s),V(o) (V)"]
+        t = 0.0
+        while t < 4e-7:
+            a = 0.28 * (1 - math.exp(-(t - 1e-7) / 2e-8)) if t > 1e-7 else 0.0
+            rows.append("%.12g,%.9g"
+                        % (t, 0.3 + a * math.sin(2 * math.pi * 5.03e9 * t)))
+            t += 1e-11
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            with open(p, "w", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
+            import tkinter as tk
+            import wave_cli
+            import wave_gui
+            args = wave_cli.build_parser().parse_args(["--demod"])
+            args.budget = 51200
+            args.demod_cycles, args.demod_min = 6, 20
+            root = tk.Tk()
+            try:
+                app = wave_gui.WaveGui(root, p, args)
+                for _ in range(500):
+                    root.update()
+                    if app.red:
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(app.red)
+                self.assertTrue(app.red.trace.signals[0].name.startswith("env_hi"),
+                                "GUI 没有解调：%s"
+                                % app.red.trace.signals[0].name)
+                self.assertEqual(len(app.traces), 2, "包络块 + 频率块")
+                txt = app.wv_text()
+                self.assertIn("[CYCLES]", txt, "代表性周期没跟着复制出来")
+                _, cli = C.run_cli([p, "--demod", "--budget", "51200"])
+                self.assertEqual(txt.count("# WV1"), cli.count("# WV1"))
+            finally:
+                root.destroy()
+        finally:
+            os.unlink(p)
 
     def test_canvas_segment_budget(self):
         """Canvas 上的图元数要恒定 —— 拖动时才不掉帧。"""
