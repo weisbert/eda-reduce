@@ -372,9 +372,14 @@ def summary(cycles, sig, n_win):
     f = [1.0 / p for p in per if p > 0]
     res = max(c.resid for c in cycles)
     worst = max(cycles, key=lambda c: c.resid)
+    # 两种精度是**叠加**的，而它们分别报在两个地方、用两种单位。
+    # 不写清楚的话，读的人（和模型）会拿 recon 的 0.5% 当成
+    # 「这条包络离真实波形 0.5%」—— 那是两码事。
     return ("解调：%d 个周期 -> %d 个包络点；载波中位 %s（%s .. %s）；"
             "逐周期残差最大 %.1f%% @ %s。**SHAPE 里画的是包络不是波形**，"
-            "原始波形看 CYCLES 段"
+            "原始波形看 CYCLES 段。"
+            "注意下面 recon 那行只管**编码**误差（算出来的包络存得准不准），"
+            "解调本身的误差是这里这个残差 —— 两者叠加才是离真实波形的距离"
             % (len(cycles), n_win,
                core.eng_str(f[len(f) // 2] if f else 0.0, "Hz", 6),
                core.eng_str(min(f) if f else 0.0, "Hz", 5),

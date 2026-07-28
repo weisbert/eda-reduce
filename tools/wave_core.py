@@ -261,9 +261,17 @@ class Trace(object):
         t.notes = list(self.notes)
         t.picks = list(self.picks)
         t.warns = list(self.warns)
+        t.window = self.window
+        t.dt_med, t.dt_min, t.dt_max = self.dt_med, self.dt_min, self.dt_max
         for s in self.signals:
             d = Signal(s.name, s.unit, s.unit_src)
             d.y = array("d", s.y)
+            # analyze() 的结果也要带上：**克隆就该是克隆**。
+            # 只复制 y 的话，拿到的是一个 rng=0 的壳子，
+            # 而 rng=0 会让 find_cycles / set_eps 静默什么都不做 —— 不报错，只是没结果。
+            d.vmin, d.vmax = s.vmin, s.vmax
+            d.vmin_at, d.vmax_at = s.vmin_at, s.vmax_at
+            d.noise, d.eps, d.cycles = s.noise, s.eps, s.cycles
             t.signals.append(d)
         return t
 
