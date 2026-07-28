@@ -244,6 +244,11 @@ class TestCarrierResolution(unittest.TestCase):
         self.assertTrue(w, "800 点画 2000 个周期，必须报出来")
         self.assertIn("点/周期", w)
         self.assertIn("--xrange", w, "得给出做得到的路径")
+        # 这条警告一度只说 --xrange 和加预算，从没提过 --demod ——
+        # 结果用户拿着它问「我看不见你说的包络」。最该用的那条要排第一。
+        self.assertIn("--demod", w, "没告诉人还有解调这条路")
+        self.assertLess(w.index("--demod"), w.index("--xrange"),
+                        "要看包络时 --demod 才是首选，得排在前面")
 
     def test_no_carrier_warning_when_resolution_is_enough(self):
         tr = _osc(t1=4e-8)                       # 200 个周期

@@ -277,8 +277,17 @@ _UNIT_EXTRA = frozenset("""
 """.split())
 
 
+# ViVA 括号里写的是**量的符号**，不是单位：电压写 `(V)`、电流写 `(I)`。
+# `(V)` 碰巧对（伏特也是 V），`(I)` 就不对了（电流的单位是 A）。
+# 一个字母引发的连锁：单位不认识 -> `; tran` 不在名字末尾 -> 横轴认不出来 ->
+# kind=unknown -> **一条 METRICS 都没有**。实测在真实电流波形上踩到。
+# 只放**见过的**；没见过的别猜，让它落到 unknown 去（下面的分析名识别不受影响）。
+_VIVA_QUANTITY = {"I": "A"}
+
+
 def _is_unit(tok):
-    return bool(tok) and (tok in _UNIT_EXTRA or bool(_UNIT_TOK.match(tok)))
+    return bool(tok) and (tok in _UNIT_EXTRA or tok in _VIVA_QUANTITY
+                          or bool(_UNIT_TOK.match(tok)))
 
 
 def _split_unit(name):
@@ -304,6 +313,10 @@ def _norm(name):
 def _unit_of(name, declared):
     """-> (unit, src)。src=declared 才是可信的；inferred 会在输出里带 ?。"""
     if declared:
+        u = _VIVA_QUANTITY.get(declared)
+        if u:
+            # 文件里写的是量的符号，单位是我们换算出来的 —— 算 inferred 不算 declared
+            return u, "inferred"
         return declared, "declared"
     m = _DECLARED_FN.match(name)
     if m:
@@ -441,6 +454,14 @@ def _viva_rewrite(names):
     out, notes = [], []
     for k in xidx:
         base, unit = _split_unit(bases[k])
+        if unit is None:
+            # 括号里那玩意儿不在单位白名单里（ViVA 会写量的符号，比如 `(I)`）。
+            # **分析名的识别不该被单位白名单挡住** —— 先把尾部的括号组摘掉再找
+            # `; tran`。这样即使单位认不出来，横轴和 kind 照样是对的，
+            # 只有单位老实留 unknown。少认一个单位是小事，丢掉整份 METRICS 是大事。
+            m2 = re.match(r"^(.*\S)\s*\([^()]*\)\s*$", bases[k])
+            if m2:
+                base = m2.group(1)
         m = _VIVA_ANALYSIS.search(base)
         ana = m.group(1) if m else ""
         axis = _VIVA_AXIS.get(ana.lower(), "")

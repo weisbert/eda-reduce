@@ -112,6 +112,39 @@ class TestViVAXY(unittest.TestCase):
         self.assertEqual(tr.xunit_src, "unknown")
         self.assertTrue(any("认不出分析类型" in n for n in tr.notes))
 
+    def test_viva_writes_the_quantity_symbol_not_the_unit(self):
+        """ViVA 括号里是**量的符号**：电压 `(V)`、电流 `(I)`。
+
+        `(V)` 碰巧对（伏特也是 V），`(I)` 就不对了（电流单位是 A）。
+        真实电流波形上踩到过，一个字母引发连锁：单位不认识 -> `; tran` 不在末尾
+        -> 横轴认不出 -> kind=unknown -> **一条 METRICS 都没有**。
+        """
+        txt = ("i /VCO_TOP/VDD; tran (I) X,i /VCO_TOP/VDD; tran (I) Y\n"
+               + "".join("%g,%g\n" % (i * 1e-11, 1e-3 * (i % 7 - 3))
+                         for i in range(60)))
+        tr = core.parse_csv("<t>", text=txt)[0]
+        core.analyze(tr)
+        self.assertEqual(tr.kind, "tran")
+        self.assertEqual((tr.xname, tr.xunit), ("time", "s"))
+        self.assertEqual(tr.signals[0].name, "i /VCO_TOP/VDD")
+        self.assertEqual(tr.signals[0].unit, "A")
+        self.assertEqual(tr.signals[0].unit_src, "inferred",
+                         "文件写的是 I，A 是我们换算的 —— 不算 declared")
+
+    def test_unknown_quantity_symbol_still_gets_kind_and_axis(self):
+        """没见过的量符号只该丢**单位**，不该连横轴和 kind 一起丢。
+
+        少认一个单位是小事，丢掉整份 METRICS 是大事 —— 所以分析名的识别
+        不能被单位白名单挡住。
+        """
+        txt = ("p /x; tran (Wat) X,p /x; tran (Wat) Y\n"
+               + "".join("%g,%g\n" % (i * 1e-11, i) for i in range(60)))
+        tr = core.parse_csv("<t>", text=txt)[0]
+        core.analyze(tr)
+        self.assertEqual(tr.kind, "tran", "单位没认出来就把 kind 也丢了")
+        self.assertEqual(tr.xunit, "s")
+        self.assertEqual(tr.signals[0].unit_src, "unknown", "认不出就老实说")
+
     def test_declared_overrides_win(self):
         # 人给了 --xcols / --layout a 就听人的，不许自作主张按 X/Y 拆
         trs = core.parse_csv(C.ex("demo_tran_viva.csv"), layout="a")

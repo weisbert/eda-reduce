@@ -12,6 +12,7 @@
 它同时也保证了「你以为打进包的改动」和「真的打进包的改动」是同一件事。
 """
 
+import io
 import os
 import re
 import shutil
@@ -31,6 +32,33 @@ def sh(args, cwd=None, env=None):
     e.update(env or {})
     return subprocess.run(args, cwd=cwd or ROOT, env=e, timeout=600,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+
+def _baseline_pts():
+    """仓库基线里 demo_tran 保留了多少点。"""
+    with io.open(os.path.join(ROOT, "examples", "demo_tran.wv"),
+                 encoding="utf-8") as fh:
+        m = re.search(r"2545 -> (\d+) pts", fh.read())
+    return int(m.group(1)) if m else 0
+
+
+def _assert_smoke_matches_baseline(case, out):
+    """冒烟测试跑的是真实压缩，结果要和仓库基线对得上。
+
+    **不比精确点数**：`# build:` 那一行的长度参与 20 KB 预算，
+    打出来的包（真 commit 号）比工作树（`dev(工作树)`）长十来个字节，
+    于是少放得下一两个点。物理结果（max|err|）才是该钉死的东西，
+    点数只要在基线附近就行。
+    """
+    m = re.search(r"2545 -> (\d+)\s+pts", out)
+    case.assertTrue(m, "冒烟测试没打出压缩结果\n" + out)
+    got, want = int(m.group(1)), _baseline_pts()
+    case.assertLessEqual(abs(got - want), 4,
+                         "端到端 %d 点 vs 基线 %d 点，差太多\n%s"
+                         % (got, want, out))
+    case.assertIn("max|err| 116 uV (13.35%)", out,
+                  "端到端的物理结果和基线对不上\n" + out)
 
 
 class TestNoHardcodedInstallPath(unittest.TestCase):
@@ -125,8 +153,7 @@ class TestPackageAndInstall(unittest.TestCase):
         for sub in ("app", "results", "INSTALL.json", "wave"):
             self.assertTrue(os.path.exists(os.path.join(p, sub)), sub)
         self.assertIn("装好了", out)
-        # 冒烟测试跑的是真实压缩，结果要和仓库基线一致
-        self.assertIn("2545 -> 585", out, "端到端结果和基线对不上\n" + out)
+        _assert_smoke_matches_baseline(self, out)
 
     def test_in_place_install(self):
         """包是 tarbomb，「解进自己建的目录然后就地装」才是最自然的用法。
@@ -145,7 +172,7 @@ class TestPackageAndInstall(unittest.TestCase):
                          "不该在里面再套一层")
         for sub in ("app", "results", "INSTALL.json", "wave", ".backups"):
             self.assertTrue(os.path.exists(os.path.join(home, sub)), sub)
-        self.assertIn("2545 -> 585", out, "就地装出来的结果也得对")
+        _assert_smoke_matches_baseline(self, out)
         r = sh([BASH, os.path.join(home, "wave"), "--list-kinds"], cwd=home)
         self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
 

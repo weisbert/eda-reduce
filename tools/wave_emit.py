@@ -254,10 +254,16 @@ def carrier_warn(red):
     s, ppc = worst
     per_pt = shape_bytes(red) / float(max(1, nk))
     need_kb = MIN_PTS_PER_CYCLE * s.cycles * per_pt / 1024.0
+    # 出路要**按用得上的顺序**给。这条警告写在 --demod 之前，一直只说
+    # 「--xrange 或加预算」；结果用户拿着这条警告问「我看不见你说的包络」——
+    # 工具从没告诉过他还有这个模式。最该用的那条排第一。
     return ("SHAPE 只有 %.1f 点/周期（%s 在这段里约 %d 个振荡周期，%d 个保留点）。"
             "画出来不会像正弦，也别拿它数周期或量摆幅。"
-            "**这是预算和周期数的矛盾，拖大 max-points 解决不了** —— "
-            "要看波形就用 --xrange 缩到几十个周期，或者把预算开到 %.0f KB 以上。"
+            "**这是预算和周期数的矛盾，拖大 max-points 解决不了。** 三条出路："
+            "① 要看**起振/包络**就加 `--demod`（传包络+瞬时频率+几个代表性周期，"
+            "同一份 txt，实测 218 KB 的东西 22 KB 装得下）；"
+            "② 要看**某几十个周期的实际波形**就 `--xrange 1.6u:1.62u` 切一段；"
+            "③ 硬要全画就把预算开到 %.0f KB 以上。"
             % (ppc, s.name, s.cycles, nk, need_kb))
 
 
