@@ -143,9 +143,18 @@ bash ~/upd/update.sh ~/eda_reduce
 ```bash
 P=./eda_reduce
 $P/wave my.csv -o my.wv
-$P/wave my.csv --gui                     # 要有 tkinter
+$P/wave my.csv --gui                     # 要有 tkinter + X 显示
+$P/wave --gui                            # 不给文件也能开，窗口里有「打开 CSV…」
+$P/wave my.csv --gui --selftest          # 探针：打印状态后自动退出，不会挂住
 cat $P/app/VERSION                       # 看装的是哪个 commit
 ```
+
+GUI 里调好参数后点 **「复制全文到剪贴板」** 直接粘进聊天框。
+X11 的剪贴板归复制它的进程持有，**先粘贴再关窗口**；
+怕丢就切到「完整 .wv」视图手动全选，或者 `另存 .wv…`。
+
+开不起来先跑 `--gui --selftest`：报 `no display name and no $DISPLAY`
+是 X 没接上（SSH 要 `ssh -X`），不是工具的问题。
 
 ### tkinter
 

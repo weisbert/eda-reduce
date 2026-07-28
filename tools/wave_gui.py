@@ -194,8 +194,15 @@ class WaveGui(object):
         self.force_extrema = tk.BooleanVar(value=True)
         self.force_metrics = tk.BooleanVar(value=True)
         self.cols = []
+        self.view_full = tk.BooleanVar(value=False)
         self._build()
-        self._load_async()
+        # 没给文件也要能开窗。开窗和选文件是两件事，绑死了不合理 ——
+        # 想先看看界面、想换一个文件重来，都不该被逼着先满足一个文件对话框。
+        if path:
+            self._load_async(path)
+        else:
+            self.status.set("还没打开文件 —— 点左下角「打开 CSV…」，"
+                            "或者命令行给一个：wave my.csv --gui")
 
     # ------------------------------------------------------------ 界面
 
@@ -256,12 +263,34 @@ class WaveGui(object):
         tk.Checkbutton(fb, text="强制保留 spur/事件", variable=self.force_metrics,
                        bg=BG, fg=FG, selectcolor=BG,
                        command=self._recompute).pack(anchor="w")
-        tk.Button(fb, text="另存 .wv…", command=self._save).pack(anchor="w",
-                                                                pady=(4, 0))
 
-        self.txt = tk.Text(r, height=9, bg="#fafafa", fg=FG,
-                           font=("Consolas", 9), wrap="none")
-        self.txt.pack(fill="both", padx=8, pady=(2, 8))
+        # 下窗格的工具条。**复制到剪贴板**是这里最重要的一个按钮：
+        # .wv 的归宿就是粘进聊天框，「先另存成文件、再打开、再全选、再复制」
+        # 中间三步纯属多余。
+        tb = tk.Frame(r, bg=BG)
+        tb.pack(fill="x", padx=8, pady=(4, 0))
+        tk.Button(tb, text="打开 CSV…", command=self._open).pack(side="left")
+        tk.Button(tb, text="复制全文到剪贴板", command=self._copy).pack(
+            side="left", padx=(8, 2))
+        tk.Button(tb, text="另存 .wv…", command=self._save).pack(side="left")
+        tk.Radiobutton(tb, text="METRICS", variable=self.view_full, value=False,
+                       bg=BG, fg=FG, selectcolor=BG,
+                       command=self._fill_text).pack(side="left", padx=(16, 0))
+        tk.Radiobutton(tb, text="完整 .wv（可全选手动复制）",
+                       variable=self.view_full, value=True, bg=BG, fg=FG,
+                       selectcolor=BG, command=self._fill_text).pack(side="left")
+
+        tf = tk.Frame(r, bg=BG)
+        tf.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        sb = tk.Scrollbar(tf)
+        sb.pack(side="right", fill="y")
+        self.txt = tk.Text(tf, height=10, bg="#fafafa", fg=FG,
+                           font=("Consolas", 9), wrap="none",
+                           yscrollcommand=sb.set)
+        self.txt.pack(side="left", fill="both", expand=True)
+        sb.config(command=self.txt.yview)
+        r.bind("<Control-c>", lambda _: self._copy())
+        r.bind("<Control-o>", lambda _: self._open())
 
         self.c_wave.bind("<Configure>", lambda e: self._redraw())
         self.c_err.bind("<Configure>", lambda e: self._redraw())
@@ -272,13 +301,33 @@ class WaveGui(object):
 
     # ------------------------------------------------------------ 载入
 
-    def _load_async(self):
+    def _open(self):
+        """随时换一个文件。开窗和选文件是两件事。"""
+        p = filedialog.askopenfilename(
+            title="选一个 ViVA 导出的 CSV",
+            filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
+        if p:
+            self._load_async(p)
+
+    def _load_async(self, path):
         """解析 + 预细化放后台线程。1e7 点解析要几十秒，不能冻界面。"""
+        self.path = path
+        # 换文件要把上一份状态清干净，否则列选框会越积越多、视窗还停在旧范围
+        self.traces, self.red, self.metrics, self.cand = [], None, None, None
+        self.view = self.band = self.band_key = None
+        self.cols = []
+        for w in self.colbox.winfo_children():
+            w.destroy()
+        self.txt.delete("1.0", "end")
+        self.c_wave.delete("all")
+        self.c_err.delete("all")
+        self.status.set("载入中… " + os.path.basename(path))
+        self.prog.set(0.0)
         q = []
 
         def work():
             try:
-                trs = core.parse_csv(self.path, layout=self.args.layout,
+                trs = core.parse_csv(path, layout=self.args.layout,
                                      xcols=self.args.xcols)
                 for tr in trs:
                     core.analyze(tr, kind=self.args.kind, xscale=self.args.xscale)
@@ -367,12 +416,43 @@ class WaveGui(object):
         self._status()
         self._redraw()
 
+    def wv_text(self):
+        """当前参数下的完整 .wv —— 就是要粘进聊天框的那份东西。"""
+        if not self.red:
+            return ""
+        return emit.emit(self.red, self.metrics)
+
     def _fill_text(self):
         self.txt.delete("1.0", "end")
-        blk = emit.metrics_block(self.red, self.metrics)
-        if not blk:
-            blk = ["[METRICS] （这个 kind 没有注册 metrics 模块）"]
-        self.txt.insert("1.0", "\n".join(blk))
+        if not self.red:
+            return
+        if self.view_full.get():
+            self.txt.insert("1.0", self.wv_text())
+        else:
+            blk = emit.metrics_block(self.red, self.metrics)
+            if not blk:
+                blk = ["[METRICS] （这个 kind 没有注册 metrics 模块）"]
+            self.txt.insert("1.0", "\n".join(blk))
+
+    def _copy(self):
+        """整份 .wv 直接进剪贴板。它的归宿就是聊天框，中间那三步是多余的。"""
+        txt = self.wv_text()
+        if not txt:
+            self.status.set("还没有可复制的内容 —— 先打开一个 CSV")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self.root.update()               # 让 Tk 真正拿到剪贴板所有权
+        n = emit.nbytes(txt)
+        b = self.budget()
+        tail = ""
+        if b and n > b:
+            tail = "  ✗ 超预算 %.1f KB" % (b / 1024.0)
+        # X11 的剪贴板是「谁复制谁持有」，进程退出内容就没了。
+        # 没有剪贴板管理器的隔离机上这一条会咬人，所以每次都提醒。
+        self.status.set("已复制 %d 字节（%d 行）到剪贴板%s"
+                        "  │  X11 下先粘贴再关窗口，剪贴板归本进程持有"
+                        % (n, txt.count("\n"), tail))
 
     def budget(self):
         """-> 字节数，0/空 = 不限。输入看不懂就退回启动时的值并说一声。"""
@@ -403,18 +483,24 @@ class WaveGui(object):
         if not b:
             self.status.set("预算设成了不限，没什么可压的")
             return
-        self._recompute(True)                     # 先拿到准确的 fixed_bytes
-        if self.fixed_bytes >= b:
+        # 固定开销要从**不限点数**那一版量，和 CLI 完全一致。
+        # 拿「当前这一版」去量的话，头里每列的 err X.XX% 宽度会随点数变，
+        # 于是同一个预算从不同起点压会落在不同的点数上（实测差过 55 字节）。
+        # 「同一个预算 -> 同一个结果」这条得成立，不然 GUI 里调好的参数
+        # 拿到命令行就对不上了。
+        r0 = self._reduce(None, check=True)
+        fixed = emit.nbytes(emit.emit(r0, self.metrics)) - emit.shape_bytes(r0)
+        if fixed >= b:
             self.status.set(
                 "压不进去：头部+METRICS+EVENTS 本身就要 %.1f KB > 预算 %.1f KB。"
                 "那些是全精度事实，不能为预算牺牲 —— 放宽预算或调大 tol。"
-                % (self.fixed_bytes / 1024.0, b / 1024.0))
+                % (fixed / 1024.0, b / 1024.0))
             return
-        lo, hi, best = 2, len(self.cand), 2
+        lo, hi, best = 2, len(r0.kept), 2
         while lo <= hi:
             mid = (lo + hi) // 2
             r = self._reduce(mid, check=False)
-            if self.fixed_bytes + emit.shape_bytes(r) <= b:
+            if fixed + emit.shape_bytes(r) <= b:
                 best, lo = mid, mid + 1
             else:
                 hi = mid - 1
@@ -424,6 +510,8 @@ class WaveGui(object):
             self.status.set(self.status.get() + "  ← 强制保留点撑住了下限")
 
     def _status(self):
+        if not self.red:
+            return
         w = self.red.worst if self.red.err else None
         tr = self.red.trace
         b = self.budget()
@@ -468,6 +556,8 @@ class WaveGui(object):
                                             lambda: self._recompute(True))
 
     def _zoom_all(self):
+        if not self.traces:
+            return
         tr = self.traces[self.ti]
         self.view = (tr.x[0], tr.x[-1])
         self.band = None
@@ -611,12 +701,15 @@ class WaveGui(object):
     # ------------------------------------------------------------ 保存
 
     def _save(self):
+        if not self.red:
+            self.status.set("还没有可保存的内容 —— 先打开一个 CSV")
+            return
         p = filedialog.asksaveasfilename(defaultextension=".wv",
                                          filetypes=[("wave reduce", "*.wv")])
         if not p:
             return
         with open(p, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(emit.emit(self.red, self.metrics))
+            fh.write(self.wv_text())
         self.status.set("已写 %s（%d 字节）" % (p, os.path.getsize(p)))
 
 
@@ -690,12 +783,28 @@ def selftest(path, args, timeout=60.0):
                 log.append("预算 %-3s KB -> kept %-5d bytes %-6d %s"
                            % (kb, len(app.red.kept), app.nbytes,
                               "OK" if app.nbytes <= app.budget() else "压不进(已声明)"))
-            app.budget_v.set("0")
+            app.budget_v.set("20")
             app._on_budget()
-            log.append("预算不限 -> " + app.status.get())
+            app._fit()
+            root.update_idletasks()
+            # 复制到剪贴板：.wv 的归宿就是聊天框
+            app._copy()
+            root.update()
+            clip = root.clipboard_get()
+            log.append("剪贴板: %d 字节，首行 %r"
+                       % (len(clip.encode("utf-8")),
+                          clip.splitlines()[0][:48]))
+            log.append("剪贴板内容 == 当前 .wv: %s"
+                       % (clip == app.wv_text()))
+            # 下窗格两种视图
+            app.view_full.set(False)
+            app._fill_text()
+            n_met = len(app.txt.get("1.0", "end").splitlines())
+            app.view_full.set(True)
+            app._fill_text()
+            n_full = len(app.txt.get("1.0", "end").splitlines())
+            log.append("下窗格 METRICS %d 行 / 完整 .wv %d 行" % (n_met, n_full))
             log.append("状态栏: " + app.status.get())
-            log.append("METRICS 窗格 %d 行"
-                       % len(app.txt.get("1.0", "end").splitlines()))
         root.destroy()
 
     root.after(50, lambda: step(0))
@@ -711,16 +820,12 @@ def run(path, args):
         sys.stderr.write("这台机器没有 tkinter，GUI 用不了；"
                          "命令行照常可用。\n")
         return 2
-    if not path:
-        root = tk.Tk()
-        root.withdraw()
-        path = filedialog.askopenfilename(
-            filetypes=[("CSV", "*.csv"), ("all", "*.*")])
-        root.destroy()
-        if not path:
-            return 1
     if getattr(args, "selftest", False):
+        if not path:
+            sys.stderr.write("--selftest 要给一个 CSV\n")
+            return 1
         return selftest(path, args)
+    # 没给文件也照样开窗 —— 窗口里有「打开 CSV…」，不该先被一个对话框卡住
     root = tk.Tk()
     WaveGui(root, path, args)
     root.mainloop()

@@ -11,8 +11,10 @@
 """
 
 import os
+import re
 import subprocess
 import sys
+import time
 import unittest
 
 from _common import ROOT
@@ -70,6 +72,79 @@ class TestGuiSelftest(unittest.TestCase):
         _, txt = CC.run_cli([CC.ex("demo_tran.csv"), "--budget", "20480"])
         self.assertEqual(rows["20"][1], len(txt.encode("utf-8")),
                          "GUI 压到 20 KB 和命令行 --budget 20480 结果不一致")
+
+        # 同一个预算从不同起点压必须落在同一个结果上。自检里 20 KB 压了两次，
+        # 中间去 40 KB 和 6 KB 绕了一圈；第二次的结果就是剪贴板里那份。
+        clip = [ln for ln in out.splitlines() if ln.startswith("剪贴板: ")]
+        self.assertTrue(clip, out)
+        n = int(clip[0].split("剪贴板: ")[1].split()[0])
+        self.assertEqual(n, rows["20"][1],
+                         "同一个预算从不同起点压出了不同结果（%d vs %d）"
+                         % (n, rows["20"][1]))
+
+    def test_clipboard_holds_the_whole_wv(self):
+        """.wv 的归宿就是聊天框 —— 剪贴板里必须是完整可粘的那一份。"""
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "tools", "wave_reduce.py"),
+             os.path.join(ROOT, "examples", "demo_tran.csv"),
+             "--gui", "--selftest"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("剪贴板内容 == 当前 .wv: True", out,
+                      "剪贴板里的不是当前这份 .wv\n" + out)
+        head = [ln for ln in out.splitlines() if ln.startswith("剪贴板: ")]
+        self.assertIn("# WV1", head[0], "第一行得是 .wv 头，不是 METRICS 片段")
+        # 下窗格两种视图都要有：完整视图是剪贴板挂了时的手动兜底
+        v = [ln for ln in out.splitlines() if ln.startswith("下窗格 ")]
+        self.assertTrue(v, out)
+        met, full = (int(x) for x in re.findall(r"(\d+) 行", v[0]))
+        self.assertGreater(full, met * 5, "完整 .wv 视图应当远长于 METRICS")
+
+    def test_opens_without_a_file(self):
+        """开窗和选文件是两件事，不给文件不该被一个对话框卡死。"""
+        import tkinter as tk
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import wave_cli
+        import wave_gui
+        args = wave_cli.build_parser().parse_args([])
+        args.budget = 20480
+        root = tk.Tk()
+        try:
+            app = wave_gui.WaveGui(root, None, args)
+            root.update_idletasks()
+            self.assertIn("还没打开文件", app.status.get())
+            self.assertEqual(app.wv_text(), "", "没数据时不该有 .wv")
+            # 空状态下点这些按钮都不许炸
+            app._copy()
+            app._fill_text()
+            app._fit()
+            app._redraw()
+            app._zoom_all()
+            app._on_budget()
+            root.update_idletasks()
+            # 然后再打开文件，一切正常
+            app._load_async(os.path.join(ROOT, "examples", "demo_ac.csv"))
+            for _ in range(300):
+                root.update()
+                if app.red:
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(app.red, "打开文件后应当算出结果")
+            self.assertIn("# WV1", app.wv_text())
+            self.assertEqual(len(app.colbox.winfo_children()),
+                             len(app.traces[0].signals))
+            # 再换一个文件：列选框不许越积越多
+            app._load_async(os.path.join(ROOT, "examples", "demo_tran.csv"))
+            for _ in range(300):
+                root.update()
+                if app.red:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(len(app.colbox.winfo_children()), 4,
+                             "换文件要把上一份的列选框清掉")
+        finally:
+            root.destroy()
 
     def test_canvas_segment_budget(self):
         """Canvas 上的图元数要恒定 —— 拖动时才不掉帧。"""
