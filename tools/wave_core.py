@@ -77,6 +77,43 @@ _SUFFIX = {"f": 1e-15, "p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "m": 1e-3,
            "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
 
 
+_BUILD = None
+
+
+def build_id():
+    """-> 'eeaa52e 2026-07-28' / 'dev(工作树)'。**这份代码到底是哪一版。**
+
+    隔离区没有 git，版本只能从打包时 `export-subst` 写进 `VERSION` 的那行读。
+    工作树里那行还是 `$Format:%H$` 没被替换 —— 那就老实说 `dev(工作树)`，
+    不要假装有版本号：「我到底跑的是不是新版」这个问题必须能被**回答**，
+    不是被猜。真实教训：更新过一轮之后，判断「换上没有」靠的是
+    「输出里有没有那条新 note」，全凭推断。
+    """
+    global _BUILD
+    if _BUILD is not None:
+        return _BUILD
+    _BUILD = "unknown"
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                     "VERSION")
+    try:
+        with io.open(p, encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except (IOError, OSError):
+        return _BUILD
+    if "$Format" in txt:
+        _BUILD = "dev(工作树)"
+        return _BUILD
+    sha = date = ""
+    for ln in txt.splitlines():
+        f = ln.split(None, 1)
+        if len(f) == 2 and f[0] == "commit":
+            sha = f[1].strip()[:9]
+        elif len(f) == 2 and f[0] == "date":
+            date = f[1].strip()[:10]
+    _BUILD = (sha + " " + date).strip() or "unknown"
+    return _BUILD
+
+
 def parse_eng(s):
     """吃 '300n' / '1e-9' / '1.2G' / '-5m'。手打时间范围时工程记数是常态。
 

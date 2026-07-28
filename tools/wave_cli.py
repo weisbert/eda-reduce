@@ -215,6 +215,9 @@ def build_parser():
     p.add_argument("--no-metrics", action="store_true",
                    help="只出 SHAPE，不跑测量")
     p.add_argument("--no-offset", action="store_true", help="不扣基线")
+    p.add_argument("--version", action="store_true",
+                   help="打印这份代码的 build（commit + 日期）后退出。"
+                        "隔离区没有 git，「我跑的是不是新版」只能这么问")
     p.add_argument("--list-kinds", action="store_true",
                    help="列出已注册的分析类型后退出")
     p.add_argument("--gui", action="store_true", help="开 Tkinter 预览窗口")
@@ -226,6 +229,10 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     emit.load_builtin()
+    if args.version:
+        print("wave_reduce  build %s" % core.build_id())
+        print("             %s" % os.path.dirname(os.path.abspath(core.__file__)))
+        return 0
     if args.list_kinds:
         print("已注册的 kind: " + (", ".join(emit.registered()) or "无"))
         return 0

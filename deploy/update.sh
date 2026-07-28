@@ -104,6 +104,12 @@ rollback() {
 }
 trap rollback ERR
 
+# 更新前后各记一次 commit：光印新版本没用，人要看的是「有没有变」。
+# 真实困惑：更新完之后「红区的 python 看起来还像是老的」，而当时没有任何
+# 一条命令能回答这个问题 —— 只能靠输出里有没有某条新 note 去推断。
+OLDV="$(sed -n 's/^commit  *//p' "$PREFIX/app/VERSION" 2>/dev/null | cut -c1-9)"
+[ -n "$OLDV" ] || OLDV="unknown"
+
 echo "[1/4] 备份当前 app/ -> $BK"
 cp -r "$PREFIX/app" "$BK"
 
@@ -138,5 +144,14 @@ ls -1dt "$PREFIX"/.backups/app-* 2>/dev/null | tail -n +$((KEEP + 1)) \
     | while read -r d; do rm -rf "$d"; done
 
 echo
-echo "更新完成。app/ 已到 build ${bld:0:9}，venv 没动。"
-echo "版本：$(cat "$PREFIX/app/VERSION" 2>/dev/null || echo unknown)"
+NEWV="$(sed -n 's/^commit  *//p' "$PREFIX/app/VERSION" 2>/dev/null | cut -c1-9)"
+[ -n "$NEWV" ] || NEWV="unknown"
+echo "更新完成。venv 没动。"
+echo "版本：$OLDV  ->  $NEWV"
+if [ "$OLDV" = "$NEWV" ]; then
+    echo
+    echo "!! 注意：版本没变。你八成传的还是**上一次那个包** ——"
+    echo "   包名每次都叫 eda_reduce_incremental.tar.gz，看不出新旧。"
+    echo "   回黄区重新打一个再传，或者核对 sha256。"
+fi
+echo "随时可以自己查：$PREFIX/app/tools/wave_reduce.py --version"

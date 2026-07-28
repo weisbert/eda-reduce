@@ -303,6 +303,34 @@ class TestWvContract(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_header_says_which_build_made_it(self):
+        """每份 .wv 自报是哪一版代码出的。
+
+        起因：更新完隔离区之后「红区的 python 看起来还像是老的」，
+        而当时**没有任何一条命令能回答这个问题** —— 判断「换上没有」只能靠
+        「输出里有没有那条新 note」去推断。24 个字节换掉这种推断。
+        """
+        b = [ln for ln in self.lines if ln.startswith("# build:")]
+        self.assertEqual(len(b), 1, "头部要且只要一行 build")
+        self.assertTrue(b[0].split(":", 1)[1].strip(), "build 是空的")
+
+    def test_version_flag_reports_the_build(self):
+        rc, txt = C.run_cli(["--version"])
+        self.assertEqual(rc, 0)
+        self.assertIn("build", txt)
+        from wave_core import build_id
+        self.assertIn(build_id(), txt)
+
+    def test_build_id_admits_it_is_a_worktree(self):
+        """工作树里 VERSION 还没被 export-subst 替换 —— 老实说 dev，不许编一个。"""
+        from wave_core import build_id
+        with io.open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as fh:
+            raw = fh.read()
+        if "$Format" in raw:
+            self.assertIn("dev", build_id())
+        else:
+            self.assertNotIn("dev", build_id())
+
     def test_sections_present_and_marked_at_line_start(self):
         starts = [ln for ln in self.lines if ln.startswith("[")]
         self.assertEqual([s.split("]")[0] + "]" for s in starts],

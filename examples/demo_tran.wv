@@ -1,14 +1,15 @@
-# WV1  tran  demo_tran  4 sig  time 0 .. 300 ns  2545 -> 585 pts (4.4x)
+# WV1  tran  demo_tran  4 sig  time 0 .. 300 ns  2545 -> 584 pts (4.4x)
 # recon: max|err| 116 uV (13.35% of range) @ time=74.37 ns   rms 22.9 uV   [worst V(vref)]
 # axis: x lin  kind=tran(inferred) | 段间线性内插
 # x    time             [ns     ] 0 .. 300   (量化 1 ps)
 # c1   V(vdd_pll)       [mV     ] offset 800 mV      range -85.3..+59.6   (量化 100 uV)  err 1.93% (2.8 mV)
-# c2   V(ctrl)          [mV     ] offset 0           range -0..+1200   (量化 1 mV)  err 3.78% (45.4 mV)
+# c2   V(ctrl)          [mV     ] offset 0           range -0..+1200   (量化 1 mV)  err 3.79% (45.5 mV)
 # c3   I(mp0)           [mA     ] offset 0           range +0.872..+1.5347   (量化 100 nA)  err 2.75% (18.2 uA)
 # c4   V(vref)          [mV     ] offset 600 mV      range -0.04..+0.83   (量化 10 uV)  err 13.35% (116 uV)
 # note: dt 坍缩 488x（附近 975 ps -> 最小 2 ps）@ 250 ns..250.495 ns，31 步，期间所有信号的变化都没超出噪声带 —— 像是求解器在原地挣扎
 # note: 另有 45 段加密在信号快变处（自适应步长的正常行为）、37 处 2~3 步的孤立细化（栅格拼接痕迹），都未列出
 # note: V(vref): 噪声底 20.6397 uV（×3）高过 tol×量程 4.332 uV，eps 抬到 61.919 uV —— 再多的点只是在编码噪声
+# build: dev(工作树)
 # 读法: METRICS/EVENTS 两段是全精度事实(脚本在全分辨率数据上量的, 丢了不可逆); SHAPE 段是量化过的形状, 别拿它量数
 # SHAPE 每行 = x 后跟各列; 真值 = 该列值/scale + offset, 两者都在上面的列声明里; 单位带 ? = 从列名推的, 不是数据里声明的
 # 段标记只认行首的 [ ；以 # 开头的都是注释
@@ -97,7 +98,6 @@ c4    slew_max -0.28058 V/us @ 55.155 ns (窗口 311 ps)   drift 731.5 uV
 16.665 0 772 0.9119 0.04
 16.68 0 593 0.9019 0.06
 16.725 -0.1 123 0.8803 0.04
-16.74 -0.2 36 0.8747 0.07
 16.77 -0.1 0 0.8737 0.05
 20.11 0 0 0.8733 0.09
 20.14 -0.1 57 0.8765 0.04

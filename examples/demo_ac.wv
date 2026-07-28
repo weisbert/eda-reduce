@@ -5,6 +5,7 @@
 # c1   dB20(V(out))     [dB     ] offset 0           range -60..-10.46   (量化 0.01 dB)  err 0.44% (0.219 dB)
 # c2   phase(V(out))    [deg    ] offset 0           range -89.8..+83.3   (量化 0.1 deg)  err 0.49% (0.848 deg)
 # note: x 轴判为 log（9.00 decade，120 点/decade）
+# build: dev(工作树)
 # 读法: METRICS/EVENTS 两段是全精度事实(脚本在全分辨率数据上量的, 丢了不可逆); SHAPE 段是量化过的形状, 别拿它量数
 # SHAPE 每行 = x 后跟各列; 真值 = 该列值/scale + offset, 两者都在上面的列声明里; 单位带 ? = 从列名推的, 不是数据里声明的
 # 段标记只认行首的 [ ；以 # 开头的都是注释

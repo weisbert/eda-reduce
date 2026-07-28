@@ -22,7 +22,7 @@ wave_emit.py — `.wv` 三段格式 + 分析类型（kind）注册表。
 
 import os
 
-from wave_core import eng_fmt, eng_str
+from wave_core import build_id, eng_fmt, eng_str
 
 WV_VERSION = "WV1"
 MAX_EVENTS = 250
@@ -312,6 +312,9 @@ def header(red, metrics=None, extra=None):
         out.append("# note: " + n)
     for n in (extra or []):
         out.append("# note: " + n)
+    # 每份 .wv 自报是哪一版代码出的。20 多个字节换掉「隔离区到底换上新版没有」
+    # 这个反复出现的问题 —— 之前只能靠「输出里有没有那条新 note」去推断。
+    out.append("# build: %s" % build_id())
     out.extend(LEGEND)
     return out
 
