@@ -253,7 +253,7 @@ def _derived(tr, xs, cols, index=0):
     return out
 
 
-def demod(tr, si=0, min_cycles=MIN_CYCLES):
+def demod(tr, si=0, min_cycles=MIN_CYCLES, fspan=0):
     """-> ([派生 Trace, ...], cycles)。切不出足够周期就返回 ([], cycles)。
 
     出**两块**而不是一块，理由是量程：
@@ -290,7 +290,7 @@ def demod(tr, si=0, min_cycles=MIN_CYCLES):
         ("env_hi(%s)" % s.name, s.unit, s.unit_src, hi),
         ("env_lo(%s)" % s.name, s.unit, s.unit_src, lo)], index=tr.index)
     out = [env]
-    fx, fy, m, sd = _freq_trace(cycles)
+    fx, fy, m, sd = _freq_trace(cycles, m=fspan)
     if len(fx) >= 2:
         f = _derived(tr, fx, [("f_inst(%s)" % s.name, "Hz", "declared", fy)],
                      index=tr.index + 1)
@@ -313,7 +313,7 @@ def demod(tr, si=0, min_cycles=MIN_CYCLES):
     return out, cycles
 
 
-def _freq_trace(cycles, max_pts=FREQ_MAX_PTS):
+def _freq_trace(cycles, max_pts=FREQ_MAX_PTS, m=0):
     """跨 M 个周期测频：`f = M / (t[k+M] - t[k])`。-> (x, y, M, 逐周期 1σ)
 
     **不是「逐周期测完再平均」。** 两件事差得很远：
@@ -336,7 +336,10 @@ def _freq_trace(cycles, max_pts=FREQ_MAX_PTS):
     sd = 0.0
     if tm > 0 and d:
         sd = d[len(d) // 2] * 1.4826 / math.sqrt(2.0) / (tm * tm)   # 周期 -> 频率
-    m = max(1, int(math.ceil(n / float(max_pts))))
+    # m 是**取舍**，不是实现细节：大了频率曲线平滑但迟钝，小了跟得快但噪。
+    # 「频率被牵引了多少」看不看得见就取决于它，所以要能手给。
+    m = int(m) if m and m > 0 else max(1, int(math.ceil(n / float(max_pts))))
+    m = max(1, min(m, max(1, n - 1)))
     ox, oy = [], []
     for i in range(0, n - m + 1, m):
         p = _ls_period(t[i:i + m + 1])
@@ -483,13 +486,13 @@ def cycles_block(tr, si, picks, colspec, xunit, budget=None):
 
 
 def apply(tr, tol, budget=None, n_cycles=N_REPRESENT, min_cycles=MIN_CYCLES,
-          kind=None, xscale=None):
+          kind=None, xscale=None, fspan=0):
     """解调 + 挂上 `[CYCLES]`。-> [trace, ...]；没生效就返回 `[原 trace]`。
 
     **命令行和 GUI 走同一条路**。上一轮 `--xrange` / `--max-cand` 是分别接进两边的，
     结果 `--demod` 只接了命令行、GUI 静默忽略——同一个功能有两个入口就迟早分叉。
     """
-    out, cycles = demod(tr, 0, min_cycles=min_cycles)
+    out, cycles = demod(tr, 0, min_cycles=min_cycles, fspan=fspan)
     if not out:
         tr.note("--demod 没生效：只切出 %d 个载波周期（要 >= %d）。"
                 "这条信号可能不是准正弦，或者时间分辨率不够撑起周期"

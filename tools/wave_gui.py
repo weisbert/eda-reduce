@@ -204,12 +204,15 @@ class WaveGui(object):
         self.cols = []
         self.ti_v = tk.IntVar(value=0)
         self.raw = []
+        self.colbtn = []
         # 这两个是**模式**，不是命令行开关：用户的入口是这个窗口，
         # 「用 --gui --demod 去开一个 GUI 模式」本身就是设计错了
         self.demod_v = tk.BooleanVar(value=bool(getattr(args, 'demod', False)))
         self.win_v = tk.BooleanVar(value=False)
         self.ev_v = tk.BooleanVar(value=True)      # 波形上标 EVENTS
         self.low_v = tk.StringVar(value="err")     # 下窗格画什么
+        self.nrep_v = tk.IntVar(value=getattr(args, "demod_cycles", None) or 6)
+        self.fspan_v = tk.IntVar(value=getattr(args, "demod_fspan", 0) or 0)
         self.view_full = tk.BooleanVar(value=False)
         self._build()
         # 没给文件也要能开窗。开窗和选文件是两件事，绑死了不合理 ——
@@ -250,7 +253,9 @@ class WaveGui(object):
                              variable=self.mp_v, length=330, bg=BG, fg=FG,
                              highlightthickness=0, command=self._on_slider)
         self.s_mp.grid(row=0, column=1, padx=(4, 18))
-        tk.Label(ctl, text="tol (‰)", bg=BG, fg=FG).grid(row=0, column=2)
+        self.tol_lab = tk.StringVar(value="tol (‰)")
+        tk.Label(ctl, textvariable=self.tol_lab, bg=BG,
+                 fg=FG).grid(row=0, column=2)
         self.s_tol = tk.Scale(ctl, from_=0.1, to=100.0, resolution=0.1,
                               orient="horizontal", variable=self.tol_v,
                               length=250, bg=BG, fg=FG, highlightthickness=0,
@@ -293,6 +298,17 @@ class WaveGui(object):
         tk.Checkbutton(mb, text="波形上标出 EVENTS", variable=self.ev_v,
                        bg=BG, fg=FG, selectcolor=BG,
                        command=self._redraw).pack(anchor="w")
+        # 解调那一层的两个**取舍**旋钮。tol 管不着它们（tol 只管「算出来的曲线
+        # 存得准不准」），而它们决定「测得准不准」—— 两层精度是叠加的
+        kb = tk.Frame(mb, bg=BG)
+        kb.pack(anchor="w", pady=(2, 0))
+        tk.Label(kb, text="代表周期", bg=BG, fg=FG).pack(side="left")
+        tk.Spinbox(kb, from_=0, to=12, width=3, textvariable=self.nrep_v,
+                   command=self._remode).pack(side="left", padx=(2, 8))
+        tk.Label(kb, text="测频跨周期", bg=BG, fg=FG).pack(side="left")
+        tk.Spinbox(kb, from_=0, to=64, width=3, textvariable=self.fspan_v,
+                   command=self._remode).pack(side="left", padx=2)
+        tk.Label(kb, text="(0=自动)", bg=BG, fg="#888").pack(side="left")
 
         # 下窗格的工具条。**复制到剪贴板**是这里最重要的一个按钮：
         # .wv 的归宿就是粘进聊天框，「先另存成文件、再打开、再全选、再复制」
@@ -463,6 +479,7 @@ class WaveGui(object):
             self._fill_text()
         else:
             self.nbytes = self.fixed_bytes + emit.shape_bytes(self.red)
+        self._sync_eps_marks()
         self._status()
         self._redraw()
 
@@ -512,12 +529,14 @@ class WaveGui(object):
         self.cand = core.predecimate(tr, tol, max_cand=self._max_cand())
         for w in self.colbox.winfo_children():
             w.destroy()
+        self.colbtn = []
         self.cols = [tk.BooleanVar(value=True) for _ in tr.signals]
         for k, s in enumerate(tr.signals):
-            tk.Checkbutton(self.colbox, text="c%d %s" % (k + 1, s.name),
-                           variable=self.cols[k], bg=BG, fg=COLORS[k % 6],
-                           selectcolor=BG,
-                           command=self._recompute).pack(side="left")
+            cb = tk.Checkbutton(self.colbox, text="c%d %s" % (k + 1, s.name),
+                                variable=self.cols[k], bg=BG, fg=COLORS[k % 6],
+                                selectcolor=BG, command=self._recompute)
+            cb.pack(side="left")
+            self.colbtn.append(cb)
         self.s_mp.configure(to=max(10, len(self.cand)))
         self.mp_v.set(min(len(self.cand), max(50, len(self.cand) // 4)))
         self.band = self.band_key = None
@@ -714,9 +733,30 @@ class WaveGui(object):
             return [tr]
         tol = self.args.tol or core.DEFAULT_TOL
         return wave_demod.apply(tr, tol, self.args.budget,
-                                getattr(self.args, "demod_cycles", None) or 6,
+                                max(0, self.nrep_v.get()),
                                 getattr(self.args, "demod_min", None) or 20,
-                                self.args.kind, self.args.xscale)
+                                self.args.kind, self.args.xscale,
+                                max(0, self.fspan_v.get()))
+
+    def _sync_eps_marks(self):
+        """在每个列选框上标出**这一列的 eps 是谁定的**。
+
+        真实困惑：「包络和解调的精度跟原始波形是解耦的吗」。答案是
+        `eps = max(tol×自己的量程, 3×自己的噪声底)` —— 一个滑块，每列各算各的，
+        而且**经常有列被噪声底钉死，拖 tol 对它毫无作用**（实测频率块在
+        0.5‰~50‰ 全程纹丝不动）。不标出来的话，人会以为自己在调所有曲线。
+        """
+        if not self.traces:
+            return
+        tr = self.traces[self.ti]
+        self.tol_lab.set("tol (‰) → 包络" if self.demod_v.get() else "tol (‰)")
+        tol = self.tol_v.get() / 1000.0
+        for k, s in enumerate(tr.signals):
+            if k >= len(self.colbtn):
+                break
+            pinned = core.NOISE_K * s.noise > tol * (s.rng or 1.0)
+            self.colbtn[k].configure(
+                text="c%d %s%s" % (k + 1, s.name, " ·噪声底钉住" if pinned else ""))
 
     def _ceiling_hint(self):
         """滑块拖到头之后**是什么在挡着**。不说的话工具只是「不再变好」。

@@ -123,7 +123,8 @@ def _demod(tr, args):
         raise SystemExit("--demod 需要 tools/wave_demod.py，这份部署里没有")
     return wave_demod.apply(tr, args.tol or core.DEFAULT_TOL, args.budget,
                             args.demod_cycles, args.demod_min,
-                            args.kind, args.xscale)
+                            args.kind, args.xscale,
+                            getattr(args, "demod_fspan", 0))
 
 
 def process(path, args):
@@ -210,6 +211,10 @@ def build_parser():
                    metavar="N", help="附几个代表性周期（默认 %d）。挑在极值处："
                                      "包络最大/最小、频率偏离最大、残差最大"
                                      % 6)
+    p.add_argument("--demod-fspan", type=int, default=0, dest="demod_fspan",
+                   metavar="M", help="频率跨几个周期测（0=自动）。这是取舍不是细节："
+                                     "M 大了频率曲线平滑但迟钝，小了跟得快但噪 —— "
+                                     "「频率被牵引了多少」看不看得见就取决于它")
     p.add_argument("--demod-min", type=int, default=None, dest="demod_min",
                    metavar="N", help="少于这么多周期就不解调（默认 %d）" % 20)
     p.add_argument("--no-metrics", action="store_true",

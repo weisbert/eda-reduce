@@ -176,6 +176,42 @@ class TestRepresentativeCycles(unittest.TestCase):
                          "代表周期必须是原始样点，不许抽点")
 
 
+class TestFreqSpan(unittest.TestCase):
+    """跨几个周期测频是**取舍**，得能手给。
+
+    tol 管不着这一层：tol 只管「算出来的曲线存得准不准」，
+    这个旋钮管「测得准不准」。两层精度是叠加的。
+    """
+
+    def test_bigger_span_trades_resolution_for_smoothness(self):
+        tr = osc(t_end=1e-6)
+        cyc, _ = dm.find_cycles(tr)
+        prev_n, prev_pp = None, None
+        for m in (1, 4, 20):
+            fx, fy, got, _ = dm._freq_trace(cyc, m=m)
+            self.assertEqual(got, m)
+            pp = max(fy) - min(fy)
+            if prev_n is not None:
+                self.assertLess(len(fx), prev_n, "跨得多点数该少")
+                self.assertLess(pp, prev_pp, "跨得多该更平")
+            prev_n, prev_pp = len(fx), pp
+
+    def test_zero_means_auto(self):
+        tr = osc(t_end=1e-6)
+        cyc, _ = dm.find_cycles(tr)
+        a = dm._freq_trace(cyc, m=0)
+        b = dm._freq_trace(cyc)
+        self.assertEqual(a[2], b[2])
+        self.assertLessEqual(len(a[0]), dm.FREQ_MAX_PTS)
+
+    def test_apply_passes_the_knobs_through(self):
+        tr = osc(t_end=1e-6)
+        out = dm.apply(tr, 0.005, 51200, n_cycles=3, fspan=16, kind="tran")
+        self.assertEqual(len(out[0].picks), 3, "代表周期个数没传下去")
+        self.assertTrue(any("跨 16 个周期" in n for n in out[1].notes),
+                        "测频跨度没传下去 / 没声明")
+
+
 class TestOneDocument(unittest.TestCase):
     """一键复制是硬要求：四件东西必须在**同一份** .wv 里。"""
 
