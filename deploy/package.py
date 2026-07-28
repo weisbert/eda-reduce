@@ -248,7 +248,8 @@ def build_full(out, target_glibc):
           "sha256 旁文件已写"
           % (tar, os.path.getsize(tar) / 1024.0, req_hash[:12],
              len(man["wheels"])))
-    print("      隔离区：tar xzf 之后跑 `bash bootstrap.sh /opt/eda_reduce`")
+    print("      隔离区：tar xzf ... -C pkg 之后跑 `bash pkg/bootstrap.sh`"
+          "（默认装到当前目录下的 eda_reduce/，不需要 root；要装别处就把路径传进去）")
     return 0
 
 
@@ -298,7 +299,8 @@ def build_incremental(out, last_path):
           "      带的 req-hash %s —— 跟已部署的对不上 update.sh 会中止"
           % (tar, os.path.getsize(tar) / 1024.0,
              man["requirements_hash"][:12]))
-    print("      隔离区：tar xzf 之后跑 `bash update.sh /opt/eda_reduce`")
+    print("      隔离区：tar xzf ... -C pkg 之后跑 `bash pkg/update.sh`"
+          "（默认更新当前目录下的 eda_reduce/）")
     return 0
 
 

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # 隔离区增量更新（incremental 包）：只换 app/ 源码，复用 .venv + wheels。
 #
-#     bash update.sh [PREFIX]             # 默认 /opt/eda_reduce
+#     tar xzf eda_reduce_incremental.tar.gz -C pkg
+#     bash pkg/update.sh                  # 更新 ./eda_reduce
+#     bash pkg/update.sh ~/tools/wave     # 或者你当初装的那个位置
 #
-# **用 `bash update.sh` 调，不要 `./update.sh`**（登录 shell 常是 tcsh，
+# 默认找当前目录下的 eda_reduce/，也认 EDA_REDUCE_PREFIX。找不到会把
+# 找过哪些地方列出来，不猜。
+#
+# **用 `bash xxx.sh` 调，不要 `./xxx.sh`**（登录 shell 常是 tcsh，
 # 上传通道可能掉 exec 位）。
 #
 # 两道闸：
@@ -16,12 +21,20 @@
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PREFIX="${1:-/opt/eda_reduce}"
+PREFIX="${1:-${EDA_REDUCE_PREFIX:-$PWD/eda_reduce}}"
 KEEP=3
 
 echo "== eda-reduce 增量更新 =="
 [ -f "$HERE/MANIFEST.json" ] || { echo "错误：缺 MANIFEST.json"; exit 1; }
-[ -d "$PREFIX/app" ] || { echo "错误：$PREFIX 没装过 —— 先用 full 包跑 bootstrap.sh"; exit 1; }
+if [ ! -d "$PREFIX/app" ]; then
+    echo "错误：$PREFIX 下没有已安装的 app/。"
+    echo "      找过：\$1=${1:-（没给）}  \$EDA_REDUCE_PREFIX=${EDA_REDUCE_PREFIX:-（没设）}"
+    echo "            \$PWD/eda_reduce=$PWD/eda_reduce"
+    echo "      装在别处就把路径传进来：bash $0 <你的安装目录>"
+    echo "      从没装过就先用 full 包跑 bootstrap.sh"
+    exit 1
+fi
+PREFIX="$(cd "$PREFIX" && pwd)"
 
 _get() { grep -o "\"$2\"[^,]*" "$1" | head -1 | sed 's/.*: *"//; s/"//'; }
 

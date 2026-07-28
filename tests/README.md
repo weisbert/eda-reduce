@@ -1,7 +1,7 @@
 # tests
 
 ```bash
-python -m unittest discover -s tests            # 全套，约 7 秒
+python -m unittest discover -s tests            # 全套，约 35 秒
 python -m unittest discover -s tests -v         # 看每一条
 EDA_REDUCE_GUI_TEST=1 python -m unittest discover -s tests   # 加上会弹窗的 GUI 自检
 ```
@@ -20,6 +20,7 @@ EDA_REDUCE_GUI_TEST=1 python -m unittest discover -s tests   # 加上会弹窗�
 | `test_digitize.py` | 截图数字化闭环（渲染→数字化→比对，误差落在像素精度内） |
 | `test_regression.py` | `examples/demo_*.wv` 逐字节基线 + 生成器确定性 |
 | `test_gui.py` | GUI 无人值守自检（默认跳过）+ 不碰 Tk 的纯计算部分 |
+| `test_deploy.py` | **真打包、真解开、真跑 bootstrap.sh**：默认装当前目录、自吃自守卫、CRLF、export-subst、增量更新与失败回滚、依赖哈希闸、glibc 审计闸 |
 
 ## 几条不太一样的地方
 

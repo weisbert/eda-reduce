@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# 隔离区首次安装（full 包）。在解开的包目录里跑：
+# 隔离区首次安装（full 包）。
 #
-#     bash bootstrap.sh [PREFIX]          # 默认 /opt/eda_reduce
+#     tar xzf eda_reduce_full.tar.gz -C pkg
+#     bash pkg/bootstrap.sh                 # 装到 ./eda_reduce
+#     bash pkg/bootstrap.sh ~/tools/wave    # 或者你指定的任何地方
 #
-# **用 `bash bootstrap.sh` 调，不要 `./bootstrap.sh`** —— 登录 shell 常是 tcsh，
+# **默认装在当前目录下的 eda_reduce/**，不需要 root，不假定任何目录约定。
+# 想固定到别处就传参，或者设 EDA_REDUCE_PREFIX。
+#
+# **用 `bash xxx.sh` 调，不要 `./xxx.sh`** —— 登录 shell 常是 tcsh，
 # 而且上传通道经常把 exec 位掉了。
 #
-# 装完的目录结构：
+# 装完的目录结构（全在 PREFIX 底下，卸载就是 rm -rf 它）：
 #   PREFIX/.venv/            只建一次，之后每次 update 复用
 #   PREFIX/wheels/           只放一次，之后每次 update 复用
 #   PREFIX/app/              每次 update 整个换掉
@@ -16,7 +21,20 @@
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PREFIX="${1:-/opt/eda_reduce}"
+PREFIX="${1:-${EDA_REDUCE_PREFIX:-$PWD/eda_reduce}}"
+mkdir -p "$PREFIX"
+PREFIX="$(cd "$PREFIX" && pwd)"          # 转成绝对路径，后面全都不含糊
+
+# 装到包目录里面去会自己吃自己：rm -rf $PREFIX/app 会删掉源，cp 就没得拷了。
+# 而且 pkg/ 一删，results/ 跟着没。
+case "$PREFIX" in
+    "$HERE"|"$HERE"/*)
+        echo "错误：安装目录 $PREFIX 在包目录 $HERE 里面。"
+        echo "      先 cd 出来再跑，或者显式指定一个位置："
+        echo "        cd .. && bash $(basename "$HERE")/bootstrap.sh"
+        echo "        bash $0 ~/tools/wave"
+        exit 1 ;;
+esac
 
 echo "== eda-reduce 首次安装 =="
 echo "   包目录 : $HERE"

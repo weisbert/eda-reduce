@@ -36,8 +36,8 @@ docker run --rm --network none -v "$ABS:/in/pkg.tar.gz:ro" "$IMG" bash -euxc '
         exit 1
     fi
 
-    bash bootstrap.sh /opt/eda_reduce
-    /opt/eda_reduce/wave /opt/eda_reduce/app/examples/demo_ac.csv -o /tmp/a.wv
+    cd /tmp && bash pkg/bootstrap.sh          # 默认装到 /tmp/eda_reduce
+    /tmp/eda_reduce/wave /tmp/eda_reduce/app/examples/demo_ac.csv -o /tmp/a.wv
     head -3 /tmp/a.wv
     echo "断网离线安装 + 端到端 OK"
 '

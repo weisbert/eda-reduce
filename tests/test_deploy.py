@@ -1,0 +1,248 @@
+# -*- coding: utf-8 -*-
+"""部署管道。
+
+这是出错成本最高的一环：包坏了要到隔离区才发现，一次来回极贵。
+所以这里是**真的打包、真的解开、真的跑 bootstrap.sh**，不是读代码猜。
+
+需要 bash（Windows 上 Git Bash 就行）和 git 仓库，缺了会跳过并说明。
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from _common import ROOT
+
+BASH = shutil.which("bash")
+HAS_GIT = shutil.which("git") and os.path.isdir(os.path.join(ROOT, ".git"))
+
+
+def sh(args, cwd=None, env=None):
+    e = dict(os.environ, PYTHONIOENCODING="utf-8")
+    e.update(env or {})
+    return subprocess.run(args, cwd=cwd or ROOT, env=e, timeout=600,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+class TestNoHardcodedInstallPath(unittest.TestCase):
+    """安装位置不该由工具替用户决定。
+
+    原来默认 /opt/eda_reduce，这一条同时假定了 root 权限、FHS 约定、
+    和用户的目录布局 —— 三条都不成立。
+    """
+
+    def test_no_absolute_prefix_in_deploy(self):
+        bad = []
+        d = os.path.join(ROOT, "deploy")
+        for f in sorted(os.listdir(d)):
+            if not f.endswith((".sh", ".py", ".ps1", ".md")):
+                continue
+            with open(os.path.join(d, f), encoding="utf-8-sig") as fh:
+                for i, ln in enumerate(fh, 1):
+                    if re.search(r"/opt/eda[_-]?reduce", ln):
+                        bad.append("%s:%d" % (f, i))
+        self.assertEqual(bad, [], "deploy/ 里还有写死的绝对安装路径: %s" % bad)
+
+    def test_default_prefix_is_cwd(self):
+        for f in ("bootstrap.sh", "update.sh"):
+            with open(os.path.join(ROOT, "deploy", f), encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertIn('${1:-${EDA_REDUCE_PREFIX:-$PWD/eda_reduce}}', src,
+                          "%s 的默认前缀应当是当前目录下的 eda_reduce/" % f)
+
+
+@unittest.skipUnless(BASH and HAS_GIT, "需要 bash + git 仓库")
+class TestPackageAndInstall(unittest.TestCase):
+    """打包 -> 解开 -> 安装 -> 增量更新，整条链真跑一遍。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="edadeploy")
+        cls.dist = os.path.join(cls.tmp, "dist")
+        r = sh([sys.executable, os.path.join(ROOT, "deploy", "package.py"),
+                "full", "--out", cls.dist])
+        cls.full_log = r.stdout.decode("utf-8", "replace")
+        assert r.returncode == 0, cls.full_log
+        cls.tar = os.path.join(cls.dist, "eda_reduce_full.tar.gz")
+        cls.pkg = os.path.join(cls.tmp, "pkg")
+        os.makedirs(cls.pkg)
+        subprocess.check_call(["tar", "xzf", cls.tar, "-C", cls.pkg])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_package_layout(self):
+        for f in ("MANIFEST.json", "requirements.lock", "bootstrap.sh",
+                  "update.sh", "app/tools/wave_reduce.py",
+                  "app/examples/demo_tran.csv", "app/VERSION"):
+            self.assertTrue(os.path.exists(os.path.join(self.pkg, f)), f)
+
+    def test_no_crlf_anywhere(self):
+        """.sh 带 \\r 到 Linux 上就是 bad interpreter —— 整条链最容易踩的坑。"""
+        bad = []
+        for base, _, files in os.walk(self.pkg):
+            for f in files:
+                p = os.path.join(base, f)
+                if f.endswith((".png", ".gz")):
+                    continue
+                with open(p, "rb") as fh:
+                    if b"\r" in fh.read():
+                        bad.append(os.path.relpath(p, self.pkg))
+        self.assertEqual(bad, [], "包里有 CRLF: %s" % bad)
+
+    def test_version_export_subst_resolved(self):
+        """隔离区没有 git，cat VERSION 就得能看到 commit —— 占位符必须被替换掉。"""
+        with open(os.path.join(self.pkg, "app", "VERSION"),
+                  encoding="utf-8") as fh:
+            v = fh.read()
+        self.assertNotIn("$Format:", v, "export-subst 没生效")
+        self.assertRegex(v, r"commit\s+[0-9a-f]{40}")
+
+    def test_shebangs_intact(self):
+        for f in ("bootstrap.sh", "update.sh"):
+            with open(os.path.join(self.pkg, f), "rb") as fh:
+                self.assertTrue(fh.read(2) == b"#!", f + " 少了 shebang")
+
+    def test_install_defaults_to_current_directory(self):
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(home)
+        r = sh([BASH, os.path.join(self.pkg, "bootstrap.sh")], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, out)
+        p = os.path.join(home, "eda_reduce")
+        self.assertTrue(os.path.isdir(p), "默认该装到 ./eda_reduce\n" + out)
+        for sub in ("app", "results", "INSTALL.json", "wave"):
+            self.assertTrue(os.path.exists(os.path.join(p, sub)), sub)
+        self.assertIn("装好了", out)
+        # 冒烟测试跑的是真实压缩，结果要和仓库基线一致
+        self.assertIn("2545 -> 585", out, "端到端结果和基线对不上\n" + out)
+
+    def test_refuses_to_install_inside_package_dir(self):
+        """装进包目录会自己吃自己：rm -rf $PREFIX/app 把源删了，cp 就没得拷。"""
+        r = sh([BASH, "bootstrap.sh"], cwd=self.pkg)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(r.returncode, 0, "应当拒绝: " + out)
+        self.assertIn("在包目录", out)
+
+    def test_explicit_prefix_and_env_var(self):
+        home = os.path.join(self.tmp, "h2")
+        os.makedirs(home)
+        want = os.path.join(home, "my tools")     # 顺便验带空格的路径
+        r = sh([BASH, os.path.join(self.pkg, "bootstrap.sh"), want], cwd=home)
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+        self.assertTrue(os.path.isdir(os.path.join(want, "app")))
+
+        home3 = os.path.join(self.tmp, "h3")
+        os.makedirs(home3)
+        r = sh([BASH, os.path.join(self.pkg, "bootstrap.sh")], cwd=home3,
+               env={"EDA_REDUCE_PREFIX": os.path.join(home3, "viaenv")})
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+        self.assertTrue(os.path.isdir(os.path.join(home3, "viaenv", "app")))
+
+    def test_incremental_update_and_rollback(self):
+        home = os.path.join(self.tmp, "h4")
+        os.makedirs(home)
+        sh([BASH, os.path.join(self.pkg, "bootstrap.sh")], cwd=home)
+        prefix = os.path.join(home, "eda_reduce")
+
+        r = sh([sys.executable, os.path.join(ROOT, "deploy", "package.py"),
+                "incremental", "--out", self.dist])
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+        ipkg = os.path.join(self.tmp, "ipkg")
+        os.makedirs(ipkg, exist_ok=True)
+        subprocess.check_call(
+            ["tar", "xzf", os.path.join(self.dist,
+                                        "eda_reduce_incremental.tar.gz"),
+             "-C", ipkg])
+
+        r = sh([BASH, os.path.join(ipkg, "update.sh")], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("更新完成", out)
+
+        # 把包里的工具改坏 -> 冒烟测试失败 -> 必须自动滚回去
+        with open(os.path.join(ipkg, "app", "tools", "wave_reduce.py"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write("import nonexistent_module_xyz\n")
+        r = sh([BASH, os.path.join(ipkg, "update.sh")], cwd=home)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("正在回滚", out)
+        # 滚完还能用，results/ 还在
+        r = sh([BASH, os.path.join(prefix, "wave"), "--list-kinds"], cwd=home)
+        self.assertEqual(r.returncode, 0, r.stdout.decode("utf-8", "replace"))
+        self.assertTrue(os.path.isdir(os.path.join(prefix, "results")))
+
+    def test_update_without_install_reports_where_it_looked(self):
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty, exist_ok=True)
+        ipkg = os.path.join(self.tmp, "ipkg")
+        if not os.path.exists(os.path.join(ipkg, "update.sh")):
+            self.skipTest("增量包还没建（依赖上一个测试）")
+        r = sh([BASH, os.path.join(ipkg, "update.sh")], cwd=empty)
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("找过", out, "找不到时要把找过哪些地方列出来，不猜")
+
+
+@unittest.skipUnless(HAS_GIT, "需要 git 仓库")
+class TestDependencyHashGate(unittest.TestCase):
+    """改了依赖却只推增量包 —— 这种损坏是静默的，必须在打包时就挡住。"""
+
+    def test_incremental_aborts_when_requirements_changed(self):
+        tmp = tempfile.mkdtemp(prefix="edahash")
+        try:
+            dist = os.path.join(tmp, "dist")
+            self.assertEqual(sh([sys.executable,
+                                 os.path.join(ROOT, "deploy", "package.py"),
+                                 "full", "--out", dist]).returncode, 0)
+            req = os.path.join(ROOT, "deploy", "requirements.txt")
+            with open(req, "rb") as fh:
+                orig = fh.read()
+            try:
+                with open(req, "ab") as fh:
+                    fh.write(b"\nnumpy==1.24.4\n")
+                r = sh([sys.executable,
+                        os.path.join(ROOT, "deploy", "package.py"),
+                        "incremental", "--out", dist])
+                out = r.stdout.decode("utf-8", "replace")
+                self.assertNotEqual(r.returncode, 0, "依赖变了必须中止")
+                self.assertIn("中止", out)
+                self.assertIn("full", out, "要指明得走 full 包")
+            finally:
+                with open(req, "wb") as fh:
+                    fh.write(orig)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestGlibcAuditGate(unittest.TestCase):
+    """轮子太新的错误必须在黄区暴露，等到隔离区来回一趟成本极高。"""
+
+    def test_rejects_too_new_and_musl(self):
+        sys.path.insert(0, os.path.join(ROOT, "deploy"))
+        import audit_wheels
+        tmp = tempfile.mkdtemp(prefix="edawheel")
+        try:
+            for n in ("numpy-1.26.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+                      "bad-1.0-cp311-cp311-musllinux_1_1_x86_64.whl",
+                      "ok-1.0-py3-none-any.whl",
+                      "fine-1.0-cp311-cp311-manylinux2014_x86_64.whl"):
+                open(os.path.join(tmp, n), "wb").close()
+            rows, viol = audit_wheels.audit_dir(tmp, (2, 17), "x86_64")
+            self.assertEqual(len(rows), 4)
+            names = sorted(r["name"].split("-")[0] for r in viol)
+            self.assertEqual(names, ["bad", "numpy"])
+            ok = {r["name"].split("-")[0]: r["verdict"] for r in rows}
+            self.assertIn("2.28", ok["numpy"], "要说清要的是哪个 glibc")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

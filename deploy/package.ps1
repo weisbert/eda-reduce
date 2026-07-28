@@ -73,7 +73,9 @@ Get-ChildItem $Out -File | Where-Object { $_.Name -like '*.tar.gz*' } |
 Write-Host ""
 Write-Host "隔离区上（注意用 bash 调，不要 ./）："
 if ($Mode -eq 'full') {
-    Write-Host "  tar xzf eda_reduce_full.tar.gz -C pkg && cd pkg && bash bootstrap.sh /opt/eda_reduce"
+    Write-Host "  mkdir pkg; tar xzf eda_reduce_full.tar.gz -C pkg; bash pkg/bootstrap.sh"
+    Write-Host "  (默认装到当前目录下的 eda_reduce/，不需要 root;要装别处就把路径传进去)"
 } else {
-    Write-Host "  tar xzf eda_reduce_incremental.tar.gz -C pkg && cd pkg && bash update.sh /opt/eda_reduce"
+    Write-Host "  mkdir pkg; tar xzf eda_reduce_incremental.tar.gz -C pkg; bash pkg/update.sh"
+    Write-Host "  (默认更新当前目录下的 eda_reduce/)"
 }

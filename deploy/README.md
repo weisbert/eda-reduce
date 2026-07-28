@@ -19,7 +19,7 @@
 | 内容 | wheels + `requirements.lock` + app + `bootstrap.sh` + `update.sh` | 只有 app 源码 + `update.sh` |
 | 体积 | 有几个依赖就多大；**现在依赖为空，几十 KB** | 几十 KB |
 | 什么时候用 | 首次安装、**依赖变了** | 日常改代码（绝大多数时候） |
-| 隔离区上跑 | `bash bootstrap.sh /opt/eda_reduce` | `bash update.sh /opt/eda_reduce` |
+| 隔离区上跑 | `bash pkg/bootstrap.sh` | `bash pkg/update.sh` |
 
 > 现在 `requirements.txt` 是空的（`wave_core` / `wave_emit` / `wave_cli` 硬性纯标准库），
 > 所以两种包看起来没差别。**但管道现在就按双包建**——哪天要加 numpy 加速
@@ -88,7 +88,7 @@ python deploy/audit_wheels.py dist/_stage_full/wheels
 - 打包读 **committed blob**（`git archive HEAD`），不读 Windows 工作树。
   所以黄区的 autocrlf 设置污染不了包，未提交的改动也不会莫名其妙混进去。
   工作树脏的时候 `package.ps1` 会大声警告——你以为打进去的改动其实没打进去。
-- `VERSION export-subst`：隔离区没有 git，`cat /opt/eda_reduce/app/VERSION`
+- `VERSION export-subst`：隔离区没有 git，`cat <安装目录>/app/VERSION`
   就能看到 commit 和日期。
 
 ### 4. 备份 + 回滚（`update.sh`）
@@ -102,23 +102,35 @@ python deploy/audit_wheels.py dist/_stage_full/wheels
 
 ```bash
 # 首次
-tar xzf eda_reduce_full.tar.gz -C pkg && cd pkg
-bash bootstrap.sh /opt/eda_reduce
+mkdir -p pkg && tar xzf eda_reduce_full.tar.gz -C pkg
+bash pkg/bootstrap.sh                    # 装到 ./eda_reduce
 
 # 日常
-tar xzf eda_reduce_incremental.tar.gz -C pkg && cd pkg
-bash update.sh /opt/eda_reduce
+mkdir -p pkg && tar xzf eda_reduce_incremental.tar.gz -C pkg
+bash pkg/update.sh                       # 更新 ./eda_reduce
 ```
+
+**装在哪由你定，脚本不替你决定。** 默认是**当前目录下的 `eda_reduce/`**——
+不需要 root，不假定任何目录约定，卸载就是 `rm -rf` 它。想装别处：
+
+```bash
+bash pkg/bootstrap.sh ~/tools/wave       # 传参
+export EDA_REDUCE_PREFIX=~/tools/wave    # 或者设成常态，update.sh 也认
+```
+
+从**包目录里面**跑会被拦住（`rm -rf $PREFIX/app` 会把源删掉，
+而且 `pkg/` 一删 `results/` 跟着没），报错会告诉你怎么办。
 
 **用 `bash xxx.sh` 调，不要 `./xxx.sh`。** 登录 shell 常是 tcsh，
 而且上传通道经常把 exec 位掉了。
 
-装完之后：
+装完之后（下面用 `$P` 代指你的安装目录）：
 
 ```bash
-/opt/eda_reduce/wave my.csv -o my.wv
-/opt/eda_reduce/wave my.csv --gui        # 要有 tkinter
-cat /opt/eda_reduce/app/VERSION          # 看装的是哪个 commit
+P=./eda_reduce
+$P/wave my.csv -o my.wv
+$P/wave my.csv --gui                     # 要有 tkinter
+cat $P/app/VERSION                       # 看装的是哪个 commit
 ```
 
 ### tkinter
@@ -147,10 +159,11 @@ bash deploy/dryrun_manylinux2014.sh dist/eda_reduce_full.tar.gz
 ## 回滚
 
 ```bash
-ls -1dt /opt/eda_reduce/.backups/app-*        # 最近 3 份
-rm -rf /opt/eda_reduce/app
-cp -r /opt/eda_reduce/.backups/app-<戳> /opt/eda_reduce/app
-ln -sfn /opt/eda_reduce/results /opt/eda_reduce/app/results
+P=./eda_reduce                # 换成你的安装目录
+ls -1dt $P/.backups/app-*     # 最近 3 份
+rm -rf $P/app
+cp -r $P/.backups/app-<戳> $P/app
+ln -sfn $P/results $P/app/results
 ```
 
 `update.sh` 中途失败会自动做这件事，这里是手动兜底。
