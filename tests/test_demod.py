@@ -49,6 +49,33 @@ class TestCycleFinding(unittest.TestCase):
         spread = per[int(0.9 * len(per))] - per[int(0.1 * len(per))]
         self.assertLess(spread, 1e-11, "周期被栅格量化了（插值没生效）")
 
+    def test_one_inrush_spike_does_not_kill_cycle_finding(self):
+        """t=0 一发浪涌不许把整条解调打死。
+
+        起振**电流**必然带浪涌：t=0 给电容充电，几十 ps 内冲到几百 mA，
+        而振荡本体住在 ±1.5 mA 里。中线原来按全量程算（`0.5*(vmin+vmax)`），
+        于是落在浪涌的一半高度上 —— 一次都不过线，切出 0 个周期，
+        `--demod` 报「没生效：这条信号可能不是准正弦」。
+
+        信号本身是干净的准正弦，跟正弦不正弦无关；报错还把人往错的方向指。
+        tol / 量化 / 预细化在 ee62554 就都改按主体量程算了，这里是漏网的一处。
+        """
+        tr = osc()
+        base, _ = dm.find_cycles(tr)
+        self.assertGreater(len(base), 100, "夹具本身就切不出周期")
+
+        spiked = osc()
+        s = spiked.signals[0]
+        s.y[0] = 300.0 * (s.vmax - s.vmin)      # 一个点，量程顶高 300 倍
+        core.analyze(spiked, kind="tran")
+        self.assertGreater(s.rng, core.OUTLIER_K * s.rng_body,
+                           "夹具没造出『量程被离群点定死』这个前提")
+
+        cyc, _ = dm.find_cycles(spiked)
+        self.assertGreater(
+            len(cyc), 0.9 * len(base),
+            "一个离群点就让周期数从 %d 掉到 %d" % (len(base), len(cyc)))
+
     def test_transition_is_not_counted_as_a_cycle(self):
         """直流台阶穿过中线一次，会跟下一个真周期凑出一个假『周期』。
 

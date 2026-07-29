@@ -169,9 +169,19 @@ def find_cycles(tr, si=0):
     x, y = tr.x, s.y
     if s.rng <= 0 or len(x) < 8:
         return [], 0.0
-    level = 0.5 * (s.vmin + s.vmax)
-    hyst = max(0.05 * s.rng, core.NOISE_K * s.noise)
-    if hyst >= 0.5 * s.rng:
+    # 中线和迟滞都得按**主体量程**算，判据用 `core.eps_range` 那一个
+    # —— tol / 量化 / 预细化早就改过来了（ee62554），只有这里漏了。
+    #
+    # 漏的代价：起振**电流**的 t=0 浪涌把 vmax 顶到 500 mA，全量程中线
+    # 就落在 250 mA，而振荡本体住在 0.3 mA ± 1.6 mA —— 一次都不过线，
+    # 切出 0 个周期，--demod 报「没生效：可能不是准正弦」。
+    # 信号是干干净净的 4331 个周期、27 点/周期，跟正弦不正弦毫无关系。
+    # 而这条正好打在最需要包络的那类波形上：起振电流必然带浪涌。
+    rng, used_body = core.eps_range(tr, s)
+    level = (0.5 * (s.body_lo + s.body_hi) if used_body
+             else 0.5 * (s.vmin + s.vmax))
+    hyst = max(0.05 * rng, core.NOISE_K * s.noise)
+    if hyst >= 0.5 * rng:
         return [], level
     cr = crossings(x, y, level, hyst)
     if len(cr) < 3:
