@@ -457,7 +457,6 @@ class TestGuiSelftest(unittest.TestCase):
             app._pan_px(app.c_wave, 10 ** 6)
             self.assertEqual(app.view, full, "全视窗时平移应当是空操作")
             app.view = (tr.x[0], tr.x[0] + (tr.x[-1] - tr.x[0]) * 0.2)
-            app.band = None
             app._redraw()
             span = app.view[1] - app.view[0]
             app._pan_px(app.c_wave, 10 ** 6)                 # 一把推到最右
@@ -470,27 +469,44 @@ class TestGuiSelftest(unittest.TestCase):
 
     def test_y_axis_follows_the_view(self):
         """窄视窗里纵轴必须跟着收 —— 这是「放大局部」有没有用的分水岭。"""
+        import wave_gui
+        import wave_gui_draw as draw
         root, app = self._app("demo_tran.csv")
         try:
             tr = app.red.trace
-            s = tr.signals[0]           # V(vdd_pll)：120 ns 处有根 3.2 mV 的 glitch
             span = tr.x[-1] - tr.x[0]
             app.view = (tr.x[0] + span * 0.3975, tr.x[0] + span * 0.4025)
-            app.band = None
+            app.lane_mode.set("each")       # 一条信号一道才比得出这件事
             app._redraw()
             root.update()
-            base_l, rng_l, _ = app._yscale(s, *app.band[0])
-            app.y_local.set(False)
-            base_g, rng_g, _ = app._yscale(s, *app.band[0])
-            self.assertEqual((base_g, rng_g), (s.vmin, s.rng or 1.0),
-                             "关掉之后必须原样回到全局量程")
-            self.assertLess(rng_l * 5, rng_g, "窄视窗里纵轴没跟着放大")
-            # 视窗内的原始包络必须完整落在纵轴范围里，否则画出来是被裁过的
-            lo, hi = app.band[0]
-            vals = [v for v in lo if v is not None]
-            vals += [v for v in hi if v is not None]
-            self.assertLessEqual(base_l, min(vals))
-            self.assertGreaterEqual(base_l + rng_l, max(vals))
+            blocks = app._lane_blocks()
+            lane = draw.lanes_of(blocks, "each")[0]
+            i0i1 = {id(b): wave_gui.fit_view(b.red.trace.x, app.view[0],
+                                             app.view[1]) for b in blocks}
+            lo_l, hi_l = draw.lane_span(lane[1], i0i1, True)
+            lo_g, hi_g = draw.lane_span(lane[1], i0i1, False)
+            self.assertLess((hi_l - lo_l) * 5, hi_g - lo_g,
+                            "窄视窗里纵轴没跟着放大")
+            # 视窗内的原始点必须完整落在纵轴范围里，否则画出来是被裁过的
+            b, si = lane[1][0]
+            i0, i1 = i0i1[id(b)]
+            seg = b.red.trace.signals[si].y[i0:i1]
+            self.assertLessEqual(lo_l, min(seg))
+            self.assertGreaterEqual(hi_l, max(seg))
+        finally:
+            root.destroy()
+
+    def test_same_unit_signals_share_one_axis(self):
+        """同单位共轴 —— 各自拉满会让曲线之间的高低和交叉变成假的。"""
+        import wave_gui_draw as draw
+        root, app = self._app("demo_tran.csv")
+        try:
+            blocks = app._lane_blocks()
+            by_unit = draw.lanes_of(blocks, "unit")
+            each = draw.lanes_of(blocks, "each")
+            self.assertLess(len(by_unit), len(each), "按单位分道没合并任何东西")
+            units = [u for u, _ in by_unit]
+            self.assertEqual(len(units), len(set(units)), "同一个单位分了两道")
         finally:
             root.destroy()
 
@@ -502,16 +518,27 @@ class TestGuiSelftest(unittest.TestCase):
         """
         root, app = self._app("demo_tran.csv")
         try:
-            class Flat(object):
-                vmin, vmax, rng, eps = 0.5, 0.5, 0.0, 1e-3
-
-            flat = [0.5] * 20
+            import wave_gui
+            import wave_gui_draw as draw
+            tr = app.red.trace
+            # 找一段全平的视窗：demo_tran 起点附近 V(ctrl) 基本不动
+            app.view = (tr.x[0], tr.x[0] + (tr.x[-1] - tr.x[0]) * 0.002)
+            app.lane_mode.set("each")
             app.y_local.set(True)
-            base, rng, floored = app._yscale(Flat(), flat, flat)
-            self.assertTrue(floored, "全平的视窗没走 eps 兜底")
-            self.assertGreaterEqual(rng, 4.0 * Flat.eps)
-            self.assertLess(base, 0.5)
-            self.assertGreater(base + rng, 0.5)
+            app._redraw()
+            root.update()
+            blocks = app._lane_blocks()
+            i0i1 = {id(b): wave_gui.fit_view(b.red.trace.x, app.view[0],
+                                             app.view[1]) for b in blocks}
+            for _u, items in draw.lanes_of(blocks, "each"):
+                b, si = items[0]
+                s = b.red.trace.signals[si]
+                lo, hi = draw.lane_span(items, i0i1, True)
+                i0, i1 = i0i1[id(b)]
+                seg = s.y[i0:i1]
+                if max(seg) - min(seg) < s.eps:      # 这一段确实是平的
+                    self.assertLessEqual(lo, min(seg))
+                    self.assertGreaterEqual(hi, max(seg))
         finally:
             root.destroy()
 
@@ -744,11 +771,15 @@ class TestGuiSelftest(unittest.TestCase):
         self.assertGreaterEqual(len(counts), 4, out)
         wave = [int(c.split("/")[0]) for c in counts]
         err = [int(c.split("/")[1]) for c in counts]
+        # 判据是**有界**，不是恒定：三层带里那层「影」按连续段画 polygon，
+        # 段数随「削掉了多少」变，而那本来就该随参数变。要守的是
+        # 「图元数不随 max_points 一起长」—— 掉帧是那么来的。
         for name, vals in (("波形格", wave), ("误差格", err)):
-            self.assertLessEqual(max(vals) - min(vals), 6,
-                                 "%s图元数随 max_points 变了: %s" % (name, counts))
-            self.assertLess(max(vals), 200,
+            self.assertLess(max(vals), 600,
                             "%s图元数已经不是常数量级了: %s" % (name, counts))
+            self.assertLessEqual(vals[-1], vals[0],
+                                 "%s图元数跟着 max_points 一起长了: %s"
+                                 % (name, counts))
 
 
 class TestGuiPureCompute(unittest.TestCase):
@@ -861,6 +892,79 @@ class TestGuiPureCompute(unittest.TestCase):
         hi = band[0][1]
         peak = [i for i, v in enumerate(hi) if v == 1.0]
         self.assertEqual(peak, [10], "x=50 在 [40,60] 上应当落在正中那一列")
+
+    def test_nice_ticks_are_round(self):
+        """刻度必须是 1/2/5×10^k 的整数值。
+
+        原来是先把绘图区四等分再反算那个位置的 x，于是刻度落在
+        717.6 ps、500.4 ns 这种数上 —— 一张图上没有一个整数，读数得靠估。
+        """
+        import wave_gui_draw as draw
+        for lo, hi in ((0.0, 2e-6), (1.6e-6, 1.615e-6), (-3.0, 7.0),
+                       (0.0, 1.0), (1e9, 5e9)):
+            ts = draw.nice_ticks(lo, hi, 5)
+            self.assertTrue(ts, "%g..%g 一个刻度都没给" % (lo, hi))
+            self.assertTrue(all(lo - 1e-12 <= t <= hi + 1e-12 for t in ts))
+            step = ts[1] - ts[0] if len(ts) > 1 else (hi - lo)
+            m = step / 10.0 ** math.floor(math.log10(step))
+            self.assertAlmostEqual(min((1.0, 2.0, 5.0, 10.0),
+                                       key=lambda v: abs(v - m)), m, places=6,
+                                   msg="步长 %g 不是 1/2/5 的整数倍" % step)
+        self.assertEqual(draw.nice_ticks(1.0, 1.0), [], "退化区间该给空")
+
+    def test_symlog_is_monotonic_and_keeps_the_knee(self):
+        """symlog：±1 附近还是线性，之外按数量级压，而且不许饱和。
+
+        原来纵轴硬钳在 ±3，3 倍和 300 倍长得一模一样 —— 而那正是
+        「调 tol 还是换模式」的决定量。
+        """
+        import wave_gui_draw as draw
+        self.assertAlmostEqual(draw.symlog(0.0), 0.0)
+        self.assertAlmostEqual(draw.symlog(1.0), 1.0)
+        self.assertAlmostEqual(draw.symlog(-1.0), -1.0)
+        self.assertAlmostEqual(draw.symlog(10.0), 2.0)
+        self.assertAlmostEqual(draw.symlog(100.0), 3.0)
+        prev = None
+        for e in [x / 10.0 for x in range(-2000, 2001)]:
+            v = draw.symlog(e)
+            if prev is not None:
+                self.assertGreaterEqual(v, prev - 1e-12, "symlog 不单调")
+            prev = v
+        self.assertGreater(draw.symlog(300.0), draw.symlog(3.0),
+                           "300× 和 3× 必须画在不同高度")
+
+    def test_recon_band_has_no_holes(self):
+        """重建带不许有空列 —— 保留点稀疏时整段列全 None，带子会断成虚线。"""
+        import wave_gui_draw as draw
+        from _common import core
+        rows = ["time (s),V(o) (V)"]
+        for i in range(2000):
+            rows.append("%.12g,%.9g" % (i * 1e-9, math.sin(i * 0.01)))
+        tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+        core.analyze(tr)
+        core.set_eps(tr, 0.005)
+        red = core.reduce_trace(tr, 0.005, 12, core.predecimate(tr, 0.005), [])
+        lo, hi = draw.recon_band(tr, red, 0, 0, 2000, 120, tr.x[0], tr.x[-1])
+        self.assertEqual(sum(1 for v in lo if v is None), 0, "重建带有空列")
+        for a, b in zip(lo, hi):
+            self.assertLessEqual(a, b)
+
+    def test_clipped_runs_only_reports_real_loss(self):
+        """「影」只画超过容差的那些段 —— 否则整张图都是影。"""
+        import wave_gui_draw as draw
+        n = 20
+        olo = [0.0] * n
+        ohi = [1.0] * n
+        rlo = [0.0] * n
+        rhi = [1.0] * n
+        self.assertEqual(draw.clipped_runs(olo, ohi, rlo, rhi, 0.01), [],
+                         "没丢东西却报了影")
+        for i in range(5, 9):
+            rhi[i] = 0.5                       # 上沿被削掉 0.5
+        runs = draw.clipped_runs(olo, ohi, rlo, rhi, 0.01)
+        self.assertEqual(runs, [(5, 8, "hi")])
+        self.assertEqual(draw.clipped_runs(olo, ohi, rlo, rhi, 1.0), [],
+                         "容差比削掉的还大，不该报")
 
     def test_xform_log(self):
         import wave_gui

@@ -49,6 +49,17 @@ except ImportError:                                    # pragma: no cover
 import wave_cli as cli
 import wave_core as core
 import wave_emit as emit
+import wave_gui_draw as draw
+
+
+def _pale(hexcol, k=0.82):
+    """往白里兑。原始包络用**每条信号自己的**淡色 —— 六路共用一个 #c8c8c8
+    的话，六块灰糊成一个气球，谁都不知道哪块是谁的。"""
+    r = int(hexcol[1:3], 16)
+    g = int(hexcol[3:5], 16)
+    b = int(hexcol[5:7], 16)
+    f = lambda v: int(v + (255 - v) * k)        # noqa: E731
+    return "#%02x%02x%02x" % (f(r), f(g), f(b))
 
 BAND_COLS = 1200          # 灰带的像素列数上限
 MAX_SEG = 4000            # Canvas 线段总数上限，多路信号时按它反推列数
@@ -351,6 +362,8 @@ class WaveGui(object):
         # 因为一条线程正把 max_points 清成 None，另一条还按旧值在算。
         # 所以压预算期间主线程一律不算 —— 转圈已经说清楚在忙什么了。
         self._fitting = False
+        self._cursor_x = None       # 游标：把「丢了什么」变成数字的那把尺
+        self._lane_geom = []
         self.tol_v = tk.DoubleVar(value=(args.tol or core.DEFAULT_TOL) * 1000.0)
         self.mp_v = tk.IntVar(value=0)
         b0 = args.budget if args.budget else 0
@@ -367,6 +380,10 @@ class WaveGui(object):
         self.win_v = tk.BooleanVar(value=False)
         self.ev_v = tk.BooleanVar(value=True)      # 波形上标 EVENTS
         self.low_v = tk.StringVar(value="err")     # 下窗格画什么
+        # 纵轴：同单位共轴（真的高低）/ 每路一道（小信号也看得见）。
+        # **没有「同一道里各自拉满」这个选项** —— 那会让 env_hi 和 env_lo
+        # 在图上交叉，是在生产假信息。
+        self.lane_mode = tk.StringVar(value="unit")
         self.nrep_v = tk.IntVar(value=getattr(args, "demod_cycles", None) or 6)
         self.fspan_v = tk.IntVar(value=getattr(args, "demod_fspan", 0) or 0)
         self.view_full = tk.BooleanVar(value=False)
@@ -659,9 +676,16 @@ class WaveGui(object):
         tk.Frame(vb, bg="#9aa4ad", width=3).pack(side="left", fill="y")
         tk.Label(vb, text=" 只改这张图，不改要粘走的文本 ", bg=VIEW_BG,
                  fg="#4a5560", font=("Consolas", 9, "bold")).pack(side="left")
-        tk.Checkbutton(vb, text="纵轴跟视窗", variable=self.y_local, bg=VIEW_BG,
+        tk.Label(vb, text="纵轴:", bg=VIEW_BG, fg="#4a5560",
+                 font=("Consolas", 9)).pack(side="left", padx=(10, 0))
+        for val, lab in (("unit", "同单位共轴"), ("each", "每路一道")):
+            tk.Radiobutton(vb, text=lab, variable=self.lane_mode, value=val,
+                           bg=VIEW_BG, fg=FG, selectcolor=VIEW_BG,
+                           font=("Consolas", 9),
+                           command=self._redraw).pack(side="left")
+        tk.Checkbutton(vb, text="跟视窗", variable=self.y_local, bg=VIEW_BG,
                        fg=FG, selectcolor=VIEW_BG, font=("Consolas", 9),
-                       command=self._redraw).pack(side="left", padx=(10, 0))
+                       command=self._redraw).pack(side="left", padx=(4, 0))
         tk.Checkbutton(vb, text="标出 EVENTS", variable=self.ev_v, bg=VIEW_BG,
                        fg=FG, selectcolor=VIEW_BG, font=("Consolas", 9),
                        command=self._redraw).pack(side="left", padx=(6, 0))
@@ -736,7 +760,7 @@ class WaveGui(object):
         self.c_wave = tk.Canvas(right, bg=BG, height=330, highlightthickness=1,
                                 highlightbackground=GRID)
         self.c_wave.pack(fill="both", expand=True, pady=(2, 2))
-        self.c_err = tk.Canvas(right, bg=BG, height=180, highlightthickness=1,
+        self.c_err = tk.Canvas(right, bg=BG, height=150, highlightthickness=1,
                                highlightbackground=GRID)
         self.c_err.pack(fill="x", pady=(0, 2))
 
@@ -762,7 +786,7 @@ class WaveGui(object):
         tf.pack(fill="x", padx=8, pady=(2, 8))
         sb = tk.Scrollbar(tf)
         sb.pack(side="right", fill="y")
-        self.txt = tk.Text(tf, height=6, bg="#fafafa", fg=FG,
+        self.txt = tk.Text(tf, height=4, bg="#fafafa", fg=FG,
                            font=("Consolas", 9), wrap="none",
                            yscrollcommand=sb.set)
         self.txt.pack(side="left", fill="both", expand=True)
@@ -781,6 +805,9 @@ class WaveGui(object):
         self.c_wave.bind("<B1-Motion>", self._sel_move)
         self.c_wave.bind("<ButtonRelease-1>", self._sel_end)
         self.c_wave.bind("<Double-Button-1>", lambda e: self._zoom_all())
+        self.c_wave.bind("<Motion>", self._on_motion)
+        self.c_wave.bind("<Leave>", lambda _e: (
+            setattr(self, "_cursor_x", None), self.c_wave.delete("cursor")))
 
         # 滚轮绑在 root 上再按指针位置分派：Windows 的 <MouseWheel> 发给**有焦点的**
         # 控件而不是指针底下那个，绑在画布上会时灵时不灵。X11 没有 MouseWheel，
@@ -1786,125 +1813,247 @@ class WaveGui(object):
         self._draw_wave()
         self._draw_err()
 
+    def _lane_blocks(self):
+        """要画哪些块。全部**要搬走的**块都画，不只当前焦点那块。
+
+        原来只画焦点块，于是解调出来的 f_inst 那一块从头到尾没在任何一张
+        图上出现过 —— 它照样会被粘出去，只是没人看过它长什么样。
+        """
+        if not self.ship:
+            return []
+        return [b for b in self.ship.included() if b.red is not None]
+
     def _draw_wave(self):
         c = self.c_wave
         c.delete("all")
-        tr = self.red.trace
         w, h = c.winfo_width(), c.winfo_height()
-        if w < 50 or h < 50:
+        if w < 60 or h < 60:
             return
-        xf = self._xform(c)
-        i0, i1 = fit_view(tr.x, self.view[0], self.view[1])
-        # 列的基准是**视窗**，不是 fit_view 给的下标区间 —— 后者特意往两边
-        # 各多取一个原始点，拿它当基准的话分箱坐标系比绘图坐标系宽两个点
+        blocks = self._lane_blocks()
+        if not blocks:
+            return
+        lanes = draw.lanes_of(blocks, self.lane_mode.get())
+        if not lanes:
+            return
         x0, x1 = self.view
-        key = (i0, i1, w, id(tr), x0, x1)
-        # `band is None` 也要重算：换视窗的地方都会把 band 置空，但**下标区间可能没变**
-        # （视窗缩在相邻两个原始点之间时 fit_view 给的是同一对下标）。
-        # 只比 key 的话那一下就会拿着 None 去画。
-        if self.band is None or self.band_key != key:
-            # 线段总数要恒定：每条信号的包络是 2*ncol 个顶点，
-            # 四路信号按 1200 列画就是 9600 段，拖动会开始掉帧。
-            ncol = max(120, min(BAND_COLS, w,
-                                MAX_SEG // max(1, 2 * len(tr.signals))))
-            self.band = bin_envelope(tr.x, [s.y for s in tr.signals], i0, i1,
-                                     ncol, x0, x1)
-            self.band_key = key
-        self._grid(c, xf, w, h)
-        ncol = len(self.band[0][0]) if self.band else 0
-        for si, s in enumerate(tr.signals):
-            lo, hi = self.band[si]
-            base, rng, floored = self._yscale(s, lo, hi)
-            pts_a, pts_b = [], []
-            for cix in range(ncol):
-                if lo[cix] is None:
-                    continue
-                px = xf.l + cix / float(max(1, ncol - 1)) * xf.pw
-                pts_a.append((px, xf.sy((lo[cix] - base) / rng)))
-                pts_b.append((px, xf.sy((hi[cix] - base) / rng)))
-            if len(pts_a) > 1:
-                poly = []
-                for p in pts_a:
-                    poly += [p[0], p[1]]
-                for p in reversed(pts_b):
-                    poly += [p[0], p[1]]
-                c.create_polygon(poly, fill=BAND, outline="", stipple="gray50")
-            # reduce 之后的曲线：跑出灰带就是丢了东西。
-            # 保留点比像素列还多时**折线画不得** —— 2500 个周期铺在 1100 像素上，
-            # 每列一个来回，连出来是一坨实心色块，既看不出形状，也看不出
-            # 它比灰带窄了多少（而「窄了多少」正是这一格要回答的问题）。
-            # 那就跟灰带用同一种画法：也压成 min/max 带，两条带子直接比宽窄。
-            col = COLORS[si % 6]
-            # 画的必须是**量化之后**的值，跟误差格同源（见 q_val）
-            cs = self.red.specs[si]
-            vis = [i for i in self.red.kept if i0 <= i < i1]
-            if len(vis) > ncol:
-                klo, khi = _kept_band(tr.x, s.y, vis, x0, x1, ncol, cs)
-                top, bot = [], []
-                for cix in range(ncol):
-                    if klo[cix] is None:
-                        continue
-                    px = xf.l + cix / float(max(1, ncol - 1)) * xf.pw
-                    top.append((px, xf.sy((khi[cix] - base) / rng)))
-                    bot.append((px, xf.sy((klo[cix] - base) / rng)))
-                if len(top) > 1:
-                    # 只有一条信号时才填实心。多条信号各填一块的话，
-                    # 画在最后那条会把前面全盖掉 —— 六路电流试过一次，
-                    # 整个画布是一坨橙色，比原来的折线还糟。
-                    # 多条时只画上下两条沿：看得见彼此，也看得见底下的灰带。
-                    if len(tr.signals) == 1:
-                        poly = []
-                        for p in top:
-                            poly += [p[0], p[1]]
-                        for p in reversed(bot):
-                            poly += [p[0], p[1]]
-                        c.create_polygon(poly, fill=col, outline=col,
-                                         stipple="gray50")
-                    for edge in (top, bot):
-                        c.create_line([v for p in edge for v in p],
-                                      fill=col, width=1)
+        logx = self.traces[self.ti].xscale == "log"
+        pl, pr = draw.GUTTER_L, draw.GUTTER_R
+        pw = max(1, w - pl - pr)
+        ev_h = draw.EV_H if (self.ev_v.get() and self.metrics) else 0
+        axis_h = 18
+        lane_h = max(70, (h - axis_h - ev_h) // len(lanes))
+
+        i0i1 = {}
+        for b in blocks:
+            i0i1[id(b)] = fit_view(b.red.trace.x, x0, x1)
+
+        def sx(xv):
+            if logx:
+                xv = core.math.log10(max(xv, 1e-300))
+                a = core.math.log10(max(x0, 1e-300))
+                z = core.math.log10(max(x1, 1e-300))
             else:
-                line = []
-                for i in vis:
-                    line += [xf.sx(tr.x[i]),
-                             xf.sy((q_val(cs, s.y[i]) - base) / rng)]
-                if len(line) >= 4:
-                    c.create_line(line, fill=col, width=1)
-            # 图例打的是**纵轴当前的上下限**，不是全局极值 —— 放大之后这两个
-            # 差着几个数量级，打错一个就会把局部幅度当成全局幅度读
-            c.create_text(xf.l + 6, 12 + si * 13, anchor="w",
-                          text="c%d %s  纵轴 [%s..%s] %s%s"
-                               % (si + 1, s.name,
-                                  core.eng_str(base, s.unit, 4),
-                                  core.eng_str(base + rng, s.unit, 4),
-                                  "视窗" if self.y_local.get() else "全局",
-                                  "·eps 兜底" if floored else ""),
-                          fill=COLORS[si % 6], font=("Consolas", 8))
+                a, z = x0, x1
+            return pl + (0.0 if z == a else (xv - a) / (z - a)) * pw
+
+        # x 刻度：整数值，且整张图只算一次
+        for tv in draw.nice_ticks(x0, x1, 6):
+            px = sx(tv)
+            c.create_line(px, 0, px, h - axis_h, fill=GRID)
+
+        top = 0
+        self._lane_geom = []
+        for li, (unit, items) in enumerate(lanes):
+            self._paint_lane(c, li, unit, items, top, lane_h, pl, pw,
+                             sx, i0i1, len(lanes))
+            self._lane_geom.append({"top": top, "h": lane_h, "items": items,
+                                    "x0": pl, "x1": pl + pw})
+            top += lane_h
+            if li < len(lanes) - 1:
+                c.create_line(0, top, w, top, fill="#c9ced3")
+
+        if ev_h:
+            self._paint_events(c, sx, h - axis_h - ev_h, ev_h, w)
+        self._paint_xaxis(c, sx, h - axis_h, w, x0, x1)
+        self._paint_cursor_line(c, sx, h - axis_h)
         if self._sel:
             a, b = sorted(self._sel)
-            c.create_rectangle(a, xf.t, b, h - xf.b, outline="#1c71d8",
+            c.create_rectangle(a, 0, b, h - axis_h, outline="#1c71d8",
                                dash=(3, 2))
-        # +8 是给图例留的余量：字体真实行高比这里的 13 大（缩放屏上更明显），
-        # 贴着排会压到最后一条 c<n> 上
-        self._draw_events(c, xf, h, top=20 + len(tr.signals) * 13)
-        # 提示挪到右上角。原来钉在右下角，正好压在 `_grid` 画的最后一个
-        # x 刻度上，两行字叠着，而且长到被画布右边切掉。
-        c.create_text(w - 10, 12, anchor="ne", fill="#999",
-                      font=("Consolas", 8),
-                      text="灰带=原始包络，色带=压缩后；框选/滚轮缩放，"
-                           "右键拖平移，双击或 0 复位")
 
-    def _draw_events(self, c, xf, h, top=14):
-        """把 `[EVENTS]` 画到波形上。
+    def _paint_lane(self, c, li, unit, items, top, lane_h, pl, pw, sx,
+                    i0i1, nlane):
+        """一道 = 一个单位。**同单位的信号共用一根纵轴。**
 
-        EVENTS 是输出里**全精度的时间轴**（glitch 在哪、什么时候 settle、
-        极值落在哪一点），但在界面上一条都看不见 —— 人得对着下面的文本
-        自己往图上换算。竖线一画，METRICS 和图就接上了。
-
-        `top` 是从哪一行开始摞标签：上面还有每条信号的图例，
-        不让开就直接印在图例上（实测四条事件叠在 c1 那行上，两边都读不了）。
+        各自拉满 0..1 是在生产假信息：env_hi 和 env_lo 会在图上交叉
+        （物理上 env_hi >= env_lo 恒成立），六路电流峰值差近两倍的
+        上下沿几乎重合。共轴之后高低是真的。
         """
-        if not (self.ev_v.get() and self.metrics):
+        head_y = top + draw.HEAD_H
+        body_y0, body_y1 = head_y + 2, top + lane_h - 4
+        if body_y1 - body_y0 < 20:
+            return
+        c.create_rectangle(0, top, pl + pw + draw.GUTTER_R, head_y,
+                           fill=draw.LANE_HEAD, outline="")
+        lo, hi = draw.lane_span(items, i0i1, self.y_local.get())
+        # eps 兜底：视窗里什么都没发生时，尺度不该被容差以内的抖动撑开
+        floor = Y_EPS_FLOOR * max(
+            (s.eps for s in (b.red.trace.signals[i] for b, i in items)
+             if 0 < s.eps < float("inf")), default=0.0)
+        if floor and (hi - lo) < 2 * floor:
+            mid = 0.5 * (lo + hi)
+            lo, hi = mid - floor, mid + floor
+
+        def sy(v):
+            return body_y1 - (v - lo) / float(hi - lo or 1.0) * (body_y1 - body_y0)
+
+        # 纵轴真刻度。原来一根都没有 —— 图例写着 [-380.8 uA .. 2.781 mA]，
+        # 中间任何一点是多少全靠估
+        for tv in draw.nice_ticks(lo, hi, 4):
+            py = sy(tv)
+            c.create_line(pl, py, pl + pw, py, fill="#eef0f2")
+            c.create_text(pl - 4, py, anchor="e", fill="#666",
+                          font=("Consolas", 8),
+                          text=core.eng_str(tv, unit, 3))
+        if lo < 0 < hi:
+            c.create_line(pl, sy(0.0), pl + pw, sy(0.0), fill="#b9bfc5")
+
+        ncol = max(60, min(BAND_COLS, int(pw),
+                           MAX_SEG // max(1, 4 * len(items))))
+        names = []
+        loss_txt = ""
+        for k, (b, si) in enumerate(items):
+            tr, red = b.red.trace, b.red
+            s = tr.signals[si]
+            col = COLORS[self._sig_color(b, si) % 6]
+            i0, i1 = i0i1[id(b)]
+            x0, x1 = self.view
+            env = bin_envelope(tr.x, [s.y], i0, i1, ncol, x0, x1)
+            if not env:
+                continue
+            olo, ohi = env[0]
+            rlo, rhi = draw.recon_band(tr, red, si, i0, i1, ncol, x0, x1)
+            px = [pl + i / float(max(1, ncol - 1)) * pw for i in range(ncol)]
+            # ① 原始包络：每条信号**自己的**淡色。六块同一个灰会糊成一个气球
+            self._band_poly(c, px, olo, ohi, sy, _pale(col), "")
+            # ② 重建：会写进 .wv 的那条
+            self._band_poly(c, px, rlo, rhi, sy, "", col)
+            # ③ 影：被削掉的摆幅。判据方向因此是**正向**的 —— 丢多少是
+            #    画面上主动出现的东西，不用人去比两条带子的宽窄
+            eps = s.eps if 0 < s.eps < float("inf") else 0.0
+            worst = 0.0
+            for a, z, side in draw.clipped_runs(olo, ohi, rlo, rhi, eps):
+                pts = []
+                if side == "hi":
+                    for i in range(a, z + 1):
+                        pts += [px[i], sy(ohi[i])]
+                    for i in range(z, a - 1, -1):
+                        pts += [px[i], sy(rhi[i])]
+                    worst = max(worst, max(ohi[i] - rhi[i]
+                                           for i in range(a, z + 1)))
+                else:
+                    for i in range(a, z + 1):
+                        pts += [px[i], sy(rlo[i])]
+                    for i in range(z, a - 1, -1):
+                        pts += [px[i], sy(olo[i])]
+                    worst = max(worst, max(olo[i] - rlo[i]
+                                           for i in range(a, z + 1)))
+                if len(pts) >= 6:
+                    # gray12 而不是 gray25：丢得多的时候「影」几乎盖住整个
+                    # 包络（3.8 点/周期时它**就是**整个包络），太实的话
+                    # 整格变成一块红，反而看不见中间那条重建曲线 ——
+                    # 而「重建成了什么样」和「丢了多少」要同时看得见。
+                    c.create_polygon(pts, fill=col, outline="",
+                                     stipple="gray12")
+            names.append((col, "c%d %s" % (si + 1, s.name)))
+            if worst > 0:
+                loss_txt = "  摆幅削掉最多 %s" % core.eng_str(worst, unit, 3)
+
+        # 道头：图例、纵轴范围、点/周期。**绝不压数据**
+        x = 6
+        for col, nm in names[:6]:
+            c.create_rectangle(x, top + 4, x + 8, top + 12, fill=col,
+                               outline="")
+            c.create_text(x + 11, top + 8, anchor="w", text=nm, fill=FG,
+                          font=("Consolas", 8))
+            x += 13 + len(nm) * 6
+        tail = "纵轴 %s..%s %s%s" % (
+            core.eng_str(lo, unit, 3), core.eng_str(hi, unit, 3),
+            "视窗" if self.y_local.get() else "全长", loss_txt)
+        c.create_text(pl + pw + draw.GUTTER_R - 6, top + 8, anchor="e",
+                      text=tail + self._ppc_note(items), fill="#4a5560",
+                      font=("Consolas", 8))
+
+    def _ppc_note(self, items):
+        """点/周期。用词和 `carrier_warn` 完全一致，放大之后会自己变回来 ——
+        「照建议做了、界面一字不变」那个死循环就是这么断掉的。"""
+        worst = None
+        for b, si in items:
+            s = b.red.trace.signals[si]
+            if s.cycles < emit.MIN_CYCLES:
+                continue
+            i0, i1 = fit_view(b.red.trace.x, self.view[0], self.view[1])
+            vis = sum(1 for i in b.red.kept if i0 <= i < i1)
+            span = (self.view[1] - self.view[0])
+            full = b.red.trace.x[-1] - b.red.trace.x[0]
+            cyc = s.cycles * (span / full) if full > 0 else s.cycles
+            if cyc < 1:
+                continue
+            ppc = vis / float(cyc)
+            if worst is None or ppc < worst:
+                worst = ppc
+        if worst is None:
+            return ""
+        if worst < emit.MIN_PTS_PER_CYCLE:
+            return "  %.1f 点/周期(!) 画不出正弦，别数周期别量摆幅" % worst
+        return "  %.1f 点/周期·形状可信" % worst
+
+    def _sig_color(self, b, si):
+        """跨块也要唯一。两块各自从 c1 开始的话，图上两条不同的曲线同色。"""
+        n = 0
+        for x in self._lane_blocks():
+            if x is b:
+                return n + si
+            n += len(x.red.trace.signals)
+        return si
+
+    def _band_poly(self, c, px, lo, hi, sy, fill, outline):
+        top, bot = [], []
+        for i in range(len(px)):
+            if lo[i] is None or hi[i] is None:
+                continue
+            top.append((px[i], sy(hi[i])))
+            bot.append((px[i], sy(lo[i])))
+        if len(top) < 2:
+            return
+        if fill:
+            poly = []
+            for p in top:
+                poly += [p[0], p[1]]
+            for p in reversed(bot):
+                poly += [p[0], p[1]]
+            c.create_polygon(poly, fill=fill, outline="")
+        if outline:
+            for edge in (top, bot):
+                c.create_line([v for p in edge for v in p], fill=outline,
+                              width=1)
+
+    def _paint_xaxis(self, c, sx, y, w, x0, x1):
+        tr = self.traces[self.ti]
+        c.create_line(0, y, w, y, fill="#c9ced3")
+        for tv in draw.nice_ticks(x0, x1, 6):
+            px = sx(tv)
+            c.create_line(px, y, px, y + 4, fill="#888")
+            c.create_text(px, y + 5, anchor="n", fill="#666",
+                          font=("Consolas", 8),
+                          text=core.eng_str(tv, tr.xunit, 4))
+        c.create_text(w - 6, y + 5, anchor="ne", fill="#999",
+                      font=("Consolas", 8),
+                      text="滚轮缩放·右键拖平移·框选·双击复位")
+
+    def _paint_events(self, c, sx, y, hh, w):
+        """事件**单独一条轨**，绝不压数据。"""
+        if not self.metrics:
             return
         try:
             evs = self.metrics.events()
@@ -1912,32 +2061,81 @@ class WaveGui(object):
             return
         lo, hi = self.view
         vis = [e for e in evs if lo <= e.x <= hi]
-        # 竖线便宜，标签贵。视窗里事件一多（六路信号各有 EDGE/GLITCH/OUTLIER，
-        # 一屏几十个），标签会糊成一片纯色，连底下的波形一起吃掉。
-        # 超了就只画竖线，右上角报个数 —— 想看是哪个，放大。
+        c.create_rectangle(0, y, w, y + hh, fill="#fafbfc", outline="")
         label = len(vis) <= EV_LABELS
-        seen = {}
-        rows = max(1, int((h - xf.b - top) // 11) - 1)
         for e in vis:
-            px = xf.sx(e.x)
+            px = sx(e.x)
             col = COLORS[_col_index(e.col) % 6]
-            c.create_line(px, xf.t, px, h - xf.b, fill=col, dash=(2, 3))
-            if not label:
-                continue
-            # 同一个 x 上挤了好几个事件就往下错开，否则标签叠成一坨
-            k = int(px / 60)
-            row = seen.get(k, 0)
-            seen[k] = row + 1
-            if row > rows:                  # 摞到画布底就不摞了
-                continue
-            c.create_text(px + 3, top + row * 11, anchor="nw",
-                          text="%s %s" % (e.col, e.tag), fill=col,
-                          font=("Consolas", 7))
+            c.create_line(px, 0, px, y + hh, fill=col, dash=(2, 3))
+            if label:
+                c.create_text(px + 2, y + hh // 2, anchor="w",
+                              text="%s %s" % (e.col, e.tag), fill=col,
+                              font=("Consolas", 7))
         if vis and not label:
-            c.create_text(xf.l + 6, top, anchor="nw", fill="#888",
+            c.create_text(6, y + hh // 2, anchor="w", fill="#888",
                           font=("Consolas", 8),
                           text="视窗里 %d 个 EVENTS，只画了竖线；"
                                "放大到 %d 个以内才标名字" % (len(vis), EV_LABELS))
+
+    def _paint_cursor_line(self, c, sx, hmax):
+        """游标：把「丢了什么」从形容词变成数字。
+
+        上下两格都是**形状**，读不出「这一点丢了多少」。而这正是这个窗口
+        要回答的问题，也是把 EVENTS 里那些时间点对回图上的唯一一把尺。
+        只重画 tag="cursor"，所以鼠标移动不触发全图重绘。
+        """
+        c.delete("cursor")
+        if self._cursor_x is None or not self._lane_geom:
+            return
+        px = sx(self._cursor_x)
+        c.create_line(px, 0, px, hmax, fill="#1c71d8", tags="cursor")
+        tr0 = self.traces[self.ti]
+        c.create_text(px + 3, 2, anchor="nw", fill="#1c71d8", tags="cursor",
+                      font=("Consolas", 8),
+                      text=core.eng_str(self._cursor_x, tr0.xunit, 5))
+        for g in self._lane_geom:
+            y = g["top"] + draw.HEAD_H + 4
+            for b, si in g["items"]:
+                tr, red = b.red.trace, b.red
+                s = tr.signals[si]
+                j = bisect.bisect_left(tr.x, self._cursor_x)
+                j = max(0, min(j, len(tr.x) - 1))
+                raw = s.y[j]
+                kx, ky = draw.recon_series(tr, red, si)
+                u = self._cursor_x
+                if tr.xscale == "log" and u > 0:
+                    u = core.math.log(u)
+                rec = draw.recon_at(kx, ky, u)
+                eps = s.eps if 0 < s.eps < float("inf") else 0.0
+                d = raw - rec
+                col = COLORS[self._sig_color(b, si) % 6]
+                txt = ("c%d 原 %s\n   存 %s\n   差 %s%s"
+                       % (si + 1, core.eng_str(raw, s.unit, 4),
+                          core.eng_str(rec, s.unit, 4),
+                          core.eng_str(d, s.unit, 3),
+                          (" (%.1f×)" % abs(d / eps)) if eps else ""))
+                c.create_text(g["x1"] + 4, y, anchor="nw", fill=col,
+                              tags="cursor", font=("Consolas", 8), text=txt)
+                y += 34
+
+    def _on_motion(self, e):
+        if not self.red or not self.view or self._lane_geom is None:
+            return
+        g = self._lane_geom
+        if not g:
+            return
+        pl, pw = g[0]["x0"], g[0]["x1"] - g[0]["x0"]
+        if not (pl <= e.x <= pl + pw):
+            if self._cursor_x is not None:
+                self._cursor_x = None
+                self.c_wave.delete("cursor")
+            return
+        x0, x1 = self.view
+        self._cursor_x = x0 + (e.x - pl) / float(max(1, pw)) * (x1 - x0)
+        h = self.c_wave.winfo_height()
+        self._paint_cursor_line(self.c_wave, lambda v: pl + (v - x0) /
+                                float((x1 - x0) or 1.0) * pw, h - 18)
+
 
     def _draw_cycles(self):
         """下窗格：代表性周期叠在一起（横轴对齐到各自周期起点）。
@@ -1984,65 +2182,129 @@ class WaveGui(object):
                            "重合得好=形状稳，散开=有畸变")
 
     def _draw_err(self):
+        """误差格：symlog 纵轴 + 绿带 + **全部要搬走的块**。
+
+        原来纵轴硬钳在 ±3，于是 3 倍和 300 倍长得一模一样 —— 而那正是
+        「调 tol 还是换模式」的决定量。实测起振电流 500 ns 之后是一整块
+        顶天立地的红，用户把误差从 49% 调到 10%，这一格毫无变化：
+        整个调参循环里唯一的图形反馈是死的。
+        """
         if self.low_v.get() == "cycles":
             self._draw_cycles()
             return
         c = self.c_err
         c.delete("all")
-        tr = self.red.trace
         w, h = c.winfo_width(), c.winfo_height()
-        if w < 50 or h < 50:
+        if w < 60 or h < 60:
             return
-        i0, i1 = fit_view(tr.x, self.view[0], self.view[1])
-        lim = 3.0
-        # 顶上留一条 22 px 的横幅给说明文字。原来它压在数据上，
-        # 而这一格恰恰是最密的一格 —— 字和曲线糊在一起，两个都读不了。
-        xf = self._xform(c, -lim, lim, pad=(46, 22, 8, 20))
-        self._grid(c, xf, w, h)
-        y0 = xf.sy(0.0)
-        c.create_line(xf.l, y0, w - xf.r, y0, fill="#999")
-        ncol = max(60, min(BAND_COLS, int(xf.pw)))
-        worst = []
-        for si, s in enumerate(tr.signals):
-            band = error_band(tr, self.red, si, i0, i1, ncol,
-                              self.view[0], self.view[1])
-            col = COLORS[si % 6]
-            top, bot = [], []
-            for cix, v in enumerate(band):
-                if v is None:
-                    continue
-                px = xf.l + cix / float(max(1, ncol - 1)) * xf.pw
-                top.append((px, xf.sy(max(-lim, min(lim, v[1])))))
-                bot.append((px, xf.sy(max(-lim, min(lim, v[0])))))
-            if len(top) > 1:
-                if len(tr.signals) == 1:       # 多条就别填实心，理由同上面那格
-                    poly = []
-                    for p in top:
-                        poly += [p[0], p[1]]
-                    for p in reversed(bot):
-                        poly += [p[0], p[1]]
-                    c.create_polygon(poly, fill=col, outline="",
-                                     stipple="gray50")
-                for edge in (top, bot):
-                    c.create_line([v for p in edge for v in p], fill=col,
-                                  width=1)
-            hits = [v for v in band if v is not None]
-            if hits:
-                worst.append((si, max(max(abs(v[0]), abs(v[1])) for v in hits)))
-        # 容差线画在带子**上面**：它是判据，被数据盖住就等于没有
+        blocks = self._lane_blocks()
+        if not blocks:
+            return
+        pl, pr, ptop, pbot = draw.GUTTER_L, draw.GUTTER_R, 20, 18
+        pw = max(1, w - pl - pr)
+        ph = max(1, h - ptop - pbot)
+        x0, x1 = self.view
+        logx = self.traces[self.ti].xscale == "log"
+
+        def sx(xv):
+            if logx:
+                xv = core.math.log10(max(xv, 1e-300))
+                a = core.math.log10(max(x0, 1e-300))
+                z = core.math.log10(max(x1, 1e-300))
+            else:
+                a, z = x0, x1
+            return pl + (0.0 if z == a else (xv - a) / (z - a)) * pw
+
+        ncol = max(60, min(BAND_COLS, int(pw)))
+        series = []
+        peak = 1.0
+        for b in blocks:
+            tr = b.red.trace
+            i0, i1 = fit_view(tr.x, x0, x1)
+            for si in range(len(tr.signals)):
+                band = error_band(tr, b.red, si, i0, i1, ncol, x0, x1)
+                hits = [v for v in band if v is not None]
+                pk = max((max(abs(v[0]), abs(v[1])) for v in hits), default=0.0)
+                peak = max(peak, pk)
+                series.append((b, si, band, pk))
+        lim = draw.symlog(peak * 1.15)
+
+        def sy(e):
+            return ptop + (lim - draw.symlog(e)) / (2.0 * lim) * ph
+
+        # 绿带是**正向**判据：「在绿区里」比「没冲出红虚线」直接
+        c.create_rectangle(pl, ptop, pl + pw, h - pbot, fill=draw.BAD_BAND,
+                           outline="")
+        c.create_rectangle(pl, sy(1.0), pl + pw, sy(-1.0), fill=draw.OK_BAND,
+                           outline="")
+        for tv, lab in draw.symlog_ticks(peak):
+            if abs(draw.symlog(tv)) > lim:
+                continue
+            py = sy(tv)
+            c.create_line(pl, py, pl + pw, py, fill="#e3e6e9")
+            c.create_text(pl - 4, py, anchor="e", fill="#666",
+                          font=("Consolas", 8), text=lab)
+        for tv in draw.nice_ticks(x0, x1, 6):
+            c.create_line(sx(tv), ptop, sx(tv), h - pbot, fill="#eef0f2")
+
+        for b, si, band, pk in series:
+            col = COLORS[self._sig_color(b, si) % 6]
+            px = [pl + i / float(max(1, ncol - 1)) * pw for i in range(ncol)]
+            lo = [v[0] if v else None for v in band]
+            hi = [v[1] if v else None for v in band]
+            self._band_poly(c, px, lo, hi, sy,
+                            _pale(col) if len(series) == 1 else "", col)
+
+        # 容差线画在**最上面**，而且换色：原来用 #e01b24，正是 c1 的颜色，
+        # 于是单路（最常见的情形）下刻度和数据同色，等于没有刻度
         for lv in (1.0, -1.0):
-            y = xf.sy(lv)
-            c.create_line(xf.l, y, w - xf.r, y, fill="#e01b24", dash=(4, 3))
-            c.create_text(xf.l - 4, y, anchor="e", fill="#e01b24",
-                          font=("Consolas", 8), text="%+g" % lv)
-        c.create_text(xf.l, 11, anchor="w", fill=FG, font=("Consolas", 8),
-                      text="误差 / 各信号自己的 eps —— 带子=这一列里误差覆盖的范围；"
-                           "红虚线 ±1 是容差，冲出去就是被削平了")
-        if worst:
-            c.create_text(w - 8, 11, anchor="e", font=("Consolas", 8),
-                          fill=COLORS[worst[0][0] % 6],
-                          text="  ".join("c%d 峰 %.2f" % (i + 1, v)
-                                         for i, v in worst[:4]))
+            py = sy(lv)
+            c.create_line(pl, py, pl + pw, py, fill=draw.TOL_LINE, dash=(4, 3))
+        c.create_line(pl, sy(0.0), pl + pw, sy(0.0), fill="#9aa4ad")
+        c.create_line(pl, h - pbot, w - pr, h - pbot, fill="#c9ced3")
+        for tv in draw.nice_ticks(x0, x1, 6):
+            c.create_text(sx(tv), h - pbot + 4, anchor="n", fill="#666",
+                          font=("Consolas", 8),
+                          text=core.eng_str(tv, self.traces[self.ti].xunit, 4))
+
+        c.create_text(pl, 9, anchor="w", fill=FG, font=("Consolas", 8),
+                      text="误差 / 各信号自己的容差（symlog）—— 绿区=没超差；"
+                           "带子=这一列里误差覆盖的范围")
+        # 峰值榜按大小降序、每条用自己的颜色。原来按列序取前四、
+        # 颜色恒取第一名的 —— 六路时 c5/c6 永远看不到
+        rank = sorted(series, key=lambda t: -t[3])[:5]
+        x = w - pr
+        for b, si, _band, pk in reversed(rank):
+            txt = "c%d %.1f×" % (si + 1, pk)
+            c.create_text(x, 9, anchor="e", font=("Consolas", 8),
+                          fill=COLORS[self._sig_color(b, si) % 6], text=txt)
+            x -= 8 + len(txt) * 7
+        self._paint_global_worst(c, sx, ptop, h - pbot)
+
+    def _paint_global_worst(self, c, sx, y0, y1):
+        """顶上的判据是**整条**的，这一格画的只有**视窗内**的。
+
+        两者可以永远互相矛盾且没有出口：放大到一段压得好的地方，
+        这一格全绿而出口台仍写着 ✗ 24.3×，而唯一的定位信息
+        `@ 1.02 us` 是一行文字。所以最差点要么画出来，要么说它不在画面里。
+        """
+        v = self.ship.verdict() if self.ship else None
+        if not v or not v.worst or v.worst.at is None:
+            return
+        at = v.worst.at
+        if self.view[0] <= at <= self.view[1]:
+            px = sx(at)
+            c.create_polygon(px - 5, y0, px + 5, y0, px, y0 + 8,
+                             fill=VCOL["bad"], outline="")
+            c.create_text(px + 7, y0 + 4, anchor="w", fill=VCOL["bad"],
+                          font=("Consolas", 8), text="全局最差 %.1f×" % v.peak_eps)
+        else:
+            c.create_text(draw.GUTTER_L + 4, y1 - 6, anchor="sw",
+                          fill=VCOL["bad"], font=("Consolas", 8),
+                          text="全局最差 %.1f× @ %s（不在当前视窗）"
+                               % (v.peak_eps,
+                                  core.eng_str(at, self.traces[self.ti].xunit, 4)))
+
 
     def _grid(self, c, xf, w, h):
         tr = self.traces[self.ti]
@@ -2153,22 +2415,23 @@ def selftest(path, args, timeout=60.0):
             mid = tr.x[0] + (tr.x[-1] - tr.x[0]) * 0.40
             half = (tr.x[-1] - tr.x[0]) * 0.0025
             app.view = (mid - half, mid + half)
-            app.band = None
             app._redraw()
             root.update_idletasks()
+            blocks = app._lane_blocks()
+            # 用「每路一道」量：共轴模式下这一道装着同单位的全部信号，
+            # 局部/全局之比会被最大那条压住，测不出「放大局部有没有用」
+            lane = draw.lanes_of(blocks, "each")[0]
+            i0i1 = {id(b): fit_view(b.red.trace.x, app.view[0], app.view[1])
+                    for b in blocks}
             s0 = app.red.trace.signals[0]
-            b_l, r_l, fl = app._yscale(s0, *app.band[0])
-            app.y_local.set(False)
-            b_g, r_g, _ = app._yscale(s0, *app.band[0])
-            app.y_local.set(True)
-            app._redraw()
-            root.update_idletasks()
-            log.append("纵轴@窄视窗 %s: 视窗 %s / 全局 %s (%.1fx%s)"
+            lo_l, hi_l = draw.lane_span(lane[1], i0i1, True)
+            lo_g, hi_g = draw.lane_span(lane[1], i0i1, False)
+            r_l, r_g = hi_l - lo_l, hi_g - lo_g
+            log.append("纵轴@窄视窗 %s: 视窗 %s / 全局 %s (%.1fx)"
                        % (core.eng_str(2 * half, tr.xunit, 3),
                           core.eng_str(r_l, s0.unit, 3),
                           core.eng_str(r_g, s0.unit, 3),
-                          (r_g / r_l) if r_l else 0.0,
-                          "，eps 兜底" if fl else ""))
+                          (r_g / r_l) if r_l else 0.0))
             # 一直放大到底：必须自己停在「视窗里还剩几个原始点」上
             for _ in range(80):
                 app._zoom_at(app.c_wave, w2, ZOOM_STEP)
