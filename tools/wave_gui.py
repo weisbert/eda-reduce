@@ -1660,6 +1660,12 @@ class WaveGui(object):
                            "只压当前" if self.win_v.get() else "全长"))
         self.root.update_idletasks()
         self._rebuild_ship(self.raw)
+        # 这两个开关**换的是块集合**，字节总数跟着整个变。载入时会自动落到
+        # 预算内，这里不落就自相矛盾：实测勾上解调再取消，回到的不是载入时
+        # 那个 51198 ✓，而是 52659 ✗ —— 同一个状态，两个结果，
+        # 而人只是把开关拨过去又拨回来。`_autofit` 本来就装得下时直接 return，
+        # 所以「顺手压一下」不会把已经调好的点数冲掉。
+        self._autofit_pending = True
         self.ti_v.set(0)
         self._use_trace(0)
 

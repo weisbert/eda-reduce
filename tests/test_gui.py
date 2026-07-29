@@ -194,9 +194,25 @@ class TestGuiSelftest(unittest.TestCase):
                 break
             time.sleep(0.02)
         self.assertIsNotNone(app.red, "文件没读进来")
-        # 载入后会自动压一次到预算，那一步在后台线程里。等它落定再交给
-        # 测试 —— 否则测的是一个中间态（实测「屏幕字节数 != 剪贴板字节数」
-        # 就是这么来的）。
+        self._settle(root, app)
+        return root, app
+
+    def _settle(self, root, app):
+        """等「自动压到预算」真正落定。
+
+        不能只等 `_fitting` 变回 False：autofit 是 `after(60)` 排进去的，
+        排上到真正开跑之间，`_autofit_pending` 已经被清成 False、`_fitting`
+        还没变成 True —— 两个标志都是 False，等待循环第一圈就穿过去了，
+        测到的是**压之前**那个状态。实测这个窗口足够稳定地骗过测试：
+        同一段断言，独立脚本里过、放进 `_app` 里就挂。
+
+        所以先把事件循环空转过那 60 ms，再等后台线程。
+        """
+        for _ in range(15):                     # >= 60 ms，让 after 先排上
+            root.update()
+            time.sleep(0.02)
+            if app._fitting:
+                break
         for _ in range(600):
             root.update()
             if not app._fitting:
@@ -204,7 +220,6 @@ class TestGuiSelftest(unittest.TestCase):
             time.sleep(0.02)
         self.assertFalse(app._fitting, "自动压到预算没落定")
         root.update()
-        return root, app
 
     def test_zoom_is_anchored_and_bounded(self):
         """指针底下那个点缩放前后必须还在指针底下 —— 否则每滚一格目标就跑掉。"""
@@ -289,6 +304,38 @@ class TestGuiSelftest(unittest.TestCase):
             root.update()
             self.assertEqual(app.ship.budget, 65536)
             self.assertTrue(app.ship.verdict().bytes_ok)
+        finally:
+            root.destroy()
+
+    def test_toggling_demod_lands_back_inside_budget(self):
+        """开关拨过去再拨回来，必须回到同一个状态 —— 而且是**预算内**那个。
+
+        载入时会自动压到预算，`_remode` 却不压。于是同一个「没开解调」的状态
+        有两个结果：载入落在预算内，拨开关回来却超了，而且**再也回不去** ——
+        人只是把开关拨过去又拨回来，出口台就从「能粘」变成「不能粘」，
+        没有任何解释。
+
+        钉的是「还在预算内」，不是字节数完全相等：压出来的点数可能差一两个点
+        （实测 12202 -> 12204），那个差值对「能不能粘出去」没有意义。
+        """
+        root, app = self._app("demo_tran.csv", budget=12288)
+        try:
+            base = app.nbytes
+            self.assertTrue(app.ship.verdict().bytes_ok, "载入就没落进预算")
+
+            def toggle(on):
+                app.demod_v.set(on)
+                app._remode()
+                self._settle(root, app)
+
+            toggle(True)
+            self.assertTrue(app.ship.verdict().bytes_ok,
+                            "开解调之后超预算了：%d" % app.nbytes)
+            toggle(False)
+            self.assertTrue(app.ship.verdict().bytes_ok,
+                            "关掉解调之后超预算了：%d" % app.nbytes)
+            self.assertLess(abs(app.nbytes - base), 0.05 * base,
+                            "拨回来跟载入时差太远：%d -> %d" % (base, app.nbytes))
         finally:
             root.destroy()
 
