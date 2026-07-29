@@ -150,6 +150,23 @@ def lane_span(items, i0i1, y_local):
     return lo - m, hi + m
 
 
+def text_cols(s):
+    """字符串占几个等宽格。CJK 算两格。
+
+    道头上那排图例是手工往右推的，按 `len()` 推的话中文注解一进来
+    就推得不够，两条信号的图例叠在一起（实测 env_hi 和 env_lo 的
+    注解糊成一片）。
+    """
+    n = 0
+    for ch in s:
+        o = ord(ch)
+        # U+2000 往上一律按两格算。CJK 本来就是两格；箭头、破折号这些
+        # 「宽度不确定」的字符在中文字体下通常也按两格画，而**宁可算宽也别算窄**
+        # —— 算窄了图例会叠在一起，算宽了只是多留点空。
+        n += 2 if (o >= 0x2000 or 0x1100 <= o <= 0x115F) else 1
+    return n
+
+
 def q_val(cs, v):
     """这个点在 .wv 里的实际值（量化之后）。"""
     return cs.from_out(float(cs.txt(v)))

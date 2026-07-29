@@ -252,6 +252,112 @@ class TestGuiSelftest(unittest.TestCase):
                                           args)
             self.assertEqual(gui, cli_txt, "%s：GUI 和命令行给了不同的答案" % name)
 
+    def test_budget_has_a_visible_input(self):
+        """预算必须有一个**看得见、改得动**的输入框。
+
+        真实事故：重排控件时这个输入框被整块删掉了，变量还在、界面上没了。
+        于是预算只剩「出路卡按钮改成推荐值」一条路 —— 改了还改不回来，
+        而 20 KB 是「聊天框这条通道」的宽度，换条通道就该跟着变。
+        """
+        import tkinter as tk
+        root, app = self._app("demo_tran.csv")
+        try:
+            found = []
+
+            def walk(w):
+                for ch in w.winfo_children():
+                    if isinstance(ch, tk.Entry) and \
+                            ch.cget("textvariable") == str(app.budget_v):
+                        found.append(ch)
+                    walk(ch)
+
+            walk(root)
+            self.assertTrue(found, "预算输入框在界面上找不到了")
+            self.assertTrue(found[0].winfo_ismapped(), "预算输入框没被 pack 出来")
+            # 改得动，而且判据跟着变
+            app.budget_v.set("2")
+            app._on_budget()
+            root.update()
+            self.assertEqual(app.ship.budget, 2048)
+            self.assertFalse(app.ship.verdict().bytes_ok, "改小预算判据没跟着变")
+            app.budget_v.set("64")
+            app._on_budget()
+            root.update()
+            self.assertEqual(app.ship.budget, 65536)
+            self.assertTrue(app.ship.verdict().bytes_ok)
+        finally:
+            root.destroy()
+
+    def test_demod_can_always_be_switched_back(self):
+        """开了解调必须还能关回去 —— 而且开关得**一直看得见**。
+
+        真实事故：轨装不下时会自动折叠靠后的组，而「解调」当时就在那些组里。
+        开了之后开关被折没了，用户报的原话是「切换到包络画图之后，
+        就没法切换回原波形画图了」。开关现在钉在①里，跟它影响的块列表在一起。
+        """
+        root, app = self._app("demo_tran.csv")
+        try:
+            before = [s.name for b in app.ship.blocks
+                      for s in b.trace.signals]
+            app.demod_v.set(True)
+            app._remode()
+            for _ in range(600):
+                root.update()
+                if not app._fitting:
+                    break
+                time.sleep(0.02)
+            root.update_idletasks()
+            # ① 组必须还开着，而且是钉住的
+            g1 = app._rail_groups[0]
+            self.assertTrue(g1["pin"], "① 没被钉住")
+            self.assertTrue(g1["open"], "① 被折叠了 —— 解调开关会跟着消失")
+            self.assertIn("取消回", app.demod_lab.get(),
+                          "开着的时候没告诉人怎么关回去")
+            app.demod_v.set(False)
+            app._remode()
+            for _ in range(600):
+                root.update()
+                if not app._fitting:
+                    break
+                time.sleep(0.02)
+            after = [s.name for b in app.ship.blocks
+                     for s in b.trace.signals]
+            self.assertEqual(after, before, "切回来之后不是原来的波形")
+        finally:
+            root.destroy()
+
+    def test_collapsed_group_still_shows_its_state(self):
+        """折起来的组必须把状态写在标题上 —— 否则折叠就是在藏信息。"""
+        root, app = self._app("demo_tran.csv")
+        try:
+            root.update_idletasks()
+            app._status()
+            for g in app._rail_groups:
+                if g["open"] or g["pin"]:
+                    continue
+                self.assertTrue(g["var"].get().startswith("▸ "),
+                                "折叠的组没有 ▸ 标记")
+                self.assertGreater(len(g["var"].get()), len(g["title"]) + 2,
+                                   "折叠的组 %s 什么状态都没写" % g["title"])
+        finally:
+            root.destroy()
+
+    def test_derived_names_are_explained(self):
+        """解调出来那三个缩写必须有人话注解。
+
+        勾一下「解调」，内容就从 `i /VCO_TOP/VDD` 换成 env_hi / env_lo /
+        f_inst —— 名字在 .wv 里是契约（模型靠它认），但界面上不解释的话
+        用户看到的就是三个凭空冒出来的缩写。
+        """
+        import wave_gui
+        self.assertIn("包络上沿", wave_gui.explain("env_hi(v /o)"))
+        self.assertIn("包络下沿", wave_gui.explain("env_lo(v /o)"))
+        self.assertIn("瞬时频率", wave_gui.explain("f_inst(v /o)"))
+        self.assertIn("没在振荡", wave_gui.explain("f_inst(v /o)"),
+                      "f_inst=0 的含义必须说，否则会被当成「测出来是 0」")
+        self.assertEqual(wave_gui.explain("i /VCO_TOP/VDD"), "",
+                         "原始信号不该被注解")
+
     def test_rail_never_gets_clipped(self):
         """内容轨里的东西**永远装得下** —— 这是竖排固定宽的全部理由。
 
@@ -892,6 +998,21 @@ class TestGuiPureCompute(unittest.TestCase):
         hi = band[0][1]
         peak = [i for i, v in enumerate(hi) if v == 1.0]
         self.assertEqual(peak, [10], "x=50 在 [40,60] 上应当落在正中那一列")
+
+    def test_text_cols_counts_cjk_as_two(self):
+        """道头图例是手工往右推的，按 len() 推的话中文注解一进来就叠在一起。"""
+        import wave_gui_draw as draw
+        self.assertEqual(draw.text_cols("abc"), 3)
+        self.assertEqual(draw.text_cols("包络上沿"), 8)
+        # 箭头这类「宽度不确定」的按两格算：宁可算宽也别算窄，
+        # 算窄了图例叠在一起，算宽了只是多留点空
+        self.assertEqual(draw.text_cols("←"), 2)
+        # 可加：图例是一段一段往右推的，不可加的话推着推着就错位
+        a, b = "c1 env_hi ← ", "包络上沿"
+        self.assertEqual(draw.text_cols(a + b),
+                         draw.text_cols(a) + draw.text_cols(b))
+        self.assertGreater(draw.text_cols(a + b), len(a + b),
+                           "中文和箭头没被算宽")
 
     def test_nice_ticks_are_round(self):
         """刻度必须是 1/2/5×10^k 的整数值。
