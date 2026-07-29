@@ -386,7 +386,6 @@ class WaveGui(object):
         self.lane_mode = tk.StringVar(value="unit")
         self.nrep_v = tk.IntVar(value=getattr(args, "demod_cycles", None) or 6)
         self.fspan_v = tk.IntVar(value=getattr(args, "demod_fspan", 0) or 0)
-        self.view_full = tk.BooleanVar(value=False)
         self._build()
         # 没给文件也要能开窗。开窗和选文件是两件事，绑死了不合理 ——
         # 想先看看界面、想换一个文件重来，都不该被逼着先满足一个文件对话框。
@@ -696,16 +695,18 @@ class WaveGui(object):
                            bg=VIEW_BG, fg=FG, selectcolor=VIEW_BG,
                            font=("Consolas", 9),
                            command=self._redraw).pack(side="left")
-        tk.Label(vb, text="│ 文本框:", bg=VIEW_BG, fg="#4a5560",
-                 font=("Consolas", 9)).pack(side="left", padx=(8, 0))
-        tk.Radiobutton(vb, text="METRICS", variable=self.view_full, value=False,
-                       bg=VIEW_BG, fg=FG, selectcolor=VIEW_BG,
-                       font=("Consolas", 9),
-                       command=self._fill_text).pack(side="left")
-        tk.Radiobutton(vb, text="完整 .wv", variable=self.view_full, value=True,
-                       bg=VIEW_BG, fg=FG, selectcolor=VIEW_BG,
-                       font=("Consolas", 9),
-                       command=self._fill_text).pack(side="left")
+
+
+    def _text_page(self, nb, title):
+        f = tk.Frame(nb, bg=BG)
+        nb.add(f, text=title)
+        sb = tk.Scrollbar(f)
+        sb.pack(side="right", fill="y")
+        t = tk.Text(f, height=6, bg="#fafafa", fg=FG, font=("Consolas", 9),
+                    wrap="none", yscrollcommand=sb.set)
+        t.pack(side="left", fill="both", expand=True)
+        sb.config(command=t.yview)
+        return t
 
     def _take_window(self):
         """把当前视窗**显式提交**成搬运范围。
@@ -744,7 +745,7 @@ class WaveGui(object):
         # 按屏幕夹一下，小屏上仍退回原来的尺寸。
         r.geometry("%dx%d" % (min(1360, r.winfo_screenwidth() - 40),
                               min(880, r.winfo_screenheight() - 80)))
-        r.minsize(900, 600)
+        r.minsize(1000, 640)
 
         self._build_gate(r)
         self._build_hint(r)
@@ -780,17 +781,18 @@ class WaveGui(object):
         self.lab_receipt.pack(side="left", fill="x", expand=True, padx=(12, 0))
 
         # 文本框**不再和画布抢 expand**。两个都 expand 的话，880 高的窗口里
-        # 各分一半，而这个窗口的主诉是「图看不清」。文本要读全文可以拖大窗口，
-        # 或者用「完整 .wv」那个单选 —— 它默认只占 6 行。
-        tf = tk.Frame(r, bg=BG)
-        tf.pack(fill="x", padx=8, pady=(2, 8))
-        sb = tk.Scrollbar(tf)
-        sb.pack(side="right", fill="y")
-        self.txt = tk.Text(tf, height=4, bg="#fafafa", fg=FG,
-                           font=("Consolas", 9), wrap="none",
-                           yscrollcommand=sb.set)
-        self.txt.pack(side="left", fill="both", expand=True)
-        sb.config(command=self.txt.yview)
+        # 各分一半，而这个窗口的主诉是「图看不清」。
+        #
+        # 三个页签取代原来那对单选：「METRICS / 完整 .wv（可全选手动复制）」。
+        # 那个标签在邀请一条路，而顶层的 Ctrl+C 绑定正好把它堵死（已在
+        # Step 0 修掉）；而且**默认停在出口预览**——要粘走的东西该是
+        # 打开就看得见的那一页，不是要先切一下的那一页。
+        nb = ttk.Notebook(r, height=110)
+        nb.pack(fill="x", padx=8, pady=(2, 8))
+        self.txt = self._text_page(nb, "出口预览（要粘走的就是这个）")
+        self.txt_metrics = self._text_page(nb, "METRICS")
+        self.txt_warn = self._text_page(nb, "自检 & WARN")
+        self.nb = nb
         # **不能绑 Ctrl+C。** Text 的 bindtags 是 (自己, 'Text', 顶层, 'all')，
         # 顶层排在 Text 类绑定**之后**，所以在文本框里选一段按 Ctrl+C，
         # 最后写进剪贴板的是这个回调放的整份 .wv，不是选区 ——
@@ -806,6 +808,15 @@ class WaveGui(object):
         self.c_wave.bind("<ButtonRelease-1>", self._sel_end)
         self.c_wave.bind("<Double-Button-1>", lambda e: self._zoom_all())
         self.c_wave.bind("<Motion>", self._on_motion)
+        # **松开滑块要把焦点还给画布。** 不还的话焦点一直留在 Scale 上，
+        # 而 `_key` 见到 Scale 就不抢键 —— 于是「拖一次点数滑块之后，
+        # 按 0 复位再也没反应」，而且没有任何迹象说明为什么。
+        for s in (self.s_mp, self.s_tol):
+            s.bind("<ButtonRelease-1>", lambda _e: self.c_wave.focus_set(),
+                   add="+")
+        self.c_wave.bind("<Button-1>", lambda _e: self.c_wave.focus_set(),
+                         add="+")
+        self.c_wave.configure(takefocus=1)
         self.c_wave.bind("<Leave>", lambda _e: (
             setattr(self, "_cursor_x", None), self.c_wave.delete("cursor")))
 
@@ -1160,16 +1171,24 @@ class WaveGui(object):
                 pass
 
     def _fill_text(self):
-        self.txt.delete("1.0", "end")
+        for t in (self.txt, self.txt_metrics, self.txt_warn):
+            t.delete("1.0", "end")
         if not self.red:
             return
-        if self.view_full.get():
-            self.txt.insert("1.0", self.wv_text())
-        else:
-            blk = emit.metrics_block(self.red, self.metrics)
-            if not blk:
-                blk = ["[METRICS] （这个 kind 没有注册 metrics 模块）"]
-            self.txt.insert("1.0", "\n".join(blk))
+        # 出口预览用**缓存**拼，不重算 —— `wv_text()` 会跑一遍 check=True，
+        # 而这个函数每次精确重算之后都会被调一次
+        self.txt.insert("1.0", self.ship.text() if self.ship else "")
+        blk = emit.metrics_block(self.red, self.metrics)
+        if not blk:
+            blk = ["[METRICS] （这个 kind 没有注册 metrics 模块）"]
+        self.txt_metrics.insert("1.0", "\n".join(blk))
+        lines = []
+        for b in self.ship.included():
+            for ln in (b.text or "").splitlines():
+                if ln.startswith("# recon:") or ln.startswith("# WARN:") \
+                        or ln.startswith("# note:"):
+                    lines.append(ln)
+        self.txt_warn.insert("1.0", "\n".join(lines) or "（没有 WARN）")
 
     def _fingerprint(self):
         """当前这组参数的指纹。用来判断剪贴板里那份还算不算数。"""
@@ -1376,10 +1395,10 @@ class WaveGui(object):
         self.hint.pack(fill="x", after=self.gate)
 
     def _show_warns(self):
-        self.view_full.set(True)
         self._fill_text()
-        self.txt.insert("1.0", "".join(
+        self.txt_warn.insert("1.0", "".join(
             "!! %s\n\n" % w for w in self.ship.warns()))
+        self.nb.select(2)
 
     def _do_action(self, code):
         """出路按钮**真去执行**，不是打印一行命令行给人抄。
@@ -2469,12 +2488,9 @@ def selftest(path, args, timeout=60.0):
                           clip.splitlines()[0][:48]))
             log.append("剪贴板内容 == 当前 .wv: %s"
                        % (clip == app.wv_text()))
-            # 下窗格两种视图
-            app.view_full.set(False)
+            # 三个页签各有各的内容
             app._fill_text()
-            n_met = len(app.txt.get("1.0", "end").splitlines())
-            app.view_full.set(True)
-            app._fill_text()
+            n_met = len(app.txt_metrics.get("1.0", "end").splitlines())
             n_full = len(app.txt.get("1.0", "end").splitlines())
             log.append("下窗格 METRICS %d 行 / 完整 .wv %d 行" % (n_met, n_full))
             log.append("状态栏: " + app.status.get())

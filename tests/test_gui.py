@@ -287,7 +287,7 @@ class TestGuiSelftest(unittest.TestCase):
             app.low_v.set("cycles")
             app._redraw()
             app.low_v.set("err")
-            app.view_full.set(True)
+            app.nb.select(2)
             app._fill_text()
             root.update()
             self.assertEqual(app.wv_text(), before,
