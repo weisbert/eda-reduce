@@ -51,6 +51,9 @@ BAND_COLS = 1200          # 灰带的像素列数上限
 MAX_SEG = 4000            # Canvas 线段总数上限，多路信号时按它反推列数
 ERR_PTS = 1500            # 误差曲线画多少点（拖动时用抽样，松手再算精确的）
 PRECISE_MS = 250          # 松手多久之后算精确误差
+DEFER_MS = 300            # 勾选框攒多久再算 —— 连点几个只算最后一次
+SLOW_MS = 150             # 上一次算了这么久，就先把「重算中」画出来再动手
+EV_LABELS = 14            # 视窗里事件超过这么多就只画竖线，不再逐个标名字
 ZOOM_STEP = 0.8           # 滚一格视窗缩到 0.8 倍（反向就是 1/0.8）
 MIN_VIEW_PTS = 4          # 视窗里至少还剩这么多原始点，再放大就没东西可看了
 PAN_KEY_FRAC = 0.15       # 方向键一次平移视窗宽度的百分之几
@@ -124,6 +127,82 @@ def error_curve(tr, red, si, i0, i1, npts):
         xv = tr.x[i]
         u = core.math.log(xv) if (logx and xv > 0) else xv
         out.append((xv, (s.y[i] - recon_at(kx, ky, u)) / eps))
+    return out
+
+
+def _kept_band(x, y, vis, x0, x1, ncol):
+    """保留点按像素列压成 min/max 带。-> (lo[], hi[])，空列是 None。
+
+    跟 `bin_envelope` 是同一件事，只是喂进来的不是全部原始点，而是
+    reduce 之后**真正会写进 .wv 的那些点**。两条带子叠在一起看，
+    红带比灰带窄多少，就是这次压缩丢了多少摆幅。
+    """
+    lo = [None] * ncol
+    hi = [None] * ncol
+    span = (x1 - x0) or 1.0
+    for i in vis:
+        cix = int((x[i] - x0) / span * (ncol - 1))
+        if cix < 0:
+            cix = 0
+        elif cix >= ncol:
+            cix = ncol - 1
+        v = y[i]
+        if lo[cix] is None:
+            lo[cix] = hi[cix] = v
+        elif v < lo[cix]:
+            lo[cix] = v
+        elif v > hi[cix]:
+            hi[cix] = v
+    return lo, hi
+
+
+def error_band(tr, red, si, i0, i1, ncol):
+    """误差按像素列压成 min/max 带。-> [(lo, hi) 或 None] * ncol，单位是 eps。
+
+    原来是「隔 N 个点取一个再连折线」，两个毛病，在振荡波形上都是致命的：
+
+    - **抽样会漏掉峰。** 误差在每个原始点上都在换号，隔 N 个取一个取到的是
+      随机相位，最大误差经常一次都没被画到 —— 图上说「误差没超容差」，
+      而 `recon:` 那行说超了，两个数对不上，人只能信文本、放弃这一格。
+    - **画出来是一堵实心红墙。** 1500 个点铺在 1100 像素上，每列一根竖线，
+      形状为零。
+
+    分箱取 min/max 两个毛病一起治：画的是这一列里误差**真实覆盖的区间**，
+    而且保证包含这一列的最大误差 —— 跟上面那格灰带是同一个道理。
+    """
+    s = tr.signals[si]
+    cs = red.specs[si]
+    logx = tr.xscale == "log"
+    kx = [red.xspec.val(tr.x[i]) for i in red.kept]
+    ky = [cs.from_out(float(cs.txt(s.y[i]))) for i in red.kept]
+    if logx:
+        kx = [core.math.log(v) if v > 0 else -745.0 for v in kx]
+    eps = s.eps if 0 < s.eps < float("inf") else (s.rng or 1.0)
+    n = i1 - i0
+    if n <= 0 or ncol <= 0:
+        return []
+    x0, x1 = tr.x[i0], tr.x[i1 - 1]
+    span = (x1 - x0) or 1.0
+    out = [None] * ncol
+    # 点数远多于列数时按固定步长跳着扫：每列仍能落到几十个点，
+    # min/max 抓峰的能力保住了，而 1e7 点不至于扫到天亮。
+    step = max(1, n // (ncol * 40))
+    for i in range(i0, i1, step):
+        xv = tr.x[i]
+        cix = int((xv - x0) / span * (ncol - 1))
+        if cix < 0:
+            cix = 0
+        elif cix >= ncol:
+            cix = ncol - 1
+        u = core.math.log(xv) if (logx and xv > 0) else xv
+        e = (s.y[i] - recon_at(kx, ky, u)) / eps
+        cur = out[cix]
+        if cur is None:
+            out[cix] = [e, e]
+        elif e < cur[0]:
+            cur[0] = e
+        elif e > cur[1]:
+            cur[1] = e
     return out
 
 
@@ -229,15 +308,29 @@ class WaveGui(object):
         r = self.root
         r.title("wave_reduce — 预览    [build %s]" % core.build_id())
         r.configure(bg=BG)
-        r.geometry("1180x820")
+        # 1180 装不下那一排控件：解调/只压视窗/EVENTS 三个勾选框和两个旋钮
+        # 全被右边切掉，而且**看不出被切了** —— 人只会以为这版没有解调。
+        # 按屏幕夹一下，小屏上仍退回原来的尺寸。
+        r.geometry("%dx%d" % (min(1360, r.winfo_screenwidth() - 40),
+                              min(880, r.winfo_screenheight() - 80)))
+        r.minsize(900, 600)
 
         top = tk.Frame(r, bg=BG)
         top.pack(fill="x", padx=8, pady=(8, 2))
-        tk.Label(top, textvariable=self.status, bg=BG, fg=FG,
-                 font=("Consolas", 10)).pack(side="left")
+        # 状态栏必须**换行**而不是被窗口右边切掉。这一行里有 WARN、点数、
+        # 字节数、误差四样东西，切掉右半条等于把误差藏了 ——
+        # 而误差恰恰是判断这次压缩能不能用的那个数。
+        # 进度条先占位再放标签：pack 是按调用顺序分配的，标签先拿了
+        # expand 的空间就会把进度条挤没。
         self.pb = ttk.Progressbar(top, variable=self.prog, maximum=1.0,
                                   length=200)
-        self.pb.pack(side="right")
+        self.pb.pack(side="right", padx=(8, 0))
+        self.stat_lab = tk.Label(top, textvariable=self.status, bg=BG, fg=FG,
+                                 font=("Consolas", 10), justify="left",
+                                 anchor="w")
+        self.stat_lab.pack(side="left", fill="x", expand=True)
+        top.bind("<Configure>", lambda e: self.stat_lab.configure(
+            wraplength=max(200, e.width - 210)))
 
         self.c_wave = tk.Canvas(r, bg=BG, height=330, highlightthickness=1,
                                 highlightbackground=GRID)
@@ -280,10 +373,10 @@ class WaveGui(object):
         fb.grid(row=0, column=4, rowspan=2, padx=12)
         tk.Checkbutton(fb, text="强制保留极值", variable=self.force_extrema,
                        bg=BG, fg=FG, selectcolor=BG,
-                       command=self._recompute).pack(anchor="w")
+                       command=self._defer).pack(anchor="w")
         tk.Checkbutton(fb, text="强制保留 spur/事件", variable=self.force_metrics,
                        bg=BG, fg=FG, selectcolor=BG,
-                       command=self._recompute).pack(anchor="w")
+                       command=self._defer).pack(anchor="w")
         tk.Checkbutton(fb, text="纵轴跟视窗", variable=self.y_local,
                        bg=BG, fg=FG, selectcolor=BG,
                        command=self._redraw).pack(anchor="w")
@@ -469,6 +562,12 @@ class WaveGui(object):
     def _recompute(self, precise=True):
         if not self.traces:
             return
+        # 上一次算了 150 ms 以上就先把「重算中」刷出去。同步的活没法打断，
+        # 但**不能让窗口看起来死了** —— 六路 20 万点一次两秒多，
+        # 没有这行的话按下去到出结果之间界面完全没反应。
+        if getattr(self, "ms", 0.0) >= SLOW_MS:
+            self.status.set("重算中…")
+            self.root.update_idletasks()
         t0 = time.time()
         self.red = self._reduce(self.mp_v.get(), check=precise)
         self.ms = (time.time() - t0) * 1000.0
@@ -534,7 +633,7 @@ class WaveGui(object):
         for k, s in enumerate(tr.signals):
             cb = tk.Checkbutton(self.colbox, text="c%d %s" % (k + 1, s.name),
                                 variable=self.cols[k], bg=BG, fg=COLORS[k % 6],
-                                selectcolor=BG, command=self._recompute)
+                                selectcolor=BG, command=self._defer)
             cb.pack(side="left")
             self.colbtn.append(cb)
         self.s_mp.configure(to=max(10, len(self.cand)))
@@ -666,6 +765,10 @@ class WaveGui(object):
         head = ("!! %s" % tr.warns[0].split("。")[0]) if tr.warns else ""
         if not head:
             head = self._ceiling_hint()
+        # 留个上限兜底：状态栏会换行，但一条几百字的 WARN 会把它撑成四五行，
+        # 底下两个画布跟着跳。截断处的全文就在下面的文本框里。
+        if len(head) > 90:
+            head = head[:89] + "…"
         self.status.set(
             "%s%d 点  │  输出 %s │  %s  │  RDP %.0f ms  │  %s"
             % (head and head + "  │  ", len(self.red.kept), fit,
@@ -768,6 +871,13 @@ class WaveGui(object):
         if not self.red or not self.cand:
             return ""
         tr = self.red.trace
+        # 候选集塌到个位数：滑块上限会显示成 10（`max(10, len(cand))` 的兜底值），
+        # 而 10 是个凭空冒出来的数字，不说的话没人知道它是怎么来的。
+        if len(self.cand) <= 10 and len(self.cand) < len(tr.x):
+            s = tr.signals[0] if tr.signals else None
+            why = "整条几乎是常数" if (s and s.rng <= 0) else "量程被极端点定死"
+            return ("!! 候选点只有 %d 个（原始 %d）—— %s，滑块上限的 10 是兜底值"
+                    % (len(self.cand), len(tr.x), why))
         cw = emit.carrier_warn(self.red)
         if cw:                                # 信息量不够：最外面那层，先说它
             return "!! " + cw.split("。")[0] + "，缩小视窗或换 --xrange 导一段"
@@ -780,6 +890,28 @@ class WaveGui(object):
         return ""
 
     # ------------------------------------------------------------ 交互
+
+    def _defer(self, _=None):
+        """勾选框：攒一下再算，连点几个只算最后那一次。
+
+        一次精确 recompute 在 6 路 20 万点上要两秒多，而且是**同步**跑在 Tk
+        回调里 —— 连勾四列就是十秒白屏，中间三次的结果一眼都没人看见。
+        滑块那条早就 debounce 了（`_live`），勾选框当时直接接的 `_recompute`，
+        是漏的一条。
+
+        跟 `_live` 不一样的是：这里**不先跑一次粗的**。粗的那次省的只是
+        `recon_error`（六路上 0.4 s / 2.2 s），剩下的 RDP 一分不少，
+        先粗后精等于把两秒的活干两遍。
+        """
+        if not self.traces:
+            return
+        on = sum(1 for v in self.cols if v.get())
+        self.status.set("重算中…（%d/%d 列）" % (on, len(self.cols)))
+        if self._precise_job:
+            self.root.after_cancel(self._precise_job)
+        self._precise_job = self.root.after(
+            DEFER_MS, lambda: (setattr(self, "_precise_job", None),
+                               self._recompute(True)))
 
     def _on_slider(self, _=None):
         self._live()
@@ -822,13 +954,24 @@ class WaveGui(object):
             return False
         tr = self.traces[self.ti]
         lo, hi = tr.x[0], tr.x[-1]
-        if x0 < lo:                          # 平移撞边就整体推回来，不把视窗压扁
-            x1, x0 = x1 + (lo - x0), lo
-        if x1 > hi:
-            x0, x1 = x0 - (x1 - hi), hi
-        x0, x1 = max(lo, x0), min(hi, x1)
-        if x1 <= x0:
+        # 先定跨度再定位置。原来是「哪头出界就把另一头推回去」，
+        # 撞边时算的是 (lo+d) - ((hi+d) - hi)：d 大到一定程度就是
+        # 灾难性抵消，本该回到 lo 的值差着 1e-20，于是「全视窗再平移」
+        # 不再是空操作 —— 视窗每次都动一点点，band 缓存每次都失效。
+        # 按跨度夹是精确的：撞边时 x0 直接取 hi-span，没有减法残渣。
+        full = hi - lo
+        span = x1 - x0
+        if span <= 0:
             return False
+        if span >= full * (1.0 - 1e-9):
+            # 「跨度就是全长」要**吸附**到全长。平移 1e6 像素再换算回来，
+            # 跨度会掉最后一两个 ulp，于是 x0 被夹到 lo 上面 1e-20 处：
+            # 视窗跟全长只差一个浮点残渣，却每次都判为「动了」，
+            # band 缓存跟着每次失效。请求全长就给全长。
+            x0, x1 = lo, hi
+        else:
+            x0 = max(lo, min(x0, hi - span))
+            x1 = x0 + span
         i0, i1 = fit_view(tr.x, x0, x1)
         if i1 - i0 < MIN_VIEW_PTS and (x1 - x0) < (self.view[1] - self.view[0]):
             return False
@@ -949,11 +1092,11 @@ class WaveGui(object):
         half = max(data_half, floor, 1e-300)
         return 0.5 * (v0 + v1) - half * 1.06, 2.12 * half, half > data_half
 
-    def _xform(self, canvas, y0=0.0, y1=1.0):
+    def _xform(self, canvas, y0=0.0, y1=1.0, pad=(46, 8, 8, 20)):
         tr = self.traces[self.ti]
         return Xform(self.view[0], self.view[1], y0, y1,
                      canvas.winfo_width(), canvas.winfo_height(),
-                     logx=(tr.xscale == "log"))
+                     pad=pad, logx=(tr.xscale == "log"))
 
     def _redraw(self):
         if not self.red or not self.view:
@@ -1002,14 +1145,44 @@ class WaveGui(object):
                 for p in reversed(pts_b):
                     poly += [p[0], p[1]]
                 c.create_polygon(poly, fill=BAND, outline="", stipple="gray50")
-            # reduce 之后的曲线：跑出灰带就是丢了东西
-            line = []
-            for i in self.red.kept:
-                if i < i0 or i >= i1:
-                    continue
-                line += [xf.sx(tr.x[i]), xf.sy((s.y[i] - base) / rng)]
-            if len(line) >= 4:
-                c.create_line(line, fill=COLORS[si % 6], width=1)
+            # reduce 之后的曲线：跑出灰带就是丢了东西。
+            # 保留点比像素列还多时**折线画不得** —— 2500 个周期铺在 1100 像素上，
+            # 每列一个来回，连出来是一坨实心色块，既看不出形状，也看不出
+            # 它比灰带窄了多少（而「窄了多少」正是这一格要回答的问题）。
+            # 那就跟灰带用同一种画法：也压成 min/max 带，两条带子直接比宽窄。
+            col = COLORS[si % 6]
+            vis = [i for i in self.red.kept if i0 <= i < i1]
+            if len(vis) > ncol:
+                klo, khi = _kept_band(tr.x, s.y, vis, x0, x1, ncol)
+                top, bot = [], []
+                for cix in range(ncol):
+                    if klo[cix] is None:
+                        continue
+                    px = xf.l + cix / float(max(1, ncol - 1)) * xf.pw
+                    top.append((px, xf.sy((khi[cix] - base) / rng)))
+                    bot.append((px, xf.sy((klo[cix] - base) / rng)))
+                if len(top) > 1:
+                    # 只有一条信号时才填实心。多条信号各填一块的话，
+                    # 画在最后那条会把前面全盖掉 —— 六路电流试过一次，
+                    # 整个画布是一坨橙色，比原来的折线还糟。
+                    # 多条时只画上下两条沿：看得见彼此，也看得见底下的灰带。
+                    if len(tr.signals) == 1:
+                        poly = []
+                        for p in top:
+                            poly += [p[0], p[1]]
+                        for p in reversed(bot):
+                            poly += [p[0], p[1]]
+                        c.create_polygon(poly, fill=col, outline=col,
+                                         stipple="gray50")
+                    for edge in (top, bot):
+                        c.create_line([v for p in edge for v in p],
+                                      fill=col, width=1)
+            else:
+                line = []
+                for i in vis:
+                    line += [xf.sx(tr.x[i]), xf.sy((s.y[i] - base) / rng)]
+                if len(line) >= 4:
+                    c.create_line(line, fill=col, width=1)
             # 图例打的是**纵轴当前的上下限**，不是全局极值 —— 放大之后这两个
             # 差着几个数量级，打错一个就会把局部幅度当成全局幅度读
             c.create_text(xf.l + 6, 12 + si * 13, anchor="w",
@@ -1024,18 +1197,25 @@ class WaveGui(object):
             a, b = sorted(self._sel)
             c.create_rectangle(a, xf.t, b, h - xf.b, outline="#1c71d8",
                                dash=(3, 2))
-        self._draw_events(c, xf, h)
-        c.create_text(w - 8, h - 8, anchor="se", fill="#888",
+        # +8 是给图例留的余量：字体真实行高比这里的 13 大（缩放屏上更明显），
+        # 贴着排会压到最后一条 c<n> 上
+        self._draw_events(c, xf, h, top=20 + len(tr.signals) * 13)
+        # 提示挪到右上角。原来钉在右下角，正好压在 `_grid` 画的最后一个
+        # x 刻度上，两行字叠着，而且长到被画布右边切掉。
+        c.create_text(w - 10, 12, anchor="ne", fill="#999",
                       font=("Consolas", 8),
-                      text="灰带=原始 min/max 包络；框选或滚轮缩放，"
-                           "右键拖平移，+/- ←/→，双击或 0 复位")
+                      text="灰带=原始包络，色带=压缩后；框选/滚轮缩放，"
+                           "右键拖平移，双击或 0 复位")
 
-    def _draw_events(self, c, xf, h):
+    def _draw_events(self, c, xf, h, top=14):
         """把 `[EVENTS]` 画到波形上。
 
         EVENTS 是输出里**全精度的时间轴**（glitch 在哪、什么时候 settle、
         极值落在哪一点），但在界面上一条都看不见 —— 人得对着下面的文本
         自己往图上换算。竖线一画，METRICS 和图就接上了。
+
+        `top` 是从哪一行开始摞标签：上面还有每条信号的图例，
+        不让开就直接印在图例上（实测四条事件叠在 c1 那行上，两边都读不了）。
         """
         if not (self.ev_v.get() and self.metrics):
             return
@@ -1044,20 +1224,33 @@ class WaveGui(object):
         except Exception:                           # noqa: BLE001
             return
         lo, hi = self.view
+        vis = [e for e in evs if lo <= e.x <= hi]
+        # 竖线便宜，标签贵。视窗里事件一多（六路信号各有 EDGE/GLITCH/OUTLIER，
+        # 一屏几十个），标签会糊成一片纯色，连底下的波形一起吃掉。
+        # 超了就只画竖线，右上角报个数 —— 想看是哪个，放大。
+        label = len(vis) <= EV_LABELS
         seen = {}
-        for e in evs:
-            if not (lo <= e.x <= hi):
-                continue
+        rows = max(1, int((h - xf.b - top) // 11) - 1)
+        for e in vis:
             px = xf.sx(e.x)
+            col = COLORS[(hash(e.col) if e.col else 0) % 6]
+            c.create_line(px, xf.t, px, h - xf.b, fill=col, dash=(2, 3))
+            if not label:
+                continue
             # 同一个 x 上挤了好几个事件就往下错开，否则标签叠成一坨
             k = int(px / 60)
             row = seen.get(k, 0)
             seen[k] = row + 1
-            col = COLORS[(hash(e.col) if e.col else 0) % 6]
-            c.create_line(px, xf.t, px, h - xf.b, fill=col, dash=(2, 3))
-            c.create_text(px + 3, xf.t + 6 + row * 11, anchor="nw",
+            if row > rows:                  # 摞到画布底就不摞了
+                continue
+            c.create_text(px + 3, top + row * 11, anchor="nw",
                           text="%s %s" % (e.col, e.tag), fill=col,
                           font=("Consolas", 7))
+        if vis and not label:
+            c.create_text(xf.l + 6, top, anchor="nw", fill="#888",
+                          font=("Consolas", 8),
+                          text="视窗里 %d 个 EVENTS，只画了竖线；"
+                               "放大到 %d 个以内才标名字" % (len(vis), EV_LABELS))
 
     def _draw_cycles(self):
         """下窗格：代表性周期叠在一起（横轴对齐到各自周期起点）。
@@ -1115,23 +1308,53 @@ class WaveGui(object):
             return
         i0, i1 = fit_view(tr.x, self.view[0], self.view[1])
         lim = 3.0
-        xf = self._xform(c, -lim, lim)
+        # 顶上留一条 22 px 的横幅给说明文字。原来它压在数据上，
+        # 而这一格恰恰是最密的一格 —— 字和曲线糊在一起，两个都读不了。
+        xf = self._xform(c, -lim, lim, pad=(46, 22, 8, 20))
         self._grid(c, xf, w, h)
-        for lv, col in ((1.0, "#e01b24"), (-1.0, "#e01b24")):
-            y = xf.sy(lv)
-            c.create_line(xf.l, y, w - xf.r, y, fill=col, dash=(4, 3))
         y0 = xf.sy(0.0)
         c.create_line(xf.l, y0, w - xf.r, y0, fill="#999")
+        ncol = max(60, min(BAND_COLS, int(xf.pw)))
+        worst = []
         for si, s in enumerate(tr.signals):
-            pts = error_curve(tr, self.red, si, i0, i1, ERR_PTS)
-            line = []
-            for xv, e in pts:
-                line += [xf.sx(xv), xf.sy(max(-lim, min(lim, e)))]
-            if len(line) >= 4:
-                c.create_line(line, fill=COLORS[si % 6], width=1)
-        c.create_text(xf.l + 6, 12, anchor="w", fill=FG, font=("Consolas", 8),
-                      text="误差 / 各信号自己的 eps —— 红虚线 ±1 就是容差；"
-                           "曲线贴住 ±1 说明那一段刚好用满容差，冲出去就是被削平了")
+            band = error_band(tr, self.red, si, i0, i1, ncol)
+            col = COLORS[si % 6]
+            top, bot = [], []
+            for cix, v in enumerate(band):
+                if v is None:
+                    continue
+                px = xf.l + cix / float(max(1, ncol - 1)) * xf.pw
+                top.append((px, xf.sy(max(-lim, min(lim, v[1])))))
+                bot.append((px, xf.sy(max(-lim, min(lim, v[0])))))
+            if len(top) > 1:
+                if len(tr.signals) == 1:       # 多条就别填实心，理由同上面那格
+                    poly = []
+                    for p in top:
+                        poly += [p[0], p[1]]
+                    for p in reversed(bot):
+                        poly += [p[0], p[1]]
+                    c.create_polygon(poly, fill=col, outline="",
+                                     stipple="gray50")
+                for edge in (top, bot):
+                    c.create_line([v for p in edge for v in p], fill=col,
+                                  width=1)
+            hits = [v for v in band if v is not None]
+            if hits:
+                worst.append((si, max(max(abs(v[0]), abs(v[1])) for v in hits)))
+        # 容差线画在带子**上面**：它是判据，被数据盖住就等于没有
+        for lv in (1.0, -1.0):
+            y = xf.sy(lv)
+            c.create_line(xf.l, y, w - xf.r, y, fill="#e01b24", dash=(4, 3))
+            c.create_text(xf.l - 4, y, anchor="e", fill="#e01b24",
+                          font=("Consolas", 8), text="%+g" % lv)
+        c.create_text(xf.l, 11, anchor="w", fill=FG, font=("Consolas", 8),
+                      text="误差 / 各信号自己的 eps —— 带子=这一列里误差覆盖的范围；"
+                           "红虚线 ±1 是容差，冲出去就是被削平了")
+        if worst:
+            c.create_text(w - 8, 11, anchor="e", font=("Consolas", 8),
+                          fill=COLORS[worst[0][0] % 6],
+                          text="  ".join("c%d 峰 %.2f" % (i + 1, v)
+                                         for i, v in worst[:4]))
 
     def _grid(self, c, xf, w, h):
         tr = self.traces[self.ti]

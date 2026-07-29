@@ -217,6 +217,37 @@ class TestGuiSelftest(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_column_clicks_coalesce_into_one_recompute(self):
+        """连点几个列选框只许算最后一次。
+
+        真实困惑：「快速勾选几个、或者取消勾选，都在重算，速度特别慢」。
+        一次精确 recompute 在多路长波形上是秒级，而且同步跑在 Tk 回调里 ——
+        点四下就是四次全量重算，前三次的结果一眼都没人看见。
+        """
+        import wave_gui
+        root, app = self._app("demo_tran.csv")
+        try:
+            self.assertGreaterEqual(len(app.cols), 3, "夹具得是多列的")
+            calls = []
+            real = app._recompute
+            app._recompute = lambda precise=True: (calls.append(precise),
+                                                   real(precise))[1]
+            for k in range(3):                  # 「快速勾选几个」
+                app.cols[k].set(not app.cols[k].get())
+                app._defer()
+            root.update()
+            self.assertEqual(calls, [], "还在攒的时候就不该算")
+            self.assertIn("重算中", app.status.get(), "攒着也得让人知道在攒")
+            deadline = time.time() + 5.0
+            while not calls and time.time() < deadline:
+                root.update()
+                time.sleep(0.02)
+            self.assertEqual(calls, [True],
+                             "三次点击算了 %d 次（该只算最后那一次的精确解）"
+                             % len(calls))
+        finally:
+            root.destroy()
+
     def test_zoom_on_log_axis_is_geometric(self):
         """log 轴要在 log 空间里缩放。按线性缩，滚一格锚点就跑到几个 decade 外。"""
         import wave_gui
@@ -510,11 +541,16 @@ class TestGuiSelftest(unittest.TestCase):
             root.destroy()
 
     def test_canvas_segment_budget(self):
-        """拖 max-points 时 Canvas 图元数要恒定 —— 那是掉帧的来源。
+        """拖 max-points 时 Canvas 图元数要**有界**，而且不跟点数一起长。
 
         只比**拖滑块**那几行。缩放会改变图元数是对的：EVENTS 标注只画视窗内的，
         窗口小了事件自然少几条。把缩放也算进「恒定」里，等于禁止任何
         跟视窗有关的绘制 —— 那不是这条测试想守的东西。
+
+        原来卡的是「完全相等」，现在放成「差几个常数以内」：保留点比像素列
+        少时画折线（1 个图元），多时画上下两条沿（2 个），换画法会差两三个。
+        要守的从来是「图元数不随 max_points 增长」—— 掉帧是那么来的，
+        不是差四个图元来的。
         """
         p = subprocess.run(
             [sys.executable, os.path.join(ROOT, "tools", "wave_reduce.py"),
@@ -526,8 +562,13 @@ class TestGuiSelftest(unittest.TestCase):
                   for ln in out.splitlines()
                   if ln.startswith("max_points=") and "canvas items" in ln]
         self.assertGreaterEqual(len(counts), 4, out)
-        self.assertEqual(len(set(counts)), 1,
-                         "拖滑块时图元数应当恒定: %s" % counts)
+        wave = [int(c.split("/")[0]) for c in counts]
+        err = [int(c.split("/")[1]) for c in counts]
+        for name, vals in (("波形格", wave), ("误差格", err)):
+            self.assertLessEqual(max(vals) - min(vals), 6,
+                                 "%s图元数随 max_points 变了: %s" % (name, counts))
+            self.assertLess(max(vals), 200,
+                            "%s图元数已经不是常数量级了: %s" % (name, counts))
 
 
 class TestGuiPureCompute(unittest.TestCase):
@@ -555,6 +596,36 @@ class TestGuiPureCompute(unittest.TestCase):
         self.assertAlmostEqual(wave_gui.recon_at(kx, ky, 1.5), 15.0)
         self.assertAlmostEqual(wave_gui.recon_at(kx, ky, -1.0), 0.0)
         self.assertAlmostEqual(wave_gui.recon_at(kx, ky, 9.0), 20.0)
+
+    def test_kept_band_is_minmax_not_sampling(self):
+        """保留点压成带子时，一列里的极值必须两头都在。"""
+        import wave_gui
+        x = [i * 1e-9 for i in range(1000)]
+        y = [(3.0 if i == 42 else (-2.0 if i == 43 else 0.0))
+             for i in range(1000)]
+        lo, hi = wave_gui._kept_band(x, y, list(range(1000)), x[0], x[-1], 50)
+        self.assertAlmostEqual(max(v for v in hi if v is not None), 3.0)
+        self.assertAlmostEqual(min(v for v in lo if v is not None), -2.0)
+        self.assertEqual(len(lo), 50)
+
+    def test_error_band_catches_the_peak_that_sampling_misses(self):
+        """误差分箱要**保证**含最大误差 —— 抽样版会漏，这正是换掉它的理由。"""
+        import wave_gui
+        from _common import core
+        rows = ["time (s),V(o) (V)"]
+        n = 4000
+        for i in range(n):                      # 每周期约 4 点的振荡：抽样必漏
+            t = i * 1e-11
+            rows.append("%.12g,%.9g" % (t, math.sin(2 * math.pi * 2.5e10 * t)))
+        tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+        core.analyze(tr)
+        core.set_eps(tr, 0.005)
+        red = core.reduce_trace(tr, 0.005, 40, core.predecimate(tr, 0.005), [])
+        band = wave_gui.error_band(tr, red, 0, 0, n, 60)
+        peak = max(max(abs(v[0]), abs(v[1])) for v in band if v is not None)
+        eps = tr.signals[0].eps
+        self.assertGreaterEqual(peak, 0.9 * red.worst.maxerr / eps,
+                                "带子没抓住 recon 报的那个最大误差")
 
     def test_xform_log(self):
         import wave_gui

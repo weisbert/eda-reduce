@@ -1,5 +1,5 @@
-# WV1  freq  demo_spec  1 sig  freq 0 .. 5 GHz  4001 -> 969 pts (4.1x)
-# recon: max|err| 2.22 dBc (1.85% of range) @ freq=4.6025 GHz   rms 0.79 dBc   [worst V(vco_out)]  ← 已到该通道噪声底 0.706 dBc，再多的点也降不下去
+# WV1  freq  demo_spec  1 sig  freq 0 .. 5 GHz  4001 -> 965 pts (4.1x)
+# recon: max|err| 2.22 dBc (1.85% of range) @ freq=4.6025 GHz   rms 0.792 dBc   [worst V(vco_out)]  ← 已到该通道噪声底 0.706 dBc，再多的点也降不下去
 # axis: x lin | 段间线性内插
 # x    freq             [GHz?   ] 0 .. 5   (量化 10 kHz)
 # c1   V(vco_out)       [dBc    ] offset 0           range -120.3..+0   (量化 0.1 dBc)  err 1.85% (2.22 dBc)
@@ -452,10 +452,6 @@ c1    spur3 -66.962 dBc @ 99.9976 MHz (f/f0 0.0416657, HWHM 1.25 MHz, Q 40)
 1.135 -112.4
 1.13625 -108.2
 1.1375 -112.2
-1.14 -109.8
-1.1425 -112.2
-1.14625 -109.3
-1.15125 -111.8
 1.16875 -108.1
 1.17375 -111.9
 1.17625 -107.9

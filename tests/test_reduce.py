@@ -260,6 +260,93 @@ class TestCarrierResolution(unittest.TestCase):
         self.assertEqual(wave_emit.carrier_warn(red), "", "够用就别啰嗦")
 
 
+def _startup_i(spike=0.0, t1=2e-6, n=40000, f=1.08e9, amp=1.5e-3, dc=1.2e-3):
+    """起振电流：慢慢长大的振荡，可选在 t=0 加一发浪涌。
+
+    真实场景就是这个形状 —— VDD 上的电流探针，开机瞬间充退耦电容的浪涌
+    比稳态振荡大两三个数量级。
+    """
+    rows = ["time (s),I(VDD) (A)"]
+    for i in range(n):
+        t = t1 * i / (n - 1.0)
+        env = amp * (1.0 - math.exp(-max(0.0, t - 0.25e-6) / 0.35e-6))
+        v = dc + env * math.sin(2 * math.pi * f * t)
+        if i == 0:
+            v += spike
+        rows.append("%.12g,%.9g" % (t, v))
+    tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+    core.analyze(tr)
+    return tr
+
+
+class TestOutlierRange(unittest.TestCase):
+    """量程被离群点定死 —— 起振电流上最容易踩的一脚。
+
+    真实症状：打开 GUI，max-points 滑块的上限只剩 10。那个 10 是
+    `max(10, len(cand))` 的兜底值，候选点其实只剩 3 个。
+    """
+
+    def test_body_range_ignores_the_inrush_spike(self):
+        tr = _startup_i(spike=0.9)
+        s = tr.signals[0]
+        self.assertGreater(s.rng, 0.5, "全量程该被浪涌顶上去")
+        self.assertLess(s.rng_body, 0.01, "主体量程不该被一个点带跑")
+        self.assertEqual(s.n_out, 1, "只有那一个点算离群")
+
+    def test_spike_no_longer_collapses_the_candidate_set(self):
+        clean = _startup_i(spike=0.0)
+        spiky = _startup_i(spike=0.9)
+        core.set_eps(clean, 0.005)
+        core.set_eps(spiky, 0.005)
+        c0 = len(core.predecimate(clean, 0.005))
+        c1 = len(core.predecimate(spiky, 0.005))
+        self.assertGreater(c1, 0.5 * c0,
+                           "一个离群点就把候选集打掉一半以上（%d -> %d）" % (c0, c1))
+
+    def test_it_says_so(self):
+        tr = _startup_i(spike=0.9)
+        core.set_eps(tr, 0.005)
+        self.assertTrue(any("离群点" in n and "主体量程" in n for n in tr.notes),
+                        "换了量程口径就必须说出来")
+
+    def test_clean_trace_keeps_the_full_range(self):
+        """没有离群点时**什么都不许变** —— 这条改的是异常路径，不是默认行为。"""
+        tr = _startup_i(spike=0.0)
+        s = tr.signals[0]
+        rng, robust = core.eps_range(tr, s)
+        self.assertFalse(robust)
+        self.assertEqual(rng, s.rng)
+        core.set_eps(tr, 0.005)
+        self.assertFalse(any("离群点" in n for n in tr.notes))
+
+    def test_spike_itself_survives(self):
+        """换量程口径不是把浪涌扔了 —— 它还在数据里，也还在 METRICS 里。"""
+        tr = _startup_i(spike=0.9)
+        core.set_eps(tr, 0.005)
+        red = core.reduce_trace(tr, 0.005, None, core.predecimate(tr, 0.005), [])
+        self.assertIn(tr.signals[0].vmax_at, red.kept, "极值点必须还在")
+        self.assertGreater(tr.signals[0].vmax, 0.5, "METRICS 量的还是全精度真值")
+
+    def test_spike_no_longer_wrecks_the_rest_of_the_wave(self):
+        """判据是「跟没有浪涌那份比」，不是一个绝对值。
+
+        绝对值会把另一件事混进来：每周期点数不够本来就有误差（候选集上限那条），
+        那跟浪涌无关。这里要问的只有一句 —— 多了一个离群点，其余的点有没有变差。
+        原来是变差到 99.8%（整条被压成直线）。
+        """
+        def worst_over_body(spike):
+            tr = _startup_i(spike=spike)
+            core.set_eps(tr, 0.005)
+            red = core.reduce_trace(tr, 0.005, None,
+                                    core.predecimate(tr, 0.005), [])
+            return red.worst.maxerr / tr.signals[0].rng_body
+
+        clean, spiky = worst_over_body(0.0), worst_over_body(0.9)
+        self.assertLess(spiky, 2.0 * clean + 0.02,
+                        "浪涌把其余点的误差抬上去了（%.3f -> %.3f，按主体量程算）"
+                        % (clean, spiky))
+
+
 class TestWindow(unittest.TestCase):
     """`--xrange`：把预算花在你要看的那一段上。"""
 

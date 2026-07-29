@@ -68,6 +68,9 @@ MAX_CAND = 20000             # 预细化的候选点上限，GUI 的交互全在
 DT_COLLAPSE = 50.0           # dt 相对附近粗尺度塌掉这么多倍才看一眼
 DT_RUN_MIN = 4               # 连着这么多小步才算「挣扎」，两三步是栅格拼接痕迹
 DROP_WARN_FRAC = 0.01        # 丢掉的行超过这个比例就报 WARN，不再只写 note
+BODY_Q = 0.001               # 主体量程取 0.1% ~ 99.9% 分位
+BODY_SAMPLE = 50000          # 算分位时最多抽这么多点（排序要钱）
+OUTLIER_K = 20.0             # 全量程比主体量程大这么多倍，就认定是离群点定的量程
 
 
 # --------------------------------------------------------------- 数值小工具
@@ -193,7 +196,8 @@ def strip_num(s, dec):
 
 class Signal(object):
     __slots__ = ("name", "unit", "unit_src", "y", "vmin", "vmax", "vmin_at",
-                 "vmax_at", "noise", "eps", "cycles")
+                 "vmax_at", "noise", "eps", "cycles", "body_lo", "body_hi",
+                 "n_out")
 
     def __init__(self, name, unit="", unit_src="unknown"):
         self.name = name
@@ -205,10 +209,22 @@ class Signal(object):
         self.noise = 0.0                  # 估出来的噪声底（自然单位）
         self.eps = 0.0                    # RDP 的绝对容差（自然单位）
         self.cycles = 0                   # 绕中线的振荡周期数（analyze 里数的）
+        self.body_lo = self.body_hi = 0.0  # 去掉离群点之后的量程（analyze 里量的）
+        self.n_out = 0                    # 落在主体量程之外的点数
 
     @property
     def rng(self):
         return self.vmax - self.vmin
+
+    @property
+    def rng_body(self):
+        """去掉两头 BODY_Q 之后的量程。**波形真正住在多宽的地方。**
+
+        `rng` 是被最极端那一个点定的，一发浪涌电流就能把它抬高几百倍；
+        而 tol、量化步长、预细化阈值全都是按量程的比例算的，于是整条波形
+        被一个点挤成一条直线。判「量程是不是被离群点定死」用这个。
+        """
+        return self.body_hi - self.body_lo
 
     def __repr__(self):
         return "<Signal %s [%s] n=%d>" % (self.name, self.unit, len(self.y))
@@ -272,6 +288,7 @@ class Trace(object):
             d.vmin, d.vmax = s.vmin, s.vmax
             d.vmin_at, d.vmax_at = s.vmin_at, s.vmax_at
             d.noise, d.eps, d.cycles = s.noise, s.eps, s.cycles
+            d.body_lo, d.body_hi, d.n_out = s.body_lo, s.body_hi, s.n_out
             t.signals.append(d)
         return t
 
@@ -908,6 +925,11 @@ def analyze(tr, kind=None, xscale=None):
             elif v > hi:
                 hi, hi_i = v, i
         s.vmin, s.vmax, s.vmin_at, s.vmax_at = lo, hi, li, hi_i
+        s.body_lo, s.body_hi = body_range(y)
+        # 「离群」不能按分位数本身来数 —— 那样答案永远是 2*BODY_Q，是问法的
+        # 同义反复。数的是**离主体一整个身位以上**的点，干净波形上它就是 0。
+        w = s.body_hi - s.body_lo
+        s.n_out = sum(1 for v in y if v < s.body_lo - w or v > s.body_hi + w)
         s.noise = noise_floor(tr.x, y)
         s.cycles = count_cycles(y, lo, hi, s.noise)
 
@@ -919,6 +941,22 @@ def analyze(tr, kind=None, xscale=None):
     else:
         _flag_dt_collapse(tr, dts)
     return tr
+
+
+def body_range(y, q=BODY_Q, sample=BODY_SAMPLE):
+    """-> (lo, hi)：抽样后的 q ~ 1-q 分位。**波形主体住在哪一段。**
+
+    抽样是因为这只是用来跟全量程比个数量级，不需要精确的分位数；
+    1e7 点全排一遍要好几秒，抽 5 万点排一次是几十毫秒，结论一样。
+    """
+    n = len(y)
+    if n < 32:
+        return (min(y), max(y)) if n else (0.0, 0.0)
+    step = max(1, n // sample)
+    d = sorted(y[::step]) if step > 1 else sorted(y)
+    m = len(d)
+    k = int(m * q)
+    return d[k], d[m - 1 - k]
 
 
 def noise_floor(x, y, sample=200000):
@@ -947,6 +985,26 @@ def noise_floor(x, y, sample=200000):
     return min(est, 0.1 * rng) if rng > 0 else 0.0
 
 
+def eps_range(tr, s):
+    """-> (用来算 eps 的量程, 是不是改用了主体量程)。
+
+    默认就是全量程。**除非全量程是被极少数离群点定的** —— 起振电流最典型：
+    t=0 一发浪涌把 max 顶到 0.9 A，而整条波形真正住在 ±1.5 mA 里，
+    量程差了 300 倍。tol、量化步长、预细化阈值全是量程的比例，于是：
+
+      - 预细化阈值 0.3×tol×量程 比整条波形的摆幅还大 -> 候选点塌到 3 个，
+        GUI 的 max-points 滑块**上限只剩 10**（`max(10, len(cand))` 的那个 10）；
+      - 量化步长 0.25×tol×量程 = 1 mA，把 ±1.5 mA 的振荡压成三个台阶。
+
+    出来的 .wv 是空的，而且看不出为什么空。改用主体量程之后浪涌那个点
+    一点没丢（它照样在数据里、照样被强制保留、METRICS 还是全精度量的），
+    只是不再由它一个人决定其余 20 万个点的分辨率。
+    """
+    if s.rng_body > 0 and s.rng > OUTLIER_K * s.rng_body:
+        return s.rng_body, True
+    return s.rng, False
+
+
 def set_eps(tr, tol=DEFAULT_TOL):
     """每个信号的绝对容差 eps = max(tol*量程, 噪声底)。
 
@@ -954,9 +1012,21 @@ def set_eps(tr, tol=DEFAULT_TOL):
     tol*量程 会小到比噪声还低好几个数量级，于是 RDP 一个点都删不掉——
     在编码噪声，不是在编码信号。抬到噪声底之上是唯一讲得通的做法，
     而且**抬了要说出来**（进 notes，最后印在 .wv 头里）。
+
+    量程本身也可能是假的（被离群点定的），见 `eps_range`。同样要说出来。
     """
     for s in tr.signals:
-        base = tol * s.rng
+        rng, robust = eps_range(tr, s)
+        if robust:
+            tr.note("%s: 全量程 %s 是被 %d 个离群点定的（占 %.3g%%），"
+                    "主体只有 %s —— 差 %.0f 倍。tol / 量化步长 / 预细化阈值"
+                    "都改按**主体量程**算，否则那几个点会把其余 %d 个点压成直线。"
+                    "离群点本身一点没丢：它还在数据里，METRICS 也还是全精度量的"
+                    % (s.name, eng_str(s.rng, s.unit), s.n_out,
+                       100.0 * s.n_out / max(1, len(s.y)),
+                       eng_str(s.rng_body, s.unit), s.rng / s.rng_body,
+                       len(s.y) - s.n_out))
+        base = tol * rng
         s.eps = max(base, NOISE_K * s.noise)
         if NOISE_K * s.noise > base and base > 0:
             tr.note("%s: 噪声底 %s（×%g）高过 tol×量程 %s，eps 抬到 %s"
@@ -1197,25 +1267,39 @@ def rdp(tr, cand, tol=DEFAULT_TOL, max_points=None, forced=(), xscale=None):
     pos = {v: i for i, v in enumerate(cand)}
     brk = sorted({0, m - 1} | {pos[f] for f in forced if f in pos})
 
+    # 这个内层循环是整个工具最热的地方：一次 reduce 要跑几百万次。
+    # 恒定信号（inv==0）先筛掉，别在循环里每点判一次；单信号是最常见的形状，
+    # 单独走一条没有内层循环的路。实测 6 路 20 万点从 4.8 s 降到 2.0 s。
+    act = [(ys[k], inv[k]) for k in range(len(ys)) if inv[k] != 0.0]
+    one = act[0] if len(act) == 1 else None
+
     def seg_err(a, b):
         """-> (max_norm_err, argmax_position_in_cand)"""
-        if b - a < 2:
+        if b - a < 2 or not act:
             return 0.0, -1
         ia, ib = cand[a], cand[b]
-        xa, xb = xs[ia], xs[ib]
-        dx = xb - xa
-        best, bp = 0.0, -1
+        xa = xs[ia]
+        dx = xs[ib] - xa
         if dx == 0.0:
             return 0.0, -1
-        slopes = [(y[ib] - y[ia]) / dx for y in ys]
+        best, bp = 0.0, -1
+        if one is not None:                      # 单信号：省掉内层循环和拆包
+            y, iv = one
+            ya = y[ia]
+            sl = (y[ib] - ya) / dx
+            for p in range(a + 1, b):
+                ip = cand[p]
+                d = abs(y[ip] - (ya + sl * (xs[ip] - xa))) * iv
+                if d > best:
+                    best, bp = d, p
+            return best, bp
+        terms = [(y, y[ia], (y[ib] - y[ia]) / dx, iv) for y, iv in act]
         for p in range(a + 1, b):
             ip = cand[p]
             t = xs[ip] - xa
             e = 0.0
-            for k in range(len(ys)):
-                if inv[k] == 0.0:
-                    continue
-                d = abs(ys[k][ip] - (ys[k][ia] + slopes[k] * t)) * inv[k]
+            for y, ya, sl, iv in terms:
+                d = abs(y[ip] - (ya + sl * t)) * iv
                 if d > e:
                     e = d
             if e > best:
@@ -1496,9 +1580,24 @@ def reduce_trace(tr, tol=DEFAULT_TOL, max_points=None, cand=None, forced=(),
         cand = predecimate(tr, tol)
     f = set(forced)
     if keep_extrema:
+        n = len(tr.x)
         for s in tr.signals:
-            f.add(s.vmin_at)
-            f.add(s.vmax_at)
+            for i in (s.vmin_at, s.vmax_at):
+                if i is None:
+                    continue
+                f.add(i)
+                # **孤立尖峰的左右邻居也得留。** 只保留峰顶的话，重建会从峰顶
+                # 直接连到几百个点之外，紧挨着峰的那个样点就被插成了峰值本身
+                # —— 误差正好是整个峰高。实测：0.9 A 的单点浪涌（起振电流上
+                # 的开机充电），只留峰顶时 max|err| 99.8%，带上邻居之后 0.16%。
+                #
+                # 但只对**孤立**的峰这么做。光滑波形的峰顶导数近于零，邻居和
+                # 峰顶差不到一个 eps，留了纯属占位 —— 而点数是有预算的，
+                # 占掉的正是 RDP 本该拿去补别处的那几个点（demo_tran 上无脑
+                # 留邻居，误差反而从 1.93% 涨到 3.08%）。
+                for j in (i - 1, i + 1):
+                    if 0 <= j < n and abs(s.y[i] - s.y[j]) > s.eps:
+                        f.add(j)
     f.discard(None)
     f = {i for i in f if 0 <= i < len(tr.x)}
     kept = rdp(tr, cand, tol, max_points, f)
