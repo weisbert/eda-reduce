@@ -404,5 +404,66 @@ class TestWindow(unittest.TestCase):
         self.assertAlmostEqual(core.parse_eng("1e-9"), 1e-9)
 
 
+class TestVerdictAndBlockers(unittest.TestCase):
+    """出口台那两条判据和出路卡那张决策表 —— 全是纯函数，不碰 Tk。
+
+    这一层单独测得起来，是把 `_status` 从「一路 % 拼字符串」拆出来的理由：
+    原来「有 WARN 时下一步提示一定消失」「预算封顶这句话在装得下时也会出现」
+    这类毛病，全是渲染时拼出来的，没法测。
+    """
+
+    def _ship(self, name="demo_tran.csv", budget=20480, **kw):
+        import wave_cli
+        args = wave_cli.build_parser().parse_args([])
+        args.budget = budget
+        for k, v in kw.items():
+            setattr(args, k, v)
+        return wave_cli.plan(wave_cli.prepare_traces(C.ex(name), args), args)
+
+    def test_two_independent_criteria(self):
+        """装得下和够得准是两件事，不许混成一个符号。"""
+        ship = self._ship()
+        v = ship.verdict()
+        self.assertTrue(v.bytes_ok, "demo_tran 压到预算之后该装得下")
+        self.assertIn(v.err_ok, ("ok", "warn", "bad"))
+        self.assertEqual(v.level, "bad" if (not v.bytes_ok or v.err_ok == "bad")
+                         else ("warn" if v.err_ok == "warn" else "ok"))
+
+    def test_over_budget_is_bad_even_if_accurate(self):
+        ship = self._ship(budget=2048)          # 故意给不够
+        v = ship.verdict()
+        self.assertFalse(v.bytes_ok)
+        self.assertEqual(v.level, "bad")
+        self.assertGreater(v.over(), 1.0)
+
+    def test_blockers_give_actions_not_prose(self):
+        """出路必须是能点的东西，不是一句话里的三个片段。"""
+        ship = self._ship(budget=2048)
+        bl = ship.blockers()
+        self.assertTrue(bl, "超预算了却一条出路都没给")
+        self.assertTrue(bl[0].actions, "出路卡没有可执行的动作")
+        for code, label in bl[0].actions:
+            self.assertTrue(code and label)
+
+    def test_all_green_gives_no_blocker(self):
+        """没事就别占那 44 px。"""
+        ship = self._ship(budget=0)             # 不限预算
+        ship.compute(force=True)
+        v = ship.verdict()
+        if v.level == "ok":
+            self.assertEqual(ship.blockers(), [])
+
+    def test_carrier_beats_budget_in_the_ordering(self):
+        """信息量那条排在预算前面 —— 里面几层拖参数还有救，最外层拖什么都没用。"""
+        import wave_emit
+        ship = self._ship("demo_tran.csv", budget=512)
+        hit = any(wave_emit.carrier_exits(b.red) for b in ship.included()
+                  if b.red is not None)
+        bl = ship.blockers()
+        if hit:
+            self.assertEqual(bl[0].code, "carrier",
+                             "撞上周期数那堵墙时应该先说它，而不是先说超预算")
+
+
 if __name__ == "__main__":
     unittest.main()

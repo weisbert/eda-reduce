@@ -406,6 +406,156 @@ class Shipment(object):
             out.extend(getattr(b.trace, "warns", []) or [])
         return out
 
+    # -------------------------------------------------- 判据
+
+    def verdict(self):
+        v = Verdict()
+        v.nbytes = self.total_bytes()
+        v.budget = self.budget
+        v.nblocks = len(self.included())
+        v.warns = self.warns()
+        v.worst = self.worst()
+        v.peak_eps = self.worst_eps()
+        v.bytes_ok = (not self.budget) or v.nbytes <= self.budget
+        # 精度按**各信号自己的 eps 的几倍**判，不按 % of range ——
+        # 量程本身可能是被一个离群点定的，而 eps 是这份数据自己声明的容差。
+        if v.peak_eps <= 1.0:
+            v.err_ok = "ok"
+        elif v.peak_eps <= 3.0:
+            v.err_ok = "warn"
+        else:
+            v.err_ok = "bad"
+        if v.warns:                       # 输入本身就不足以支撑下面的数
+            v.err_ok = "bad"
+        if not v.bytes_ok or v.err_ok == "bad":
+            v.level = "bad"
+        elif v.err_ok == "warn":
+            v.level = "warn"
+        else:
+            v.level = "ok"
+        return v
+
+    def blockers(self):
+        """卡在哪儿。自上而下，**第一个命中的**那条就是要显示的那条。
+
+        排序是「最外面那层先说」：信息量 > 保底点 > 固定开销 > 候选集 >
+        预算 > 精度。里面那几层拖参数还有救，最外面那层拖什么都没用。
+        """
+        inc = self.included()
+        if not inc:
+            return [Blocker("empty", "一块都没勾 —— .wv 会是空的", [])]
+        per = self.per_block_budget()
+
+        # ① 信息量：点数撑不起周期数。拖任何参数都解决不了，所以排最前
+        for b in inc:
+            if b.red is None:
+                continue
+            ex = emit.carrier_exits(b.red)
+            if ex:
+                return [Blocker("carrier", emit.carrier_warn(b.red), [
+                    ("demod", "① 开解调（包络+频率，实测 218 KB → 22 KB）"),
+                    ("window", "② 只搬当前视窗"),
+                    ("budget", "③ 预算改到 %.0f KB" % ex["need_kb"]),
+                ])]
+
+        # ② 保底点已经把点数顶住了 —— 此刻拖点数滑块完全无效
+        for b in inc:
+            if b.red is None or not b.max_points:
+                continue
+            if len(b.red.kept) > b.max_points:
+                return [Blocker("forced", (
+                    "保底点 %d 个已经超过点数上限 %d —— **此刻拖点数滑块无效**。"
+                    "保底点是 spur/极值/事件，不为预算牺牲"
+                    % (len(b.red.forced), b.max_points)), [
+                    ("drop_forced", "关掉「保底 spur/事件」"),
+                    ("tol_up", "调粗存储精度 tol"),
+                    ("window", "只搬当前视窗"),
+                ])]
+
+        # ③ 固定开销就顶穿了每块的预算：SHAPE 一行都还没写
+        if per:
+            for b in inc:
+                if b.red is None or not b.text:
+                    continue
+                fixed = emit.nbytes(b.text) - emit.shape_bytes(b.red)
+                if fixed >= per:
+                    need = sum(
+                        emit.nbytes(x.text) - emit.shape_bytes(x.red)
+                        for x in inc if x.red is not None and x.text)
+                    return [Blocker("fixed", (
+                        "头部+METRICS+EVENTS 本身要 %.1f KB，超过这块分到的 "
+                        "%.1f KB。那些是全精度事实，不为预算牺牲"
+                        % (fixed / 1024.0, per / 1024.0)), [
+                        ("tol_up", "调粗存储精度 tol"),
+                        ("budget", "预算改到 %.0f KB" % (need * 1.2 / 1024.0)),
+                    ])]
+
+        # ④ 候选集塌了：滑块上限那个 10 是兜底值，跟数据没关系
+        for b in inc:
+            if b.cand is not None and len(b.cand) <= 10 \
+                    and len(b.cand) < len(b.trace.x):
+                return [Blocker("cand", (
+                    "候选点只有 %d 个（原始 %d）—— 量程八成被极端点定死了，"
+                    "滑块上限那个 10 是兜底值"
+                    % (len(b.cand), len(b.trace.x))), [
+                    ("tol_down", "调细存储精度 tol"),
+                    ("max_cand", "调大候选点上限"),
+                ])]
+
+        v = self.verdict()
+        if not v.bytes_ok:
+            return [Blocker("budget", "超预算 %.1f 倍" % v.over(), [
+                ("fit", "自动压到预算"),
+            ])]
+        if v.err_ok != "ok":
+            return [Blocker("precision", (
+                "最差误差 %.1f× 容差 —— 这份搬出去会失真" % v.peak_eps), [
+                ("more_points", "多给点数"),
+                ("tol_up", "调粗存储精度（放宽判据）"),
+                ("window", "只搬当前视窗"),
+            ])]
+        return []
+
+
+class Verdict(object):
+    """「这份能不能粘出去」的答案。**两条独立判据，取更差的那个。**
+
+    原来只有字节数一条：19.9 KB 打勾、20.1 KB 打叉，而一份 49% 失真的
+    19.9 KB 照样是绿的。装得下和够得准是两件事，混成一个符号就等于
+    把其中一件藏了。
+    """
+
+    __slots__ = ("level", "bytes_ok", "err_ok", "nbytes", "budget",
+                 "peak_eps", "worst", "nblocks", "warns")
+
+    LABEL = {"ok": "✓ 可以粘走", "warn": "⚠ 能粘，但看清楚",
+             "bad": "✗ 先别粘"}
+
+    def label(self):
+        return self.LABEL[self.level]
+
+    def over(self):
+        """超预算几倍。没超或不限预算给 0。"""
+        if not self.budget or self.nbytes <= self.budget:
+            return 0.0
+        return self.nbytes / float(self.budget)
+
+
+class Blocker(object):
+    """卡在哪儿 + 能点的出路。`actions` 是一串 (code, 文案)。
+
+    出路必须是**结构化**的。原来它们拼在一句话里（`carrier_warn`），
+    而状态栏那句 `split("。")[0]` 正好把三条出路全切掉 —— 用户看见
+    「拖 max-points 解决不了」却看不见该拖什么。
+    """
+
+    __slots__ = ("code", "text", "actions")
+
+    def __init__(self, code, text, actions):
+        self.code = code
+        self.text = text
+        self.actions = actions
+
 
 def plan(traces, args, keep_extrema=True):
     """[trace] -> 算好的 Shipment。命令行和 GUI 走的是同一条路。"""

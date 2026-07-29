@@ -66,6 +66,11 @@ BG = "#ffffff"
 FG = "#1a1a1a"
 GRID = "#dcdcdc"
 BAND = "#c8c8c8"
+GATE_BG = "#fdf3e3"       # 出口台：答案区
+GATE_LINE = "#e8791a"
+HINT_BG = "#fffbe6"       # 出路卡：下一步该点哪里
+HINT_LINE = "#e5a50a"
+VCOL = {"ok": "#1a7f37", "warn": "#9a6700", "bad": "#c01c28"}
 
 
 # --------------------------------------------------------------- 纯计算部分
@@ -324,6 +329,14 @@ class WaveGui(object):
         # 纵向还是一条压平的直线，等于没放大
         self.y_local = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="载入中…")
+        self.verdict_v = tk.StringVar(value="载入中…")
+        self.bytes_v = tk.StringVar(value="")
+        self.err_v = tk.StringVar(value="")
+        self.selfcheck_v = tk.StringVar(value="")
+        self.hint_v = tk.StringVar(value="")
+        self.receipt_v = tk.StringVar(value="")
+        self._copied = None          # (字节数, 那一刻的参数指纹)
+        self._autofit_pending = False
         self.tol_v = tk.DoubleVar(value=(args.tol or core.DEFAULT_TOL) * 1000.0)
         self.mp_v = tk.IntVar(value=0)
         b0 = args.budget if args.budget else 0
@@ -380,6 +393,75 @@ class WaveGui(object):
         b = self.blk
         return b.metrics if b else None
 
+    # ------------------------------------------------------------ 出口台
+
+    def _build_gate(self, r):
+        """永远在最上面、**永远不被任何消息覆盖**的两行。
+
+        这个窗口只回答一个问题：这份文本能不能粘出去。答案就该在
+        第一眼的位置，而且是**两条独立判据** —— 装得下（字节）和
+        够得准（误差）。原来只有字节一条，于是一份 49% 失真的 19.9 KB
+        照样打勾；而复制成功那句提示会把整条状态栏盖掉，
+        「粘贴前最后一眼」正好看不到判据。
+        """
+        g = self.gate = tk.Frame(r, bg=GATE_BG, highlightthickness=0)
+        g.pack(fill="x", padx=0, pady=0)
+        tk.Frame(g, bg=GATE_LINE, height=3).pack(fill="x")
+        row1 = tk.Frame(g, bg=GATE_BG)
+        row1.pack(fill="x", padx=10, pady=(5, 0))
+        # 固定宽度是为了让右边那几个数不随判定文字长短左右跳；
+        # 宽度按最长那句「⚠ 能粘，但看清楚」留，CJK 在 Tk 里按两格算不准，
+        # 所以宁可宽一点也别切字 —— 判定被切成「能粘，但看清」是最糟的一种切法。
+        self.lab_verdict = tk.Label(row1, textvariable=self.verdict_v,
+                                    bg=GATE_BG, font=("Consolas", 12, "bold"),
+                                    width=18, anchor="w")
+        self.lab_verdict.pack(side="left")
+        tk.Label(row1, text="│", bg=GATE_BG, fg="#c9b79a").pack(side="left")
+        self.lab_bytes = tk.Label(row1, textvariable=self.bytes_v, bg=GATE_BG,
+                                  fg=FG, font=("Consolas", 11), anchor="w")
+        self.lab_bytes.pack(side="left", padx=(8, 8))
+        tk.Button(row1, text="自动压到预算", command=self._fit).pack(side="left")
+        tk.Label(row1, text="│", bg=GATE_BG, fg="#c9b79a").pack(side="left",
+                                                                padx=(8, 8))
+        self.lab_err = tk.Label(row1, textvariable=self.err_v, bg=GATE_BG,
+                                fg=FG, font=("Consolas", 11), anchor="w")
+        self.lab_err.pack(side="left", fill="x", expand=True)
+        self.pb = ttk.Progressbar(row1, mode="indeterminate", length=140)
+
+        row2 = tk.Frame(g, bg=GATE_BG)
+        row2.pack(fill="x", padx=10, pady=(2, 5))
+        self.c_budget = tk.Canvas(row2, height=12, width=280, bg=GATE_BG,
+                                  highlightthickness=0)
+        self.c_budget.pack(side="left")
+        # 「跳到最差点」放第二行：第一行那几个数是判据，塞不下再多东西了，
+        # 而这个按钮的邻居本来就是自检行里那个 `@ 1.02 us`。
+        self.btn_worst = tk.Button(row2, text="跳到最差点",
+                                   command=self._goto_worst,
+                                   font=("Consolas", 9))
+        self.btn_worst.pack(side="left", padx=(8, 0))
+        self.lab_check = tk.Label(row2, textvariable=self.selfcheck_v,
+                                  bg=GATE_BG, fg="#6b5b45",
+                                  font=("Consolas", 9), anchor="w",
+                                  justify="left")
+        self.lab_check.pack(side="left", padx=(10, 0), fill="x", expand=True)
+
+    def _build_hint(self, r):
+        """出路卡：**有事才出现**，没事把这 44 px 还给图。"""
+        self.hint = tk.Frame(r, bg=HINT_BG)
+        inner = tk.Frame(self.hint, bg=HINT_BG)
+        inner.pack(fill="x", padx=(0, 8))
+        tk.Frame(inner, bg=HINT_LINE, width=4).pack(side="left", fill="y")
+        box = tk.Frame(inner, bg=HINT_BG)
+        box.pack(side="left", fill="x", expand=True, padx=(6, 0), pady=3)
+        self.lab_hint = tk.Label(box, textvariable=self.hint_v, bg=HINT_BG,
+                                 fg="#7a5c00", font=("Consolas", 9),
+                                 justify="left", anchor="w")
+        self.lab_hint.pack(fill="x")
+        self.hint_btns = tk.Frame(box, bg=HINT_BG)
+        self.hint_btns.pack(anchor="w", pady=(2, 0))
+        box.bind("<Configure>", lambda e: self.lab_hint.configure(
+            wraplength=max(300, e.width - 10)))
+
     # ------------------------------------------------------------ 界面
 
     def _build(self):
@@ -393,27 +475,8 @@ class WaveGui(object):
                               min(880, r.winfo_screenheight() - 80)))
         r.minsize(900, 600)
 
-        top = tk.Frame(r, bg=BG)
-        top.pack(fill="x", padx=8, pady=(8, 2))
-        # 状态栏必须**换行**而不是被窗口右边切掉。这一行里有 WARN、点数、
-        # 字节数、误差四样东西，切掉右半条等于把误差藏了 ——
-        # 而误差恰恰是判断这次压缩能不能用的那个数。
-        # 进度条先占位再放标签：pack 是按调用顺序分配的，标签先拿了
-        # expand 的空间就会把进度条挤没。
-        #
-        # **一个控件不能有两个含义。** 原来这条既当载入进度、又当预算占用率：
-        # 载入那半从来没动过（`work()` 从没往队列 push 过进度值，是死代码），
-        # 载完又被 `_status` 拿去表示 nbytes/budget —— 于是满格既可能是
-        # 「载完了」也可能是「超预算 63 倍」。现在它**只表示载入**，
-        # 而且改成 indeterminate：解析 1e7 点没有可信的百分比，
-        # 假装有一个精确进度比转圈更糟。预算占用率归 `_status` 的文字。
-        self.pb = ttk.Progressbar(top, mode="indeterminate", length=160)
-        self.stat_lab = tk.Label(top, textvariable=self.status, bg=BG, fg=FG,
-                                 font=("Consolas", 10), justify="left",
-                                 anchor="w")
-        self.stat_lab.pack(side="left", fill="x", expand=True)
-        top.bind("<Configure>", lambda e: self.stat_lab.configure(
-            wraplength=max(200, e.width - 210)))
+        self._build_gate(r)
+        self._build_hint(r)
 
         self.c_wave = tk.Canvas(r, bg=BG, height=330, highlightthickness=1,
                                 highlightbackground=GRID)
@@ -507,6 +570,17 @@ class WaveGui(object):
         tk.Radiobutton(tb, text="完整 .wv（可全选手动复制）",
                        variable=self.view_full, value=True, bg=BG, fg=FG,
                        selectcolor=BG, command=self._fill_text).pack(side="left")
+
+        # 动作条：复制回执落在这里，**绝不碰出口台** —— 粘贴前最后一眼
+        # 永远看得到判据。原来「已复制 N 字节…」会把整条状态栏盖掉。
+        act = tk.Frame(r, bg=BG)
+        act.pack(fill="x", padx=8, pady=(2, 0))
+        self.lab_receipt = tk.Label(act, textvariable=self.receipt_v, bg=BG,
+                                    fg="#666", font=("Consolas", 9),
+                                    anchor="w", justify="left")
+        self.lab_receipt.pack(side="left", fill="x", expand=True)
+        tk.Label(act, textvariable=self.status, bg=BG, fg="#888",
+                 font=("Consolas", 9), anchor="e").pack(side="right")
 
         tf = tk.Frame(r, bg=BG)
         tf.pack(fill="both", expand=True, padx=8, pady=(2, 8))
@@ -626,6 +700,7 @@ class WaveGui(object):
                 self.tol_v.set(tol * 1000.0)
             self._rebuild_ship(raw)
             self.ti_v.set(0)
+            self._autofit_pending = True   # 落地不该是失败态，见 _autofit
             self._use_trace(0)             # metrics / 候选集在这里面算
             return
         self.root.after(40, lambda: self._poll(q))
@@ -718,6 +793,64 @@ class WaveGui(object):
         self._sync_trace_bar()
         self._zoom_all()
         self._recompute()
+        if self._autofit_pending:
+            self._autofit_pending = False
+            self.root.after(60, self._autofit)
+
+    def _autofit(self):
+        """载入之后自动压一次到预算。
+
+        不做这一步的话，每个人的落地画面必然是失败态：默认点数
+        `len(cand)//4` 和预算**毫无关系**，实测起振电流一打开就是
+        `94.7 KB ✗ / 49.53% / 一堵红墙`，而那跟数据好不好没关系，
+        纯粹是个没人选过的初值。
+
+        六路 20 万点的 fit 实测 30 s，所以放后台线程，界面照常能用；
+        算完了再把结果搬回主线程 —— 跨线程碰 Tk 变量是未定义行为，
+        这条上一轮已经踩过（整个载入静默卡死）。
+        """
+        if not self.ship or not self.budget():
+            return
+        v = self.ship.verdict()
+        if v.bytes_ok:                       # 本来就装得下，别乱动人家的点数
+            return
+        self._busy(True)
+        self.status.set("压到预算中…（后台，界面照常能用）")
+        ship, keep = self.ship, self.force_extrema.get()
+        q = []
+
+        def work():
+            try:
+                for b in ship.blocks:
+                    b.max_points = None
+                    b.touch()
+                ship.compute(check=True, force=True, fit=True)
+                q.append(("ok", None))
+            except Exception as exc:                # noqa: BLE001
+                q.append(("err", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+        self._poll_autofit(q, keep)
+
+    def _poll_autofit(self, q, keep):
+        if not q:
+            self.root.after(80, lambda: self._poll_autofit(q, keep))
+            return
+        kind, exc = q.pop(0)
+        self._busy(False)
+        if kind == "err":
+            self.status.set("自动压到预算失败：%s" % exc)
+            return
+        cur = self.blk
+        if cur is not None and cur.red is not None:
+            with self._mute():
+                self.mp_v.set(min(len(cur.cand), len(cur.red.kept)))
+            cur.max_points = self.mp_v.get()
+        self.nbytes = self.ship.total_bytes()
+        self._fill_text()
+        self._sync_eps_marks()
+        self._status()
+        self._redraw()
 
     def _sync_trace_bar(self):
         """多条 trace 时才显示切换条 —— 单条时它是纯噪音。"""
@@ -750,25 +883,45 @@ class WaveGui(object):
                 blk = ["[METRICS] （这个 kind 没有注册 metrics 模块）"]
             self.txt.insert("1.0", "\n".join(blk))
 
+    def _fingerprint(self):
+        """当前这组参数的指纹。用来判断剪贴板里那份还算不算数。"""
+        if not self.ship:
+            return None
+        return (self.ship.tol_override, self.ship.budget,
+                self.ship.keep_extrema, self.demod_v.get(), self.win_v.get(),
+                tuple((b.included, b.max_points, tuple(b.cols or ()),
+                       b.use_forced) for b in self.ship.blocks))
+
     def _copy(self):
         """整份 .wv 直接进剪贴板。它的归宿就是聊天框，中间那三步是多余的。"""
         txt = self.wv_text()
         if not txt:
-            self.status.set("还没有可复制的内容 —— 先打开一个 CSV")
+            self.receipt_v.set("还没有可复制的内容 —— 先打开一个 CSV")
             return
         self.root.clipboard_clear()
         self.root.clipboard_append(txt)
         self.root.update()               # 让 Tk 真正拿到剪贴板所有权
         n = emit.nbytes(txt)
-        b = self.budget()
-        tail = ""
-        if b and n > b:
-            tail = "  ✗ 超预算 %.1f KB" % (b / 1024.0)
-        # X11 的剪贴板是「谁复制谁持有」，进程退出内容就没了。
-        # 没有剪贴板管理器的隔离机上这一条会咬人，所以每次都提醒。
-        self.status.set("已复制 %d 字节（%d 行）到剪贴板%s"
-                        "  │  X11 下先粘贴再关窗口，剪贴板归本进程持有"
-                        % (n, txt.count("\n"), tail))
+        self._copied = (n, self._fingerprint())
+        self._sync_receipt()
+
+    def _sync_receipt(self):
+        """复制回执 + **剪贴板还算不算数**。
+
+        真实的坑：复制完再拖两下滑块，屏幕上的读数变了，剪贴板里还是旧的，
+        而两者没有任何区别标记 —— 粘出去的是哪一份，只能靠记。
+        """
+        if not self._copied:
+            self.receipt_v.set("")
+            return
+        n, fp = self._copied
+        same = (fp == self._fingerprint())
+        self.receipt_v.set(
+            "已复制 %.1f KB 到剪贴板 · %s  │  X11 下先粘贴再关窗口，"
+            "剪贴板归本进程持有"
+            % (n / 1024.0,
+               "与当前参数一致 ✓" if same else "**参数已改，剪贴板是旧的** ⚠"))
+        self.lab_receipt.configure(fg="#666" if same else VCOL["warn"])
 
     def budget(self):
         """-> 字节数，0/空 = 不限。输入看不懂就退回启动时的值并说一声。"""
@@ -830,35 +983,186 @@ class WaveGui(object):
         # 屏幕上写 9.1 KB / 20 KB ✓，而剪贴板里是 18.3 KB —— 两个数
         # 都对，只是回答的不是同一个问题，而用户没法知道该信哪个。
         ship = self.ship
-        w = ship.worst()
-        tr = self.red.trace
-        b = self.budget()
-        nb = self.nbytes
-        nblk = len(ship.included())
-        blk_tail = "（%d 块）" % nblk if nblk > 1 else ""
-        if b:
-            fit = "%.1f KB / %.1f KB %s%s" % (
-                nb / 1024.0, b / 1024.0,
-                "✓" if nb <= b else "✗ 超预算", blk_tail)
+        v = ship.verdict()
+        self.verdict_v.set(v.label())
+        self.lab_verdict.configure(fg=VCOL[v.level])
+
+        nblk = "  %d 块" % v.nblocks if v.nblocks > 1 else ""
+        if v.budget:
+            self.bytes_v.set(
+                "总计 %.1f KB / 预算 %.0f KB%s%s"
+                % (v.nbytes / 1024.0, v.budget / 1024.0,
+                   ("  超 %.1f×" % v.over()) if v.over() else "  装得下", nblk))
         else:
-            fit = "%.1f KB（预算不限）%s" % (nb / 1024.0, blk_tail)
-        # 输入本身不可信的话，别的读数说得再准也没意义 —— WARN 顶到最前面
-        warns = ship.warns()
-        head = ("!! %s" % warns[0].split("。")[0]) if warns else ""
-        if not head:
-            head = self._ceiling_hint()
-        # 留个上限兜底：状态栏会换行，但一条几百字的 WARN 会把它撑成四五行，
-        # 底下两个画布跟着跳。截断处的全文就在下面的文本框里。
-        if len(head) > 90:
-            head = head[:89] + "…"
-        self.status.set(
-            "%s%d 点  │  输出 %s │  %s  │  RDP %.0f ms  │  %s"
-            % (head and head + "  │  ", ship.n_kept(), fit,
-               ("max|err| %s (%.2f%%) rms %s  [%s]"
-                % (core.eng_str(w.maxerr, w.sig.unit, 3), w.pct,
-                   core.eng_str(w.rms, w.sig.unit, 3), w.sig.name))
-               if w else "误差计算中…",
-               self.ms, os.path.basename(tr.source or "")))
+            self.bytes_v.set("总计 %.1f KB（预算不限）%s"
+                             % (v.nbytes / 1024.0, nblk))
+        self.lab_bytes.configure(fg=FG if v.bytes_ok else VCOL["bad"])
+
+        # 三个刻度**同行并排**：×容差 / 绝对值 / % of range。
+        # 状态栏原来只给 % of range，误差格只给 ±1（eps 归一），
+        # 两个数第一次能互相印证 —— 而它们对不上正是信任崩掉的那一刻。
+        w = v.worst
+        if w:
+            # 名字只在多列时才写 —— 单列时它是纯噪音，而这一行挤得下的
+            # 只有三个刻度本身
+            tail = ""
+            if sum(len(b.trace.signals) for b in self.ship.included()) > 1:
+                tail = "  [%s]" % w.sig.name
+            self.err_v.set("最差误差 %.1f× 容差 ＝ %s ＝ 量程 %.1f%%%s"
+                           % (v.peak_eps, core.eng_str(w.maxerr, w.sig.unit, 3),
+                              w.pct, tail))
+            self.lab_err.configure(fg=VCOL[v.err_ok])
+        else:
+            self.err_v.set("误差计算中…")
+            self.lab_err.configure(fg=FG)
+        self.btn_worst.configure(state="normal" if w else "disabled")
+
+        self._draw_budget_bar(v)
+        self._sync_hint()
+        self._sync_receipt()
+        # 自检行：`# recon:` 那一行的原文。粘贴前最后一眼要看到的就是它。
+        self.selfcheck_v.set(self._selfcheck_line())
+        self.status.set("%d 点  │  RDP %.0f ms  │  %s"
+                        % (ship.n_kept(), self.ms,
+                           os.path.basename(self.red.trace.source or "")))
+
+    def _selfcheck_line(self):
+        for b in self.ship.included():
+            for ln in (b.text or "").splitlines():
+                if ln.startswith("# recon:"):
+                    return ln
+        return ""
+
+    def _draw_budget_bar(self, v):
+        """预算尺：按块分段 + 均摊线 + 预算线。
+
+        「哪一块吃掉了多少」在数字上是看不见的 —— 而按块均摊在解调上
+        本来就不是个好分法（env 两列、f_inst 一列，固定开销差一截），
+        顶穿的时候得一眼看得到是哪一块顶的。
+        """
+        c = self.c_budget
+        c.delete("all")
+        w = int(c.cget("width"))
+        h = int(c.cget("height"))
+        ref = float(v.budget or v.nbytes or 1)
+        full = max(ref, float(v.nbytes or 1))
+        c.create_rectangle(0, 0, w, h, fill="#efe4d2", outline="")
+        x = 0.0
+        for i, b in enumerate(self.ship.included()):
+            seg = b.nbytes() / full * w
+            c.create_rectangle(x, 0, x + seg, h,
+                               fill=COLORS[i % 6], outline="", stipple="gray75")
+            x += seg
+        if v.budget:
+            bx = v.budget / full * w
+            c.create_line(bx, -1, bx, h + 1, fill=VCOL["bad"], width=2)
+            n = len(self.ship.included())
+            if n > 1:                       # 均摊线：每块分到多少
+                for k in range(1, n):
+                    px = bx * k / float(n)
+                    c.create_line(px, 0, px, h, fill="#8a7a63", dash=(2, 2))
+
+    def _sync_hint(self):
+        """出路卡：有事才 pack，没事把那 44 px 还给图。"""
+        for w in self.hint_btns.winfo_children():
+            w.destroy()
+        bl = self.ship.blockers() if self.ship else []
+        if not bl:
+            self.hint.pack_forget()
+            return
+        b = bl[0]
+        txt = b.text
+        if len(txt) > 200:
+            txt = txt[:199] + "…"
+        self.hint_v.set(txt)
+        for code, label in b.actions:
+            tk.Button(self.hint_btns, text=label, font=("Consolas", 9),
+                      command=lambda c=code: self._do_action(c)).pack(
+                          side="left", padx=(0, 6))
+        n = len(self.ship.warns())
+        if n:
+            tk.Button(self.hint_btns, text="全部 WARN (%d) ▾" % n,
+                      font=("Consolas", 9),
+                      command=self._show_warns).pack(side="left", padx=(12, 0))
+        self.hint.pack(fill="x", after=self.gate)
+
+    def _show_warns(self):
+        self.view_full.set(True)
+        self._fill_text()
+        self.txt.insert("1.0", "".join(
+            "!! %s\n\n" % w for w in self.ship.warns()))
+
+    def _do_action(self, code):
+        """出路按钮**真去执行**，不是打印一行命令行给人抄。
+
+        原来三条出路写在一句 WARN 里（而且被状态栏截断了），用户看见
+        「用 --xrange」得自己关窗口、回命令行、重开。工具知道该做什么，
+        就该自己做。
+        """
+        if code == "demod":
+            self.demod_v.set(True)
+            self._remode()
+        elif code == "window":
+            self.win_v.set(True)
+            self._remode()
+        elif code == "budget":
+            need = self._need_kb()
+            if need:
+                with self._mute():
+                    self.budget_v.set("%.0f" % need)
+                self._on_budget()
+                self._recompute(True)
+        elif code == "fit":
+            self._fit()
+        elif code == "drop_forced":
+            self.force_metrics.set(False)
+            self._defer()
+        elif code in ("tol_up", "tol_down"):
+            f = 2.0 if code == "tol_up" else 0.5
+            self.tol_v.set(max(0.1, min(100.0, self.tol_v.get() * f)))
+            self._on_tol()
+        elif code == "max_cand":
+            self.args.max_cand = self._max_cand() * 2
+            for b in self.ship.blocks:
+                b.cand = None
+                b.touch()
+            self._on_tol()
+        elif code == "more_points":
+            b = self.blk
+            if b and b.cand:
+                self.mp_v.set(min(len(b.cand), max(4, self.mp_v.get() * 2)))
+                self._live()
+
+    def _need_kb(self):
+        for b in self.ship.included():
+            if b.red is None:
+                continue
+            ex = emit.carrier_exits(b.red)
+            if ex:
+                return ex["need_kb"]
+        return self.nbytes * 1.2 / 1024.0
+
+    def _goto_worst(self):
+        """把视窗挪到全局最差点。
+
+        顶上的判据是**整条**的（`recon` 全点自检），而误差格画的只有
+        **视窗内**的 —— 用户放大到一段压得好的地方，误差格全绿而出口台
+        仍写着 ✗ 24.3×，他没有任何办法找到那个 24.3× 在哪，
+        因为唯一的定位信息 `@ 1.02 us` 是一行文字，而导航全是相对操作。
+        """
+        v = self.ship.verdict() if self.ship else None
+        if not v or not v.worst or v.worst.at is None:
+            return
+        at = v.worst.at
+        tr = self.traces[self.ti]
+        span = (self.view[1] - self.view[0]) if self.view else (tr.x[-1] - tr.x[0])
+        i0, i1 = fit_view(tr.x, at - span / 2.0, at + span / 2.0)
+        if i1 - i0 < 20:                       # 缩得太狠就给 200 个原始点的宽度
+            k = bisect.bisect_left(tr.x, at)
+            lo = max(0, k - 100)
+            hi = min(len(tr.x) - 1, k + 100)
+            span = tr.x[hi] - tr.x[lo]
+        self._set_view(at - span / 2.0, at + span / 2.0)
 
     def _max_cand(self):
         return getattr(self.args, "max_cand", None) or core.MAX_CAND
@@ -970,34 +1274,6 @@ class WaveGui(object):
             pinned = core.NOISE_K * s.noise > tol * (s.rng or 1.0)
             self.colbtn[k].configure(
                 text="c%d %s%s" % (k + 1, s.name, " ·噪声底钉住" if pinned else ""))
-
-    def _ceiling_hint(self):
-        """滑块拖到头之后**是什么在挡着**。不说的话工具只是「不再变好」。
-
-        真实困惑：「max-points 拖到最大了，波形还是跟原数据差很多」。
-        三个天花板叠着，从里到外：预算 -> 候选集上限 -> 波形本身的周期数。
-        最外面那个是信息量不是参数，拖滑块永远拖不过去。
-        """
-        if not self.red or not self.cand:
-            return ""
-        tr = self.red.trace
-        # 候选集塌到个位数：滑块上限会显示成 10（`max(10, len(cand))` 的兜底值），
-        # 而 10 是个凭空冒出来的数字，不说的话没人知道它是怎么来的。
-        if len(self.cand) <= 10 and len(self.cand) < len(tr.x):
-            s = tr.signals[0] if tr.signals else None
-            why = "整条几乎是常数" if (s and s.rng <= 0) else "量程被极端点定死"
-            return ("!! 候选点只有 %d 个（原始 %d）—— %s，滑块上限的 10 是兜底值"
-                    % (len(self.cand), len(tr.x), why))
-        cw = emit.carrier_warn(self.red)
-        if cw:                                # 信息量不够：最外面那层，先说它
-            return "!! " + cw.split("。")[0] + "，缩小视窗或换 --xrange 导一段"
-        b = self.budget()
-        if b and self.nbytes > 0.98 * b and self.mp_v.get() < len(self.cand):
-            return "预算封顶（%.0f KB）" % (b / 1024.0)
-        if self.mp_v.get() >= len(self.cand) and len(self.cand) < len(tr.x):
-            return ("候选集封顶（%d 点 / 原始 %d）—— 候选集是质量上限，"
-                    "命令行可用 --max-cand 开大" % (len(self.cand), len(tr.x)))
-        return ""
 
     # ------------------------------------------------------------ 交互
 
