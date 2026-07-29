@@ -217,6 +217,72 @@ class TestGuiSelftest(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_gui_text_equals_cli_text_byte_for_byte(self):
+        """同一组参数下，GUI 复制出去的东西必须和命令行输出**逐字节相同**。
+
+        这是整个模型层存在的理由。原来两边各写了一条预算二分（对同一份
+        数据落在不同点数上，实测差过 55 字节），而 GUI 的非当前块是复制
+        那一刻拿**当前块**的参数临时压的 —— 同一份数据同一组参数，
+        两边给不同的答案，用户没法知道该信哪个。
+
+        比的是「压到预算」那个状态：命令行永远压到预算，而 GUI 落地时
+        停在探索状态（点数由滑块给，超预算就超着，这是刻意的）。
+        点一下「自动压到预算」两边就该一个字节都不差。
+        """
+        import wave_cli
+        for name in ("demo_tran.csv", "demo_ac.csv"):
+            root, app = self._app(name)
+            try:
+                app._fit()
+                gui = app.wv_text()
+            finally:
+                root.destroy()
+            args = wave_cli.build_parser().parse_args([])
+            args.budget = 20480
+            cli_txt, _ = wave_cli.process(os.path.join(ROOT, "examples", name),
+                                          args)
+            self.assertEqual(gui, cli_txt, "%s：GUI 和命令行给了不同的答案" % name)
+
+    def test_displayed_bytes_are_the_copied_bytes(self):
+        """屏幕上那个字节数必须**就是**剪贴板里的字节数。
+
+        原来屏幕报的是当前块、剪贴板里是全部块；后来还有一层：
+        便宜那条计算路径 emit 出来的文本少一行 `# recon:`，
+        于是合计比真正复制出去的少几十字节。
+        """
+        for name in ("demo_tran.csv", "demo_tran_layoutb.csv"):
+            root, app = self._app(name)
+            try:
+                app._recompute(True)
+                shown = app.nbytes
+                copied = C.emit.nbytes(app.wv_text())
+                self.assertEqual(shown, copied,
+                                 "%s：屏幕 %d 字节，剪贴板 %d 字节"
+                                 % (name, shown, copied))
+            finally:
+                root.destroy()
+
+    def test_switching_block_does_not_touch_any_parameter(self):
+        """「看一眼别的块」不许改变要粘出去的东西。
+
+        原来切块会把候选集、metrics、列选、点数全推倒重来，而且回不去 ——
+        看一眼的代价是把调好的参数丢掉。
+        """
+        root, app = self._app("demo_tran_layoutb.csv")
+        try:
+            if len(app.ship.blocks) < 2:
+                self.skipTest("这个夹具只有一块")
+            before = app.wv_text()
+            snap = [(b.max_points, list(b.cols or []), b.included)
+                    for b in app.ship.blocks]
+            app._use_trace(1)
+            app._use_trace(0)
+            self.assertEqual([(b.max_points, list(b.cols or []), b.included)
+                              for b in app.ship.blocks], snap, "切块改了参数")
+            self.assertEqual(app.wv_text(), before, "切块改了输出")
+        finally:
+            root.destroy()
+
     def test_column_clicks_coalesce_into_one_recompute(self):
         """连点几个列选框只许算最后一次。
 
@@ -259,11 +325,10 @@ class TestGuiSelftest(unittest.TestCase):
         try:
             self.assertGreaterEqual(len(app.cols), 3)
             self.assertTrue(app.force_metrics.get())
-            full = app._reduce(app.mp_v.get(), check=False)
-            self.assertTrue(full.forced, "夹具本身就该有强制保留点")
+            self.assertTrue(app.red.forced, "夹具本身就该有强制保留点")
             app.cols[1].set(False)
-            sub = app._reduce(app.mp_v.get(), check=False)
-            self.assertTrue(sub.forced,
+            app._recompute(True)
+            self.assertTrue(app.red.forced,
                             "取消一列之后强制保留点没了（守卫又回来了）")
         finally:
             root.destroy()

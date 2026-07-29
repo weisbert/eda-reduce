@@ -134,12 +134,15 @@ def _demod(tr, args):
                             getattr(args, "demod_fspan", 0))
 
 
-def process(path, args):
-    """-> (text, [(trace, reduction), ...])"""
+def prepare_traces(path, args):
+    """解析 -> 单位 -> 切窗口 -> analyze -> 解调。-> [trace, ...]
+
+    预处理（切窗口 / 解调）**会改变 trace 的条数**，所以预算要等条数
+    定下来才摊得了 —— 这也是为什么它单独一步。
+    """
     traces = core.parse_csv(path, layout=args.layout, xcols=args.xcols)
     if not traces:
         raise ValueError("没解析出任何 trace: %s" % path)
-    # 预处理（切窗口 / 解调）会改变 trace 的条数，所以预算要等条数定下来再摊
     prepared = []
     for tr in traces:
         _apply_units(tr, args.unit)
@@ -149,34 +152,272 @@ def process(path, args):
             core.slice_trace(tr, *args.xrange)
         core.analyze(tr, kind=args.kind, xscale=args.xscale)
         prepared.extend(_demod(tr, args) if args.demod else [tr])
+    return prepared
 
-    per = args.budget // len(prepared) if args.budget else None
-    chunks, info = [], []
-    for tr in prepared:
-        notes = []
+
+class Block(object):
+    """`.wv` 里的一「块」：一条 trace，加上**它自己那一整份**压缩状态。
+
+    为什么要有这个类。GUI 原来把「当前这条 trace」的状态摊在 self 上
+    （cand / metrics / red / cols / mp_v），切一下块全被冲掉；而非当前块
+    是在复制的那一刻拿**当前块的参数**临时压一遍出去的（旧 `_emit_other`）。
+    于是屏幕上那个字节数和真正会粘出去的东西对不上 —— 解调出两块时，
+    状态栏读的是第一块，剪贴板里是两块。状态归块，这条就不成立了。
+
+    每块自己的东西只有三样：`cols`（搬哪几列）、`max_points`、`included`
+    （搬不搬这块）。tol 和预算是整份货的，不是块的 —— 拆开就需要
+    「同步到所有块」这种二级概念。
+    """
+
+    def __init__(self, trace, args):
+        self.trace = trace
+        self.args = args
+        self.metrics = None
+        self.suggested_tol = None
+        self.tol = None                  # 这一轮实际用的（compute 里定）
+        self.cand = None
+        self.cols = None                 # None = 整条都要；否则一组 bool
+        self.max_points = getattr(args, "max_points", None)
+        self.included = True
+        # 命令行没有对应的 flag（保底点永远留），但 GUI 上是个勾选框。
+        # 放在这里而不是让 GUI 自己旁路一条路 —— 旁路就是上一版
+        # 「GUI 和命令行给不同答案」的来源。
+        self.use_forced = True
+        self.red = None
+        self.text = ""
+        self.notes = []
+        self._prepared = False
+        self._cand_tol = None
+        self._dirty = True
+        # 缓存里那份文本是不是**带 `# recon:`** 的。`check=False` 省掉 O(n)
+        # 自检，代价是emit 出来的文本少一行 —— 少的正好是诚实闸门那一行。
+        # 所以「缓存够不够用」不只看脏不脏，还要看要的精度够不够。
+        self._checked = False
+
+    # -------------------------------------------------- 只跟数据有关的一次性活
+
+    def prepare(self):
+        """metrics 和建议 tol。跟 tol / 预算都无关，所以只算一次。"""
+        if self._prepared:
+            return
         m = None
-        if not args.no_metrics:
-            m = emit.run_metrics(tr)
-        tol = args.tol
-        if tol is None:
-            tol = core.DEFAULT_TOL
-            sug = m.suggest_tol() if m else None
-            if sug:
-                notes.append("tol 用了 kind=%s 建议的 %g（没给 --tol）；"
-                             "%s" % (tr.kind, sug, _why_tol(tr, sug)))
-                tol = sug
-        core.set_eps(tr, tol)
-        cand = core.predecimate(tr, tol, max_cand=args.max_cand)
-        forced = list(m.forced()) if m else []
-        if m is None and not args.no_metrics:
+        if not self.args.no_metrics:
+            m = emit.run_metrics(self.trace)
+        self.metrics = m
+        self.suggested_tol = m.suggest_tol() if m else None
+        self._prepared = True
+
+    def touch(self):
+        """这块的参数变了，下次 compute 要真算。"""
+        self._dirty = True
+
+    def dirty(self):
+        return self._dirty or self.red is None
+
+    # -------------------------------------------------- 压
+
+    def _effective_tol(self, override):
+        """-> (tol, 要不要为此写一条 note)。
+
+        口径和命令行完全一致：`--tol` 优先；没给才用 metrics 的建议值，
+        **而且用了要说**；建议值也没有才退回 DEFAULT_TOL。
+        """
+        if override is not None:
+            return override, None
+        if self.suggested_tol:
+            return self.suggested_tol, (
+                "tol 用了 kind=%s 建议的 %g（没给 --tol）；%s"
+                % (self.trace.kind, self.suggested_tol,
+                   _why_tol(self.trace, self.suggested_tol)))
+        return core.DEFAULT_TOL, None
+
+    def ensure_cand(self, tol_override):
+        """只把候选集备好（不做 RDP）。界面要拿它定滑块量程和默认点数。"""
+        self.prepare()
+        tol, _ = self._effective_tol(tol_override)
+        core.set_eps(self.trace, tol)
+        if self.cand is None or self._cand_tol != tol:
+            self.cand = core.predecimate(self.trace, tol,
+                                         max_cand=self.args.max_cand)
+            self._cand_tol = tol
+        return self.cand
+
+    def sub_trace(self):
+        """按 `cols` 做一个浅拷贝（数组共享，不复制数据）。"""
+        tr = self.trace
+        if not self.cols:
+            return tr
+        keep = [s for s, on in zip(tr.signals, self.cols) if on]
+        if not keep or len(keep) == len(tr.signals):
+            return tr
+        sub = core.Trace(tr.xname, tr.index)
+        for a in ("source", "xunit", "xunit_src", "x", "kind", "kind_src",
+                  "xscale", "notes", "dt_med", "dt_min", "dt_max"):
+            setattr(sub, a, getattr(tr, a))
+        sub.signals = keep
+        return sub
+
+    def compute(self, per_budget, tol_override, keep_extrema=True, check=True,
+                fit=True):
+        """压一遍，填 self.red / self.text。
+
+        `fit=True` 走 `fit_budget`，也就是**压到预算**（命令行永远这样）。
+        `fit=False` 只按 `max_points` 压一次，超预算就超着 —— GUI 拖滑块时
+        要的是这个：拖到超预算是**探索的一部分**（「多给点数能好多少」），
+        顶回来的话滑块过了某一格就没反应，人只会以为坏了。
+        超没超由出口台去说。
+        """
+        self.prepare()
+        tol, tol_note = self._effective_tol(tol_override)
+        self.tol = tol
+        notes = [tol_note] if tol_note else []
+        core.set_eps(self.trace, tol)
+        if self.cand is None or self._cand_tol != tol:
+            self.cand = core.predecimate(self.trace, tol,
+                                         max_cand=self.args.max_cand)
+            self._cand_tol = tol
+        m = self.metrics
+        forced = list(m.forced()) if (m and self.use_forced) else []
+        if m is None and not self.args.no_metrics:
             notes.append("kind=%s 没有注册的 metrics 模块，本文件只有 SHAPE 段"
-                         "（已注册: %s）" % (tr.kind, ", ".join(emit.registered())
-                                            or "无"))
-        red, txt = fit_budget(tr, tol, per, m, forced, cand,
-                              args.max_points, not args.no_offset, notes)
-        chunks.append(txt)
-        info.append((tr, red))
-    return "\n".join(chunks), info
+                         "（已注册: %s）"
+                         % (self.trace.kind, ", ".join(emit.registered()) or "无"))
+        self.notes = notes
+        sub = self.sub_trace()
+        if fit:
+            self.red, self.text = fit_budget(
+                sub, tol, per_budget, m, forced, self.cand,
+                self.max_points, not self.args.no_offset, notes, keep_extrema)
+        else:
+            self.red = core.reduce_trace(
+                sub, tol, self.max_points, self.cand, forced,
+                keep_extrema=keep_extrema,
+                keep_offset=not self.args.no_offset, check=check)
+            self.text = emit.emit(self.red, m, notes)
+        self._dirty = False
+        self._checked = bool(check) or fit
+        return self.red
+
+    def nbytes(self):
+        return emit.nbytes(self.text) if self.text else 0
+
+    def label(self):
+        s = self.trace.signals[0].name if self.trace.signals else "?"
+        return s.split("(")[0].strip()
+
+
+class Shipment(object):
+    """要粘出去的**那一整份**：若干块 + 预算 + tol。
+
+    「合计多少字节」「最差误差多少」这两个判据只有在这一层才问得出来。
+    原来 GUI 是按当前块回答的，命令行是按全部块回答的 —— 同一份数据
+    同一组参数，两边给不同的答案，而用户没法知道该信哪个。
+    """
+
+    def __init__(self, blocks, args, keep_extrema=True):
+        self.blocks = blocks
+        self.args = args
+        self.tol_override = args.tol      # None = 各块用各自的建议值
+        self.budget = args.budget or 0
+        self.keep_extrema = keep_extrema
+
+    # -------------------------------------------------- 选择
+
+    def included(self):
+        return [b for b in self.blocks if b.included]
+
+    def per_block_budget(self):
+        """预算怎么摊 —— **只此一处**。
+
+        原来 GUI 自己写了一条二分、命令行写了另一条，两条对同一份数据
+        给不同的点数。摊法是「按块均分」：不完美（各块的固定开销不一样，
+        env 有两列、f_inst 只有一列），但必须和命令行是同一个不完美，
+        不然屏幕和产物又要对不上。顶穿了由界面去说，不在这里偷偷改算法。
+        """
+        inc = self.included()
+        return (self.budget // len(inc)) if (self.budget and inc) else None
+
+    # -------------------------------------------------- 算
+
+    def set_tol(self, tol):
+        self.tol_override = tol
+        for b in self.blocks:               # tol 是整份货的，全体失效
+            b.cand = None
+            b.touch()
+
+    def set_budget(self, n):
+        self.budget = n
+        for b in self.blocks:
+            b.touch()
+
+    def compute(self, check=True, only=None, force=False, fit=True):
+        """算脏块。
+
+        `only` 给一块时其余块只在脏了才重算 —— 这是「拖滑块还能实时报
+        合计字节」的全部秘诀：动的是焦点块，其余块的文本还在缓存里，
+        合计只是把几段字符串加起来。
+        """
+        per = self.per_block_budget()
+        for b in self.included():
+            # 精度**不按块降级**。屏幕上那个合计字节数就是复制出去的字节数，
+            # 而 `check=False` 出来的文本少一行 `# recon:` —— 只要有一块走了
+            # 便宜那条，合计就比真正复制出去的少几十字节，Step 1 想消灭的
+            # 正是这种「屏幕和产物对不上」。缓存够不够用因此有两个条件：
+            # 脏没脏，以及**精度够不够**。
+            stale = (b.dirty() or (check and not b._checked)
+                     or (only is not None and b is only))
+            if not force and not stale:
+                continue
+            b.compute(per, self.tol_override, self.keep_extrema, check, fit)
+
+    # -------------------------------------------------- 结果
+
+    def text(self):
+        return "\n".join(b.text for b in self.included() if b.text)
+
+    def total_bytes(self):
+        t = self.text()
+        return emit.nbytes(t) if t else 0
+
+    def worst(self):
+        """全部要发出去的块里最差的那个重建误差。-> Err 或 None。"""
+        cands = [b.red.worst for b in self.included()
+                 if b.red is not None and b.red.err]
+        return max(cands, key=lambda e: e.pct) if cands else None
+
+    def worst_eps(self):
+        """最差误差是各自 eps 的几倍。字节和精度是两条独立的判据。"""
+        peak = 0.0
+        for b in self.included():
+            if b.red is None:
+                continue
+            for e in b.red.err:
+                eps = e.sig.eps
+                if 0 < eps < float("inf"):
+                    peak = max(peak, e.maxerr / eps)
+        return peak
+
+    def n_kept(self):
+        return sum(len(b.red.kept) for b in self.included() if b.red)
+
+    def warns(self):
+        out = []
+        for b in self.included():
+            out.extend(getattr(b.trace, "warns", []) or [])
+        return out
+
+
+def plan(traces, args, keep_extrema=True):
+    """[trace] -> 算好的 Shipment。命令行和 GUI 走的是同一条路。"""
+    ship = Shipment([Block(tr, args) for tr in traces], args, keep_extrema)
+    ship.compute()
+    return ship
+
+
+def process(path, args):
+    """-> (text, [(trace, reduction), ...])"""
+    ship = plan(prepare_traces(path, args), args)
+    return ship.text(), [(b.trace, b.red) for b in ship.included()]
 
 
 def build_parser():

@@ -46,6 +46,7 @@ try:
 except ImportError:                                    # pragma: no cover
     tk = None
 
+import wave_cli as cli
 import wave_core as core
 import wave_emit as emit
 
@@ -304,10 +305,9 @@ class WaveGui(object):
         self.path = path
         self.traces = []
         self.ti = 0
-        self.cand = None
-        self.red = None
-        self.metrics = None
-        self.fixed_bytes = 0
+        # 整份货。`red` / `cand` / `metrics` 从今往后是**焦点块的**视图，
+        # 不再是摊在 self 上、切一下块就被冲掉的状态。
+        self.ship = None
         self.view = None
         self.band = None
         self.band_key = None
@@ -351,6 +351,34 @@ class WaveGui(object):
         else:
             self.status.set("还没打开文件 —— 点左下角「打开 CSV…」，"
                             "或者命令行给一个：wave my.csv --gui")
+
+    # ------------------------------------------------------------ 焦点块的视图
+    #
+    # 这四个 property 是这一版最重要的一处改动。原来它们是普通属性，
+    # 切块时 `_use_trace` 把它们整套冲掉重来 —— 于是「看一眼别的块」
+    # 和「改要粘出去的东西」是同一个动作，回不去。现在状态归 Block，
+    # 这里只是**望过去**。
+
+    @property
+    def blk(self):
+        if not self.ship or not self.ship.blocks:
+            return None
+        return self.ship.blocks[min(self.ti, len(self.ship.blocks) - 1)]
+
+    @property
+    def red(self):
+        b = self.blk
+        return b.red if b else None
+
+    @property
+    def cand(self):
+        b = self.blk
+        return b.cand if b else None
+
+    @property
+    def metrics(self):
+        b = self.blk
+        return b.metrics if b else None
 
     # ------------------------------------------------------------ 界面
 
@@ -531,7 +559,7 @@ class WaveGui(object):
         """解析 + 预细化放后台线程。1e7 点解析要几十秒，不能冻界面。"""
         self.path = path
         # 换文件要把上一份状态清干净，否则列选框会越积越多、视窗还停在旧范围
-        self.traces, self.red, self.metrics, self.cand = [], None, None, None
+        self.traces, self.ship = [], None
         self.view = self.band = self.band_key = None
         self.cols = []
         for w in self.colbox.winfo_children():
@@ -596,7 +624,7 @@ class WaveGui(object):
             self.raw = raw
             with self._mute():
                 self.tol_v.set(tol * 1000.0)
-            self.traces = self._build_traces(raw)
+            self._rebuild_ship(raw)
             self.ti_v.set(0)
             self._use_trace(0)             # metrics / 候选集在这里面算
             return
@@ -604,37 +632,18 @@ class WaveGui(object):
 
     # ------------------------------------------------------------ 计算
 
-    def _sub_trace(self):
-        """按列选做一个浅拷贝 trace（数组是共享的，不复制数据）。"""
-        tr = self.traces[self.ti]
-        keep = [s for s, v in zip(tr.signals, self.cols) if v.get()]
-        if len(keep) == len(tr.signals) or not keep:
-            return tr
-        sub = core.Trace(tr.xname, tr.index)
-        for a in ("source", "xunit", "xunit_src", "x", "kind", "kind_src",
-                  "xscale", "notes", "dt_med", "dt_min", "dt_max"):
-            setattr(sub, a, getattr(tr, a))
-        sub.signals = keep
-        return sub
-
-    def _reduce(self, max_points, check=True):
-        tr = self._sub_trace()
-        tol = self.tol_v.get() / 1000.0
-        core.set_eps(tr, tol)
-        # 强制保留点是一组**x 下标**，对任何列子集都成立 —— 原来这里有个
-        # 「所有列都还在才用」的守卫，后果是：六路里取消任何一列勾选，
-        # spur/事件的强制保留**静默全关**，复选框照样打着勾，点数和字节数
-        # 暴跌，人只会归因于「少了五列」。守卫本身是多余的，删掉。
-        # （代价：保底点按整条记，取消某一列不会减少它们 —— 这条要在界面上写明。）
-        forced = []
-        if self.force_metrics.get() and self.metrics:
-            forced = list(self.metrics.forced())
-        return core.reduce_trace(tr, tol, max_points, self.cand, forced,
-                                 keep_extrema=self.force_extrema.get(),
-                                 check=check)
+    def _push_ui_to_block(self):
+        """把界面上那几个旋钮写回焦点块。块才是真相，控件只是它的显示。"""
+        b = self.blk
+        if b is None:
+            return
+        b.max_points = self.mp_v.get() or None
+        b.cols = [v.get() for v in self.cols] if self.cols else None
+        b.touch()
 
     def _recompute(self, precise=True):
-        if not self.traces:
+        """重算焦点块，其余块用缓存 —— 合计字节因此还能实时。"""
+        if not self.ship or self.blk is None:
             return
         # 上一次算了 150 ms 以上就先把「重算中」刷出去。同步的活没法打断，
         # 但**不能让窗口看起来死了** —— 六路 20 万点一次两秒多，
@@ -642,16 +651,18 @@ class WaveGui(object):
         if getattr(self, "ms", 0.0) >= SLOW_MS:
             self.status.set("重算中…")
             self.root.update_idletasks()
+        self._push_ui_to_block()
+        self.ship.keep_extrema = self.force_extrema.get()
+        for b in self.ship.blocks:
+            b.use_forced = self.force_metrics.get()
         t0 = time.time()
-        self.red = self._reduce(self.mp_v.get(), check=precise)
+        # fit=False：拖滑块时不许被预算顶回来，超预算是探索的一部分，
+        # 由状态栏去说。「自动压到预算」按钮才走 fit=True。
+        self.ship.compute(check=precise, only=self.blk, fit=False)
         self.ms = (time.time() - t0) * 1000.0
+        self.nbytes = self.ship.total_bytes()
         if precise:
-            txt = emit.emit(self.red, self.metrics)
-            self.nbytes = emit.nbytes(txt)
-            self.fixed_bytes = self.nbytes - emit.shape_bytes(self.red)
             self._fill_text()
-        else:
-            self.nbytes = self.fixed_bytes + emit.shape_bytes(self.red)
         self._sync_eps_marks()
         self._status()
         self._redraw()
@@ -659,60 +670,50 @@ class WaveGui(object):
     def wv_text(self):
         """当前参数下的完整 .wv —— 就是要粘进聊天框的那份东西。
 
-        **所有 trace 都得在里面。** 原来只发当前这一条：布局 B（两个 time 列）
+        **所有块都得在里面。** 原来只发当前这一条：布局 B（两个 time 列）
         和 `--demod`（包络块 + 频率块）都会产生多条 trace，粘出去的东西是残的，
         而且残得看不出来 —— 头部长得一模一样，只是少了一块。
         这条按钮是整个工具的出口，不能是残的。
+
+        而且它现在**就是屏幕上那个字节数的来源**。原来非当前块是在这一刻
+        拿当前块的参数临时压一遍出来的，屏幕读的是当前块、剪贴板里是全部块，
+        两个数永远对不上。
         """
-        if not self.red:
+        if not self.ship:
             return ""
-        parts = []
-        for i, tr in enumerate(self.traces):
-            if i == self.ti:
-                parts.append(emit.emit(self.red, self.metrics))
-            else:
-                parts.append(self._emit_other(tr))
-        return "\n".join(parts)
-
-    def _emit_other(self, tr):
-        """非当前 trace：按当前参数压一遍再出文本。
-
-        每次复制都重算一遍（O(n)）。可以缓存，但复制是点一下的事，
-        而缓存要跟 tol / max-points / 强制保留三个开关同步失效 —— 不值。
-        """
-        tol = self.tol_v.get() / 1000.0
-        core.set_eps(tr, tol)
-        m = None if self.args.no_metrics else emit.run_metrics(tr)
-        cand = core.predecimate(tr, tol, max_cand=self._max_cand())
-        forced = list(m.forced()) if (m and self.force_metrics.get()) else []
-        red = core.reduce_trace(tr, tol, self.mp_v.get() or None, cand, forced,
-                                keep_extrema=self.force_extrema.get(),
-                                keep_offset=not self.args.no_offset)
-        return emit.emit(red, m)
+        # check=True：要粘出去的东西**必须**带 `# recon:` 那一行。
+        # 复制是点一下的事，一次 O(n) 自检付得起。
+        self.ship.compute(check=True, fit=False)       # 补齐还没算过的块
+        return self.ship.text()
 
     def _use_trace(self, i):
-        """切到第 i 条 trace：候选集、metrics、列选框、视窗全部重来。"""
-        if not self.traces:
+        """把焦点挪到第 i 块。**只换看的，不动任何参数。**
+
+        原来这里会把候选集、metrics、列选框、视窗全部推倒重来 ——
+        于是「看一眼第二块」和「把第一块调过的东西丢掉」是同一个动作，
+        而且回不去。现在每块的参数都在 Block 里存着，切回来原样还在。
+        """
+        if not self.ship or not self.ship.blocks:
             return
-        self.ti = max(0, min(i, len(self.traces) - 1))
-        tr = self.traces[self.ti]
-        tol = self.tol_v.get() / 1000.0
-        core.set_eps(tr, tol)
-        self.metrics = None if self.args.no_metrics else emit.run_metrics(tr)
-        self.cand = core.predecimate(tr, tol, max_cand=self._max_cand())
+        self.ti = max(0, min(i, len(self.ship.blocks) - 1))
+        b = self.blk
+        b.ensure_cand(self.ship.tol_override)
+        tr = b.trace
         for w in self.colbox.winfo_children():
             w.destroy()
         self.colbtn = []
-        self.cols = [tk.BooleanVar(value=True) for _ in tr.signals]
+        if b.cols is None:
+            b.cols = [True] * len(tr.signals)
+        self.cols = [tk.BooleanVar(value=on) for on in b.cols]
         for k, s in enumerate(tr.signals):
             cb = tk.Checkbutton(self.colbox, text="c%d %s" % (k + 1, s.name),
                                 variable=self.cols[k], bg=BG, fg=COLORS[k % 6],
                                 selectcolor=BG, command=self._defer)
             cb.pack(side="left")
             self.colbtn.append(cb)
-        self.s_mp.configure(to=max(10, len(self.cand)))
+        self.s_mp.configure(to=max(10, len(b.cand)))
         with self._mute():
-            self.mp_v.set(min(len(self.cand), max(50, len(self.cand) // 4)))
+            self.mp_v.set(b.max_points)
         self.band = self.band_key = None
         self._sync_trace_bar()
         self._zoom_all()
@@ -784,61 +785,66 @@ class WaveGui(object):
     def _on_budget(self):
         b = self.budget()
         self.args.budget = b or None
+        if self.ship:
+            self.ship.budget = b
         self._status()
 
     def _fit(self):
-        """二分 max_points 压到当前预算。和 CLI 里那套是同一个做法。
+        """压到当前预算。
 
-        固定开销（头部 + METRICS + EVENTS）先量一次，之后只对 SHAPE 行数二分，
-        所以中间那十几次不跑 O(n) 的重建自检。
+        这里原来有 GUI 自己写的一条二分 —— 和 `wave_cli.fit_budget` 里那条
+        是两份实现，对同一份数据会落在不同的点数上（实测差过 55 字节）。
+        「同一个预算 -> 同一个结果」这条不成立，GUI 里调好的参数拿到命令行
+        就对不上。现在整条删掉，走 `Block.compute(fit=True)`，也就是
+        命令行走的那一条。
         """
-        if not self.red or not self.cand:
+        if not self.ship or self.blk is None:
             return
         b = self.budget()
         if not b:
             self.status.set("预算设成了不限，没什么可压的")
             return
-        # 固定开销要从**不限点数**那一版量，和 CLI 完全一致。
-        # 拿「当前这一版」去量的话，头里每列的 err X.XX% 宽度会随点数变，
-        # 于是同一个预算从不同起点压会落在不同的点数上（实测差过 55 字节）。
-        # 「同一个预算 -> 同一个结果」这条得成立，不然 GUI 里调好的参数
-        # 拿到命令行就对不上了。
-        r0 = self._reduce(None, check=True)
-        fixed = emit.nbytes(emit.emit(r0, self.metrics)) - emit.shape_bytes(r0)
-        if fixed >= b:
-            self.status.set(
-                "压不进去：头部+METRICS+EVENTS 本身就要 %.1f KB > 预算 %.1f KB。"
-                "那些是全精度事实，不能为预算牺牲 —— 放宽预算或调大 tol。"
-                % (fixed / 1024.0, b / 1024.0))
-            return
-        lo, hi, best = 2, len(r0.kept), 2
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            r = self._reduce(mid, check=False)
-            if fixed + emit.shape_bytes(r) <= b:
-                best, lo = mid, mid + 1
-            else:
-                hi = mid - 1
-        with self._mute():          # 只是把界面同步到已经二分出来的结果
-            self.mp_v.set(best)
-        self._recompute(True)
-        if self.nbytes > b:                       # 强制点撑住了，压不下去
-            self.status.set(self.status.get() + "  ← 强制保留点撑住了下限")
+        self._push_ui_to_block()
+        for blk in self.ship.blocks:
+            blk.max_points = None               # 交给 fit_budget 去定
+            blk.touch()
+        self.status.set("压到预算中…")
+        self.root.update_idletasks()
+        self.ship.compute(check=True, force=True, fit=True)
+        self.nbytes = self.ship.total_bytes()
+        cur = self.blk
+        with self._mute():                      # 界面同步到算出来的结果
+            self.mp_v.set(min(len(cur.cand), len(cur.red.kept)))
+        cur.max_points = self.mp_v.get()
+        self._fill_text()
+        self._sync_eps_marks()
+        self._status()
+        self._redraw()
+        if self.nbytes > b:                     # 保底点撑住了，压不下去
+            self.status.set(self.status.get() + "  ← 保底点撑住了下限")
 
     def _status(self):
         if not self.red:
             return
-        w = self.red.worst if self.red.err else None
+        # 判据一律按**整份货**报。原来这里报的是当前块：解调出两块时
+        # 屏幕上写 9.1 KB / 20 KB ✓，而剪贴板里是 18.3 KB —— 两个数
+        # 都对，只是回答的不是同一个问题，而用户没法知道该信哪个。
+        ship = self.ship
+        w = ship.worst()
         tr = self.red.trace
         b = self.budget()
+        nb = self.nbytes
+        nblk = len(ship.included())
+        blk_tail = "（%d 块）" % nblk if nblk > 1 else ""
         if b:
-            fit = "%.1f KB / %.1f KB %s" % (
-                self.nbytes / 1024.0, b / 1024.0,
-                "✓" if self.nbytes <= b else "✗ 超预算")
+            fit = "%.1f KB / %.1f KB %s%s" % (
+                nb / 1024.0, b / 1024.0,
+                "✓" if nb <= b else "✗ 超预算", blk_tail)
         else:
-            fit = "%.1f KB（预算不限）" % (self.nbytes / 1024.0)
+            fit = "%.1f KB（预算不限）%s" % (nb / 1024.0, blk_tail)
         # 输入本身不可信的话，别的读数说得再准也没意义 —— WARN 顶到最前面
-        head = ("!! %s" % tr.warns[0].split("。")[0]) if tr.warns else ""
+        warns = ship.warns()
+        head = ("!! %s" % warns[0].split("。")[0]) if warns else ""
         if not head:
             head = self._ceiling_hint()
         # 留个上限兜底：状态栏会换行，但一条几百字的 WARN 会把它撑成四五行，
@@ -847,7 +853,7 @@ class WaveGui(object):
             head = head[:89] + "…"
         self.status.set(
             "%s%d 点  │  输出 %s │  %s  │  RDP %.0f ms  │  %s"
-            % (head and head + "  │  ", len(self.red.kept), fit,
+            % (head and head + "  │  ", ship.n_kept(), fit,
                ("max|err| %s (%.2f%%) rms %s  [%s]"
                 % (core.eng_str(w.maxerr, w.sig.unit, 3), w.pct,
                    core.eng_str(w.rms, w.sig.unit, 3), w.sig.name))
@@ -878,6 +884,35 @@ class WaveGui(object):
             out.extend(self._demod(t) if self.demod_v.get() else [t])
         return out
 
+    def _rebuild_ship(self, raw):
+        """按当前模式重建整份货。模式一动块数就变，所以整份重来。"""
+        self.traces = self._build_traces(raw)
+        self.ship = cli.Shipment([cli.Block(t, self.args) for t in self.traces],
+                                 self.args, self.force_extrema.get())
+        # 命令行的 --tol 在 args 里；GUI 拖过滑块之后由 _on_tol 覆盖。
+        # 没拖过就保持 None，让各块用自己的建议值 —— 和命令行一模一样。
+        for b in self.ship.blocks:
+            b.use_forced = self.force_metrics.get()
+        self._settle_defaults()
+        return self.traces
+
+    def _settle_defaults(self):
+        """把每块的默认参数**一次性定下来**，别等到第一次聚焦才定。
+
+        否则「切过去看一眼」这个动作会顺手把那块的 max_points 从 None
+        变成一个具体值 —— 看一眼改变了要粘出去的东西，正是这次要消灭的事。
+        """
+        for b in self.ship.blocks:
+            if b.cols is None:
+                b.cols = [True] * len(b.trace.signals)
+            if b.max_points is None:
+                # 只备候选集，不做 RDP —— 这里要的只是「这块有多少候选点」，
+                # 拿它定滑块量程和默认点数。真正的压交给随后的 _recompute，
+                # 免得同一块在载入时被压两遍。
+                cand = b.ensure_cand(self.ship.tol_override)
+                b.max_points = min(len(cand), max(50, len(cand) // 4))
+                b.touch()
+
     def _remode(self):
         """解调 / 只压当前视窗 —— 这两个开关一动就整条重来。
 
@@ -890,7 +925,7 @@ class WaveGui(object):
                         % ("开" if self.demod_v.get() else "关",
                            "只压当前" if self.win_v.get() else "全长"))
         self.root.update_idletasks()
-        self.traces = self._build_traces(self.raw)
+        self._rebuild_ship(self.raw)
         self.ti_v.set(0)
         self._use_trace(0)
 
@@ -1004,14 +1039,15 @@ class WaveGui(object):
         self._live()
 
     def _on_tol(self, _=None):
-        if self._muted:
+        if self._muted or not self.ship:
             return
-        self.cand = None            # tol 变了候选集要重来
-        tr = self.traces[self.ti] if self.traces else None
-        if tr is not None:
-            core.set_eps(tr, self.tol_v.get() / 1000.0)
-            self.cand = core.predecimate(tr, self.tol_v.get() / 1000.0,
-                                         max_cand=self._max_cand())
+        # tol 是**整份货**的判据，不是某一块的 —— 所以写进 Shipment，
+        # 全部块的候选集一起失效。原来只重算了当前块，别的块还留着旧 tol，
+        # 于是复制出去的两块用的是两个容差。
+        self.ship.set_tol(self.tol_v.get() / 1000.0)
+        b = self.blk
+        if b is not None:
+            b.ensure_cand(self.ship.tol_override)
             # 候选集变了，点数滑块的上限就得跟着变。原来只在 `_use_trace`
             # 里配一次：调大 tol -> 候选点变少 -> 滑块量程还停在老的大值上，
             # 拖到后半程完全没反应；调小 tol -> 候选点变多 -> 拖到头也够不着。
@@ -1025,6 +1061,9 @@ class WaveGui(object):
         if n and self.mp_v.get() > n:
             with self._mute():
                 self.mp_v.set(n)
+            b = self.blk
+            if b is not None:
+                b.max_points = n
 
     def _live(self):
         """拖动时只算抽样误差（O(n) 的精确自检 145k 点要 0.5 s，会卡手）；
