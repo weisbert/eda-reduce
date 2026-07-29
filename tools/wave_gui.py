@@ -301,6 +301,21 @@ def fit_view(x, x0, x1):
     return i0, i1
 
 
+def fitted_mp(b):
+    """这块压完之后**实际落在**多少点。算不出来就返回 None。
+
+    压预算的入口（`_fit` / `_autofit`）是把每块的 max_points 清成 None
+    再交给 `fit_budget` 定的。清了之后必须**逐块**写回来：原来只写回当前
+    聚焦的那块，其余块一直挂着 None，于是「切到另一块看一眼」就把 None
+    塞进了绑在 Scale 上的 IntVar ——
+        TclError: can't assign non-numeric value to scale variable
+    多 trace + 超预算（布局 B、--demod、六路电流，全中）是常态不是边角。
+    """
+    if b.red is None or b.cand is None:
+        return None
+    return min(len(b.cand), len(b.red.kept))
+
+
 class Xform(object):
     """世界坐标 <-> 画布像素。log 轴在 log 空间线性映射。"""
 
@@ -1077,9 +1092,13 @@ class WaveGui(object):
                 tk.Label(self.colbox, text="      " + why, bg=RAIL_BG,
                          fg="#8a7a63", font=("Consolas", 8), anchor="w",
                          justify="left", wraplength=225).pack(fill="x")
-        self.s_mp.configure(to=max(10, len(b.cand)))
+        # `b.cand` / `b.max_points` 在这里都可能还没定（块是懒算的，压预算
+        # 又会把它们清掉）。**切一下块不许崩**，所以两个都取到具体的数再用。
+        ncand = len(b.cand) if b.cand else 0
+        self.s_mp.configure(to=max(10, ncand))
+        mp = b.max_points if b.max_points is not None else fitted_mp(b)
         with self._mute():
-            self.mp_v.set(b.max_points)
+            self.mp_v.set(mp if mp is not None else max(2, ncand // 4))
         self.band = self.band_key = None
         self._sync_trace_bar()
         self._zoom_all()
@@ -1134,11 +1153,11 @@ class WaveGui(object):
         if kind == "err":
             self.status.set("自动压到预算失败：%s" % exc)
             return
+        self._settle_fitted()                   # 每块都写回，不只当前这块
         cur = self.blk
-        if cur is not None and cur.red is not None:
+        if cur is not None and cur.max_points is not None:
             with self._mute():
-                self.mp_v.set(min(len(cur.cand), len(cur.red.kept)))
-            cur.max_points = self.mp_v.get()
+                self.mp_v.set(cur.max_points)
         self.nbytes = self.ship.total_bytes()
         self._fill_text()
         self._sync_eps_marks()
@@ -1361,10 +1380,11 @@ class WaveGui(object):
         self.root.update_idletasks()
         self.ship.compute(check=True, force=True, fit=True)
         self.nbytes = self.ship.total_bytes()
+        self._settle_fitted()                   # 每块都写回，不只当前这块
         cur = self.blk
         with self._mute():                      # 界面同步到算出来的结果
-            self.mp_v.set(min(len(cur.cand), len(cur.red.kept)))
-        cur.max_points = self.mp_v.get()
+            if cur.max_points is not None:
+                self.mp_v.set(cur.max_points)
         self._fill_text()
         self._sync_eps_marks()
         self._status()
@@ -1595,6 +1615,20 @@ class WaveGui(object):
             b.use_forced = self.force_metrics.get()
         self._settle_defaults()
         return self.traces
+
+    def _settle_fitted(self):
+        """压完预算之后，把每块**算出来的点数**写回该块。
+
+        `fit_budget` 只认 max_points=None（「你来定」），所以压之前每块都被
+        清成 None。不逐块写回，那些没被聚焦过的块就一直是 None ——
+        参见 `fitted_mp` 的注释。
+        """
+        if not self.ship:
+            return
+        for b in self.ship.blocks:
+            n = fitted_mp(b)
+            if n is not None:
+                b.max_points = n
 
     def _settle_defaults(self):
         """把每块的默认参数**一次性定下来**，别等到第一次聚焦才定。

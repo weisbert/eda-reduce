@@ -172,14 +172,18 @@ class TestGuiSelftest(unittest.TestCase):
         self.assertGreater(ratio, 5.0,
                            "窄视窗里纵轴还是按全局量程画的（%s）" % y[0])
 
-    def _app(self, csv_name, w=900):
-        """开一个真窗口把文件读进去。-> (root, app)，调用方负责 destroy。"""
+    def _app(self, csv_name, w=900, budget=20480):
+        """开一个真窗口把文件读进去。-> (root, app)，调用方负责 destroy。
+
+        `budget` 调小就能逼出「载入后自动压预算」那条路 —— 默认预算下
+        小夹具本来就装得下，`_autofit` 直接 return，那条路一次都没被测过。
+        """
         import tkinter as tk
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         import wave_cli
         import wave_gui
         args = wave_cli.build_parser().parse_args([])
-        args.budget = 20480
+        args.budget = budget
         root = tk.Tk()
         app = wave_gui.WaveGui(root, os.path.join(ROOT, "examples", csv_name),
                                args)
@@ -438,6 +442,39 @@ class TestGuiSelftest(unittest.TestCase):
             self.assertEqual([(b.max_points, list(b.cols or []), b.included)
                               for b in app.ship.blocks], snap, "切块改了参数")
             self.assertEqual(app.wv_text(), before, "切块改了输出")
+        finally:
+            root.destroy()
+
+    def test_switching_block_after_autofit_does_not_crash(self):
+        """压完预算再切块 —— 用户实测的崩法。
+
+            wave_gui.py: self.mp_v.set(b.max_points)
+            TclError: can't assign non-numeric value to scale variable
+
+        `_fit` / `_autofit` 为了让 `fit_budget` 说了算，会把**每块**的
+        max_points 清成 None，压完却只把当前那块写回去。其余块一直挂着
+        None，切过去的一瞬间 None 就进了绑在 Scale 上的 IntVar。
+
+        为什么原来那条切块测试没抓到：默认预算下小夹具本来就装得下，
+        `_autofit` 在 `bytes_ok` 那儿就 return 了，根本没清过 None。
+        **多 trace + 超预算**才是真实场景（布局 B / --demod / 多路电流全中），
+        所以这里把预算压到 2 KB 逼它真的走一遍。
+        """
+        root, app = self._app("demo_tran_layoutb.csv", budget=2048)
+        try:
+            if len(app.ship.blocks) < 2:
+                self.skipTest("这个夹具只有一块")
+            self.assertTrue(
+                any(b.max_points is not None for b in app.ship.blocks),
+                "压完预算后没有任何一块拿到具体点数")
+            for b in app.ship.blocks:
+                self.assertIsNotNone(
+                    b.max_points,
+                    "压完预算后还有块挂着 max_points=None —— 切到它就会崩")
+            for i in range(len(app.ship.blocks)):   # 真的切一遍，别只查不变量
+                app._use_trace(i)
+                root.update()
+                self.assertIsInstance(app.mp_v.get(), int)
         finally:
             root.destroy()
 
