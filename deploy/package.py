@@ -89,6 +89,22 @@ def dirty():
         return False
 
 
+def commit_epoch():
+    """HEAD 的提交时间（Unix 秒），拿来当包里所有文件的 mtime。
+
+    为什么不用 0：mtime=0 确实可复现，但 GNU tar 解包时每个文件都要喊一句
+
+        tar: app_incoming/tools/wave_core.py: implausibly old time stamp 1970-01-01
+
+    四十几行警告刷过去，看起来像是包坏了 —— 用户真的会停下来问。
+    用提交时间同样满足「同一个 commit 出同一个包」，而且是个讲得通的日期。
+    """
+    try:
+        return int(git("log", "-1", "--format=%ct"))
+    except Exception:
+        return 1000000000                    # 2001-09-09，随便挑个不刺眼的
+
+
 # 增量包里的载荷目录**故意不叫 app/**。
 # 叫 app/ 的话，人把增量包解进安装目录（这是很自然的做法）就会在
 # update.sh 跑起来之前把已装好的 app/ 盖掉，于是「备份」备的是新的那份，
@@ -191,13 +207,14 @@ def _make_tar(stage, tar):
     for base, _, files in os.walk(stage):
         for f in files:
             names.append(os.path.join(base, f))
+    mtime = commit_epoch()
     with tarfile.open(tar, "w:gz") as t:
         for p in sorted(names):
             arc = os.path.relpath(p, stage).replace(os.sep, "/")
             ti = t.gettarinfo(p, arcname=arc)
             ti.uid = ti.gid = 0
             ti.uname = ti.gname = "root"
-            ti.mtime = 0                     # 可复现：同一个 commit 出同一个包
+            ti.mtime = mtime                 # 可复现：同一个 commit 出同一个包
             if arc.endswith(".sh") or os.path.basename(arc) in EXEC_NAMES:
                 ti.mode = 0o755
             with open(p, "rb") as fh:
