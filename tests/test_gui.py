@@ -248,6 +248,69 @@ class TestGuiSelftest(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_unchecking_a_column_keeps_the_forced_points(self):
+        """取消一列勾选，不许把 spur/事件的强制保留**静默**关掉。
+
+        原来有个「所有列都还在才用 forced」的守卫，后果是六路里取消任何
+        一列，保底点全没了，而复选框还打着勾 —— 点数和字节数暴跌，
+        人只会归因于「少了五列」。
+        """
+        root, app = self._app("demo_tran.csv")
+        try:
+            self.assertGreaterEqual(len(app.cols), 3)
+            self.assertTrue(app.force_metrics.get())
+            full = app._reduce(app.mp_v.get(), check=False)
+            self.assertTrue(full.forced, "夹具本身就该有强制保留点")
+            app.cols[1].set(False)
+            sub = app._reduce(app.mp_v.get(), check=False)
+            self.assertTrue(sub.forced,
+                            "取消一列之后强制保留点没了（守卫又回来了）")
+        finally:
+            root.destroy()
+
+    def test_tol_change_resyncs_the_points_slider(self):
+        """tol 改了候选集就变，滑块量程必须跟着变。"""
+        root, app = self._app("demo_tran.csv")
+        try:
+            app.tol_v.set(0.5)
+            app._on_tol()
+            fine = int(app.s_mp.cget("to"))
+            self.assertEqual(fine, max(10, len(app.cand)))
+            app.tol_v.set(50.0)
+            app._on_tol()
+            coarse = int(app.s_mp.cget("to"))
+            self.assertEqual(coarse, max(10, len(app.cand)))
+            self.assertLess(coarse, fine, "tol 调粗候选点该变少，量程该跟着缩")
+            self.assertLessEqual(app.mp_v.get(), coarse, "当前值该被夹回量程内")
+        finally:
+            root.destroy()
+
+    def test_ctrl_c_is_left_to_the_text_widget(self):
+        """整份复制不许占用 Ctrl+C —— 那是文本框选区复制的键。"""
+        root, app = self._app("demo_tran.csv")
+        try:
+            self.assertEqual(root.bind("<Control-c>"), "",
+                             "顶层绑了 Ctrl+C，会盖掉文本框的选区复制")
+            self.assertTrue(root.bind("<Control-C>"), "Ctrl+Shift+C 没绑上")
+        finally:
+            root.destroy()
+
+    def test_programmatic_set_does_not_recompute(self):
+        """_mute() 里的 set() 只同步界面，不许回头触发重算。"""
+        root, app = self._app("demo_tran.csv")
+        try:
+            calls = []
+            real = app._recompute
+            app._recompute = lambda precise=True: (calls.append(precise),
+                                                   real(precise))[1]
+            with app._mute():
+                app.mp_v.set(max(2, app.mp_v.get() - 7))
+                app.tol_v.set(app.tol_v.get() + 1.0)
+            root.update()
+            self.assertEqual(calls, [], "静音区里的 set 还是触发了重算")
+        finally:
+            root.destroy()
+
     def test_zoom_on_log_axis_is_geometric(self):
         """log 轴要在 log 空间里缩放。按线性缩，滚一格锚点就跑到几个 decade 外。"""
         import wave_gui
@@ -626,6 +689,61 @@ class TestGuiPureCompute(unittest.TestCase):
         eps = tr.signals[0].eps
         self.assertGreaterEqual(peak, 0.9 * red.worst.maxerr / eps,
                                 "带子没抓住 recon 报的那个最大误差")
+
+    def test_event_colour_is_deterministic(self):
+        """事件颜色必须由列号决定，不能由 str hash 决定。
+
+        `hash("c1")` 每个进程都不一样（PYTHONHASHSEED 随机化），
+        于是标着 c1 的竖线这次蓝下次橙，跟 c1 自己的颜色也对不上；
+        截图发给别人，两边看到的颜色不同 —— 而颜色是图上唯一的归属线索。
+        """
+        import wave_gui
+        self.assertEqual(wave_gui._col_index("c1"), 0)
+        self.assertEqual(wave_gui._col_index("c3"), 2)
+        self.assertEqual(wave_gui._col_index("c12"), 11)
+        self.assertEqual(wave_gui._col_index(""), 0)
+        self.assertEqual(wave_gui._col_index(None), 0)
+        self.assertEqual(wave_gui._col_index("总计"), 0, "认不出就给 0，别抛")
+
+    def test_kept_band_uses_quantized_values(self):
+        """上格画的必须是 .wv 里**真的会存的**值，跟下格同源。"""
+        import wave_gui
+        from _common import core
+        rows = ["time (s),V(o) (V)"]
+        for i in range(400):
+            rows.append("%.12g,%.9g" % (i * 1e-9, math.sin(i * 0.05)))
+        tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+        core.analyze(tr)
+        core.set_eps(tr, 0.005)
+        red = core.reduce_trace(tr, 0.005, 60, core.predecimate(tr, 0.005), [])
+        cs = red.specs[0]
+        y = tr.signals[0].y
+        raw = wave_gui._kept_band(tr.x, y, red.kept, tr.x[0], tr.x[-1], 40)
+        q = wave_gui._kept_band(tr.x, y, red.kept, tr.x[0], tr.x[-1], 40, cs)
+        # 量化后的每个值都必须落在量化栅格上
+        step = cs.q_nat
+        if step > 0:
+            for v in [v for v in q[0] if v is not None]:
+                k = (v - cs.offset) * cs.scale / (step * cs.scale)
+                self.assertAlmostEqual(k, round(k), places=6,
+                                       msg="上格的值没落在量化栅格上")
+        self.assertNotEqual(raw, q, "量化前后一模一样，说明 cs 根本没起作用")
+
+    def test_bin_column_basis_is_the_view(self):
+        """分箱的列基准由调用方给，且给的是视窗两端。
+
+        `fit_view` 特意往两边各多取一个原始点。拿它当基准的话，
+        分箱坐标系比绘图坐标系宽两个点 —— 放大到几十个点时偏得肉眼可见。
+        """
+        import wave_gui
+        x = [i * 1.0 for i in range(100)]
+        y = [0.0] * 100
+        y[50] = 1.0
+        # 视窗 [40, 60]，但下标区间被 fit_view 撑到 [39, 62)
+        band = wave_gui.bin_envelope(x, [y], 39, 62, 21, 40.0, 60.0)
+        hi = band[0][1]
+        peak = [i for i, v in enumerate(hi) if v == 1.0]
+        self.assertEqual(peak, [10], "x=50 在 [40,60] 上应当落在正中那一列")
 
     def test_xform_log(self):
         import wave_gui

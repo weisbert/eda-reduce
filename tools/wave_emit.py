@@ -223,16 +223,13 @@ def eng_range(lo, hi, unit):
     return "%s .. %s %s" % (b, c, u)
 
 
-def carrier_warn(red):
-    """SHAPE 的点数撑不撑得起这段波形里的**周期数**。撑不起就说出来。
+def carrier_exits(red):
+    """撞上「点数撑不起周期数」这堵墙没有？-> None 或者一份**结构化**的诊断。
 
-    这条是拿一个真实的困惑换来的：「max-points 拖到最大了，波形还是跟原数据差很多」。
-    答案是三个天花板叠在一起，而且最外面那个是**信息量**不是参数：
-    2515 个振荡周期要画得像正弦至少要 6 点/周期 = 15000 点 ≈ 150 KB，
-    20 KB 装不下，拖滑块永远拖不到。工具当时什么都没说，只是不再变好。
-
-    所以这里报的是「每周期几个点」而不是误差百分比 —— 误差百分比对振荡信号
-    没有直觉（差半个周期就是 100%），点/周期直接对得上「画出来像不像」。
+    `carrier_warn` 把同样的东西拼成一句话。拼成话之后界面只能整段显示或者
+    整段截断 —— 状态栏里那句 `split("。")[0]` 正好把三条出路全切掉，
+    于是用户看见「拖 max-points 解决不了」却看不见该拖什么。
+    结构化出来，出路才能变成三个能点的按钮。
     """
     tr = red.trace
     nk = len(red.kept)
@@ -250,10 +247,29 @@ def carrier_warn(red):
         if ppc < MIN_PTS_PER_CYCLE and (worst is None or ppc < worst[1]):
             worst = (s, ppc)
     if worst is None:
-        return ""
+        return None
     s, ppc = worst
     per_pt = shape_bytes(red) / float(max(1, nk))
-    need_kb = MIN_PTS_PER_CYCLE * s.cycles * per_pt / 1024.0
+    return {"ppc": ppc, "sig": s.name, "cycles": s.cycles, "nk": nk,
+            "need_kb": MIN_PTS_PER_CYCLE * s.cycles * per_pt / 1024.0,
+            "want_ppc": MIN_PTS_PER_CYCLE}
+
+
+def carrier_warn(red):
+    """SHAPE 的点数撑不撑得起这段波形里的**周期数**。撑不起就说出来。
+
+    这条是拿一个真实的困惑换来的：「max-points 拖到最大了，波形还是跟原数据差很多」。
+    答案是三个天花板叠在一起，而且最外面那个是**信息量**不是参数：
+    2515 个振荡周期要画得像正弦至少要 6 点/周期 = 15000 点 ≈ 150 KB，
+    20 KB 装不下，拖滑块永远拖不到。工具当时什么都没说，只是不再变好。
+
+    所以这里报的是「每周期几个点」而不是误差百分比 —— 误差百分比对振荡信号
+    没有直觉（差半个周期就是 100%），点/周期直接对得上「画出来像不像」。
+    """
+    ex = carrier_exits(red)
+    if ex is None:
+        return ""
+    ppc, s, nk, need_kb = ex["ppc"], ex["sig"], ex["nk"], ex["need_kb"]
     # 出路要**按用得上的顺序**给。这条警告写在 --demod 之前，一直只说
     # 「--xrange 或加预算」；结果用户拿着这条警告问「我看不见你说的包络」——
     # 工具从没告诉过他还有这个模式。最该用的那条排第一。
@@ -264,7 +280,7 @@ def carrier_warn(red):
             "同一份 txt，实测 218 KB 的东西 22 KB 装得下）；"
             "② 要看**某几十个周期的实际波形**就 `--xrange 1.6u:1.62u` 切一段；"
             "③ 硬要全画就把预算开到 %.0f KB 以上。"
-            % (ppc, s.name, s.cycles, nk, need_kb))
+            % (ppc, s, ex["cycles"], nk, need_kb))
 
 
 def header(red, metrics=None, extra=None):

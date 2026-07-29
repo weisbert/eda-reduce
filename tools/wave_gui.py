@@ -33,7 +33,9 @@ Canvas 上就那几千条线段，改坐标即可。
 """
 
 import bisect
+import contextlib
 import os
+import re
 import sys
 import threading
 import time
@@ -69,17 +71,51 @@ BAND = "#c8c8c8"
 # 这一块刻意不碰 Tk，可以脱离窗口单独测。
 
 
-def bin_envelope(x, ys, i0, i1, ncol):
+def _col_index(name):
+    """事件标签里的 `c3` -> 2。认不出给 0。
+
+    原来是 `COLORS[hash(e.col) % 6]`。Python 3.3+ 的 str hash **每个进程
+    随机**（PYTHONHASHSEED 不固定时），所以标着 `c1` 的竖线这次是蓝的、
+    下次是橙的，跟 c1 自己的颜色也对不上。截图发给别人，两边看到的
+    颜色不一样，而颜色是这张图上唯一的归属线索。
+    """
+    if not name:
+        return 0
+    m = re.match(r"^c(\d+)$", str(name).strip())
+    return (int(m.group(1)) - 1) if m else 0
+
+
+def q_val(cs, v):
+    """这个保留点在 .wv 里的**实际**值 —— 也就是量化之后那个。
+
+    形状格原来画的是原始 y，误差格算的是量化后的 y（error_band/error_curve
+    里的 `cs.from_out(float(cs.txt(...)))`）。**两格在比不同的曲线**，
+    而量化误差正是误差格在数的东西之一，于是上格系统性偏乐观：
+    它画的是「如果不量化会长这样」，不是「.wv 里存的是这样」。
+    """
+    return cs.from_out(float(cs.txt(v)))
+
+
+def bin_envelope(x, ys, i0, i1, ncol, x0=None, x1=None):
     """把 [i0,i1) 的原始点按列压成 min/max 包络。O(区间长度)。
 
     1e7 个点画不了，也没必要画：一列像素里那几千个点，眼睛能看见的只有
     上下沿。压成包络之后画的是「原始数据真实覆盖的区域」，
     红线跑出灰带就是丢了东西 —— 这个判据只有包络能给，抽样给不了。
+
+    x0/x1 是**列的基准**，必须由调用方给成视窗的两端。原来是在这里拿
+    `x[i0]..x[i1-1]` 自己算的，而画的时候列号是铺满整个绘图区（对应
+    view[0]..view[1]）—— `fit_view` 特意往两边各多取一个原始点，
+    于是分箱的坐标系比画图的坐标系宽出两个点。全长时看不出来，
+    放大到几十个点时带子相对折线能偏出画布宽度的百分之十几。
     """
     n = i1 - i0
     if n <= 0:
         return []
-    x0, x1 = x[i0], x[i1 - 1]
+    if x0 is None:
+        x0 = x[i0]
+    if x1 is None:
+        x1 = x[i1 - 1]
     span = x1 - x0
     out = []
     for y in ys:
@@ -87,6 +123,10 @@ def bin_envelope(x, ys, i0, i1, ncol):
         hi = [None] * ncol
         for i in range(i0, i1):
             c = 0 if span <= 0 else int((x[i] - x0) / span * (ncol - 1))
+            if c < 0:
+                c = 0
+            elif c >= ncol:
+                c = ncol - 1
             v = y[i]
             if lo[c] is None:
                 lo[c] = hi[c] = v
@@ -130,12 +170,14 @@ def error_curve(tr, red, si, i0, i1, npts):
     return out
 
 
-def _kept_band(x, y, vis, x0, x1, ncol):
+def _kept_band(x, y, vis, x0, x1, ncol, cs=None):
     """保留点按像素列压成 min/max 带。-> (lo[], hi[])，空列是 None。
 
     跟 `bin_envelope` 是同一件事，只是喂进来的不是全部原始点，而是
     reduce 之后**真正会写进 .wv 的那些点**。两条带子叠在一起看，
     红带比灰带窄多少，就是这次压缩丢了多少摆幅。
+
+    给了 cs 就走量化值 —— 见 `q_val`。不给（比如画的不是保留点）保持原值。
     """
     lo = [None] * ncol
     hi = [None] * ncol
@@ -146,7 +188,7 @@ def _kept_band(x, y, vis, x0, x1, ncol):
             cix = 0
         elif cix >= ncol:
             cix = ncol - 1
-        v = y[i]
+        v = q_val(cs, y[i]) if cs is not None else y[i]
         if lo[cix] is None:
             lo[cix] = hi[cix] = v
         elif v < lo[cix]:
@@ -156,7 +198,7 @@ def _kept_band(x, y, vis, x0, x1, ncol):
     return lo, hi
 
 
-def error_band(tr, red, si, i0, i1, ncol):
+def error_band(tr, red, si, i0, i1, ncol, x0=None, x1=None):
     """误差按像素列压成 min/max 带。-> [(lo, hi) 或 None] * ncol，单位是 eps。
 
     原来是「隔 N 个点取一个再连折线」，两个毛病，在振荡波形上都是致命的：
@@ -174,14 +216,17 @@ def error_band(tr, red, si, i0, i1, ncol):
     cs = red.specs[si]
     logx = tr.xscale == "log"
     kx = [red.xspec.val(tr.x[i]) for i in red.kept]
-    ky = [cs.from_out(float(cs.txt(s.y[i]))) for i in red.kept]
+    ky = [q_val(cs, s.y[i]) for i in red.kept]
     if logx:
         kx = [core.math.log(v) if v > 0 else -745.0 for v in kx]
     eps = s.eps if 0 < s.eps < float("inf") else (s.rng or 1.0)
     n = i1 - i0
     if n <= 0 or ncol <= 0:
         return []
-    x0, x1 = tr.x[i0], tr.x[i1 - 1]
+    if x0 is None:
+        x0 = tr.x[i0]
+    if x1 is None:
+        x1 = tr.x[i1 - 1]
     span = (x1 - x0) or 1.0
     out = [None] * ncol
     # 点数远多于列数时按固定步长跳着扫：每列仍能落到几十个点，
@@ -269,11 +314,16 @@ class WaveGui(object):
         self._precise_job = None
         self._sel = None
         self._pan = None
+        # `tk.Scale.set()` / `BooleanVar.set()` 会触发控件自己的 command。
+        # 程序性地改一个旋钮（自动压到预算、出路卡按钮、量程夹回）本来只是
+        # 「把界面同步到已经算好的结果」，却会再触发一遍重算 —— 现在只是白算
+        # 一次，链条一长就成环。所有程序性 set 包在 `with self._mute()` 里，
+        # 所有 command 回调开头 `if self._muted: return`。
+        self._muted = False
         # 纵轴默认跟视窗：放大就是为了看细节，按全局量程画的话横轴放大了、
         # 纵向还是一条压平的直线，等于没放大
         self.y_local = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="载入中…")
-        self.prog = tk.DoubleVar(value=0.0)
         self.tol_v = tk.DoubleVar(value=(args.tol or core.DEFAULT_TOL) * 1000.0)
         self.mp_v = tk.IntVar(value=0)
         b0 = args.budget if args.budget else 0
@@ -322,9 +372,14 @@ class WaveGui(object):
         # 而误差恰恰是判断这次压缩能不能用的那个数。
         # 进度条先占位再放标签：pack 是按调用顺序分配的，标签先拿了
         # expand 的空间就会把进度条挤没。
-        self.pb = ttk.Progressbar(top, variable=self.prog, maximum=1.0,
-                                  length=200)
-        self.pb.pack(side="right", padx=(8, 0))
+        #
+        # **一个控件不能有两个含义。** 原来这条既当载入进度、又当预算占用率：
+        # 载入那半从来没动过（`work()` 从没往队列 push 过进度值，是死代码），
+        # 载完又被 `_status` 拿去表示 nbytes/budget —— 于是满格既可能是
+        # 「载完了」也可能是「超预算 63 倍」。现在它**只表示载入**，
+        # 而且改成 indeterminate：解析 1e7 点没有可信的百分比，
+        # 假装有一个精确进度比转圈更糟。预算占用率归 `_status` 的文字。
+        self.pb = ttk.Progressbar(top, mode="indeterminate", length=160)
         self.stat_lab = tk.Label(top, textvariable=self.status, bg=BG, fg=FG,
                                  font=("Consolas", 10), justify="left",
                                  anchor="w")
@@ -434,7 +489,12 @@ class WaveGui(object):
                            yscrollcommand=sb.set)
         self.txt.pack(side="left", fill="both", expand=True)
         sb.config(command=self.txt.yview)
-        r.bind("<Control-c>", lambda _: self._copy())
+        # **不能绑 Ctrl+C。** Text 的 bindtags 是 (自己, 'Text', 顶层, 'all')，
+        # 顶层排在 Text 类绑定**之后**，所以在文本框里选一段按 Ctrl+C，
+        # 最后写进剪贴板的是这个回调放的整份 .wv，不是选区 ——
+        # 而旁边那个单选按钮上就写着「可全选手动复制」，界面在邀请一条
+        # 自己堵死的路。整份复制改挂 Ctrl+Shift+C。
+        r.bind("<Control-C>", lambda _: self._copy())
         r.bind("<Control-o>", lambda _: self._open())
 
         self.c_wave.bind("<Configure>", lambda e: self._redraw())
@@ -480,7 +540,7 @@ class WaveGui(object):
         self.c_wave.delete("all")
         self.c_err.delete("all")
         self.status.set("载入中… " + os.path.basename(path))
-        self.prog.set(0.0)
+        self._busy(True)
         q = []
 
         def work():
@@ -507,12 +567,21 @@ class WaveGui(object):
         threading.Thread(target=work, daemon=True).start()
         self._poll(q)
 
+    def _busy(self, on):
+        """载入转圈。只表示「后台线程在跑」这一件事。"""
+        try:
+            if on:
+                self.pb.pack(side="right", padx=(8, 0))
+                self.pb.start(12)
+            else:
+                self.pb.stop()
+                self.pb.pack_forget()
+        except tk.TclError:                             # pragma: no cover
+            pass
+
     def _poll(self, q):
         while q:
             it = q.pop(0)
-            if isinstance(it, float):
-                self.prog.set(it)
-                continue
             if it[0] == "err":
                 # 状态栏只有一行，解析失败的诊断是多行的 —— 全文进文本框，
                 # 否则「切错列」这种一眼能定位的问题只剩一句 IndexError
@@ -520,11 +589,13 @@ class WaveGui(object):
                 self.status.set("载入失败: " + msg.splitlines()[0])
                 self.txt.delete("1.0", "end")
                 self.txt.insert("1.0", "载入失败\n\n" + msg)
-                self.prog.set(0.0)
+                self._busy(False)
                 return
             _, raw, tol = it
+            self._busy(False)
             self.raw = raw
-            self.tol_v.set(tol * 1000.0)
+            with self._mute():
+                self.tol_v.set(tol * 1000.0)
             self.traces = self._build_traces(raw)
             self.ti_v.set(0)
             self._use_trace(0)             # metrics / 候选集在这里面算
@@ -550,11 +621,14 @@ class WaveGui(object):
         tr = self._sub_trace()
         tol = self.tol_v.get() / 1000.0
         core.set_eps(tr, tol)
+        # 强制保留点是一组**x 下标**，对任何列子集都成立 —— 原来这里有个
+        # 「所有列都还在才用」的守卫，后果是：六路里取消任何一列勾选，
+        # spur/事件的强制保留**静默全关**，复选框照样打着勾，点数和字节数
+        # 暴跌，人只会归因于「少了五列」。守卫本身是多余的，删掉。
+        # （代价：保底点按整条记，取消某一列不会减少它们 —— 这条要在界面上写明。）
         forced = []
         if self.force_metrics.get() and self.metrics:
-            names = set(id(s) for s in tr.signals)
-            if all(id(s) in names for s in self.traces[self.ti].signals):
-                forced = list(self.metrics.forced())
+            forced = list(self.metrics.forced())
         return core.reduce_trace(tr, tol, max_points, self.cand, forced,
                                  keep_extrema=self.force_extrema.get(),
                                  check=check)
@@ -637,7 +711,8 @@ class WaveGui(object):
             cb.pack(side="left")
             self.colbtn.append(cb)
         self.s_mp.configure(to=max(10, len(self.cand)))
-        self.mp_v.set(min(len(self.cand), max(50, len(self.cand) // 4)))
+        with self._mute():
+            self.mp_v.set(min(len(self.cand), max(50, len(self.cand) // 4)))
         self.band = self.band_key = None
         self._sync_trace_bar()
         self._zoom_all()
@@ -744,7 +819,8 @@ class WaveGui(object):
                 best, lo = mid, mid + 1
             else:
                 hi = mid - 1
-        self.mp_v.set(best)
+        with self._mute():          # 只是把界面同步到已经二分出来的结果
+            self.mp_v.set(best)
         self._recompute(True)
         if self.nbytes > b:                       # 强制点撑住了，压不下去
             self.status.set(self.status.get() + "  ← 强制保留点撑住了下限")
@@ -777,7 +853,6 @@ class WaveGui(object):
                    core.eng_str(w.rms, w.sig.unit, 3), w.sig.name))
                if w else "误差计算中…",
                self.ms, os.path.basename(tr.source or "")))
-        self.prog.set(min(1.0, self.nbytes / float(b)) if b else 0.0)
 
     def _max_cand(self):
         return getattr(self.args, "max_cand", None) or core.MAX_CAND
@@ -891,7 +966,7 @@ class WaveGui(object):
 
     # ------------------------------------------------------------ 交互
 
-    def _defer(self, _=None):
+    def _defer(self, _=None):  # noqa: D401
         """勾选框：攒一下再算，连点几个只算最后那一次。
 
         一次精确 recompute 在 6 路 20 万点上要两秒多，而且是**同步**跑在 Tk
@@ -903,7 +978,7 @@ class WaveGui(object):
         `recon_error`（六路上 0.4 s / 2.2 s），剩下的 RDP 一分不少，
         先粗后精等于把两秒的活干两遍。
         """
-        if not self.traces:
+        if self._muted or not self.traces:
             return
         on = sum(1 for v in self.cols if v.get())
         self.status.set("重算中…（%d/%d 列）" % (on, len(self.cols)))
@@ -913,17 +988,43 @@ class WaveGui(object):
             DEFER_MS, lambda: (setattr(self, "_precise_job", None),
                                self._recompute(True)))
 
+    @contextlib.contextmanager
+    def _mute(self):
+        """这一段里的 set() 只同步界面，不许回头触发重算。"""
+        old = self._muted
+        self._muted = True
+        try:
+            yield
+        finally:
+            self._muted = old
+
     def _on_slider(self, _=None):
+        if self._muted:
+            return
         self._live()
 
     def _on_tol(self, _=None):
+        if self._muted:
+            return
         self.cand = None            # tol 变了候选集要重来
         tr = self.traces[self.ti] if self.traces else None
         if tr is not None:
             core.set_eps(tr, self.tol_v.get() / 1000.0)
             self.cand = core.predecimate(tr, self.tol_v.get() / 1000.0,
                                          max_cand=self._max_cand())
+            # 候选集变了，点数滑块的上限就得跟着变。原来只在 `_use_trace`
+            # 里配一次：调大 tol -> 候选点变少 -> 滑块量程还停在老的大值上，
+            # 拖到后半程完全没反应；调小 tol -> 候选点变多 -> 拖到头也够不着。
+            self._sync_mp_range()
         self._live()
+
+    def _sync_mp_range(self):
+        """把点数滑块的量程对齐到当前候选集。上限的 10 是兜底值。"""
+        n = len(self.cand) if self.cand else 0
+        self.s_mp.configure(to=max(10, n))
+        if n and self.mp_v.get() > n:
+            with self._mute():
+                self.mp_v.set(n)
 
     def _live(self):
         """拖动时只算抽样误差（O(n) 的精确自检 145k 点要 0.5 s，会卡手）；
@@ -1113,7 +1214,10 @@ class WaveGui(object):
             return
         xf = self._xform(c)
         i0, i1 = fit_view(tr.x, self.view[0], self.view[1])
-        key = (i0, i1, w, id(tr))
+        # 列的基准是**视窗**，不是 fit_view 给的下标区间 —— 后者特意往两边
+        # 各多取一个原始点，拿它当基准的话分箱坐标系比绘图坐标系宽两个点
+        x0, x1 = self.view
+        key = (i0, i1, w, id(tr), x0, x1)
         # `band is None` 也要重算：换视窗的地方都会把 band 置空，但**下标区间可能没变**
         # （视窗缩在相邻两个原始点之间时 fit_view 给的是同一对下标）。
         # 只比 key 的话那一下就会拿着 None 去画。
@@ -1123,11 +1227,10 @@ class WaveGui(object):
             ncol = max(120, min(BAND_COLS, w,
                                 MAX_SEG // max(1, 2 * len(tr.signals))))
             self.band = bin_envelope(tr.x, [s.y for s in tr.signals], i0, i1,
-                                     ncol)
+                                     ncol, x0, x1)
             self.band_key = key
         self._grid(c, xf, w, h)
         ncol = len(self.band[0][0]) if self.band else 0
-        x0, x1 = tr.x[i0], tr.x[i1 - 1]
         for si, s in enumerate(tr.signals):
             lo, hi = self.band[si]
             base, rng, floored = self._yscale(s, lo, hi)
@@ -1151,9 +1254,11 @@ class WaveGui(object):
             # 它比灰带窄了多少（而「窄了多少」正是这一格要回答的问题）。
             # 那就跟灰带用同一种画法：也压成 min/max 带，两条带子直接比宽窄。
             col = COLORS[si % 6]
+            # 画的必须是**量化之后**的值，跟误差格同源（见 q_val）
+            cs = self.red.specs[si]
             vis = [i for i in self.red.kept if i0 <= i < i1]
             if len(vis) > ncol:
-                klo, khi = _kept_band(tr.x, s.y, vis, x0, x1, ncol)
+                klo, khi = _kept_band(tr.x, s.y, vis, x0, x1, ncol, cs)
                 top, bot = [], []
                 for cix in range(ncol):
                     if klo[cix] is None:
@@ -1180,7 +1285,8 @@ class WaveGui(object):
             else:
                 line = []
                 for i in vis:
-                    line += [xf.sx(tr.x[i]), xf.sy((s.y[i] - base) / rng)]
+                    line += [xf.sx(tr.x[i]),
+                             xf.sy((q_val(cs, s.y[i]) - base) / rng)]
                 if len(line) >= 4:
                     c.create_line(line, fill=col, width=1)
             # 图例打的是**纵轴当前的上下限**，不是全局极值 —— 放大之后这两个
@@ -1233,7 +1339,7 @@ class WaveGui(object):
         rows = max(1, int((h - xf.b - top) // 11) - 1)
         for e in vis:
             px = xf.sx(e.x)
-            col = COLORS[(hash(e.col) if e.col else 0) % 6]
+            col = COLORS[_col_index(e.col) % 6]
             c.create_line(px, xf.t, px, h - xf.b, fill=col, dash=(2, 3))
             if not label:
                 continue
@@ -1317,7 +1423,8 @@ class WaveGui(object):
         ncol = max(60, min(BAND_COLS, int(xf.pw)))
         worst = []
         for si, s in enumerate(tr.signals):
-            band = error_band(tr, self.red, si, i0, i1, ncol)
+            band = error_band(tr, self.red, si, i0, i1, ncol,
+                              self.view[0], self.view[1])
             col = COLORS[si % 6]
             top, bot = [], []
             for cix, v in enumerate(band):

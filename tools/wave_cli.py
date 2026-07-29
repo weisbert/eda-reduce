@@ -60,14 +60,18 @@ def _apply_units(tr, decls):
 
 
 def fit_budget(tr, tol, budget, m, forced, cand, max_points=None,
-               keep_offset=True, notes=None):
+               keep_offset=True, notes=None, keep_extrema=True):
     """压到 <= budget 字节。返回 (reduction, text)。
 
     先量一次不限点数的结果，拿到「头部+METRICS+EVENTS」这块固定开销，
     再对 SHAPE 的行数二分——这样只有首尾两次跑完整的 O(n) 重建自检。
+
+    `keep_extrema` 要**透传到每一次** reduce_trace：命令行没有对应的 flag、
+    默认恒为 True，所以以前漏掉它看不出问题；但 GUI 上它是个勾选框，
+    一旦 GUI 改走这条路，漏传就等于那个勾选框静默失效。
     """
     red = core.reduce_trace(tr, tol, max_points, cand, forced,
-                            keep_offset=keep_offset)
+                            keep_offset=keep_offset, keep_extrema=keep_extrema)
     txt = emit.emit(red, m, notes)
     if budget is None or emit.nbytes(txt) <= budget:
         return red, txt
@@ -77,7 +81,8 @@ def fit_budget(tr, tol, budget, m, forced, cand, max_points=None,
     while lo <= hi:
         mid = (lo + hi) // 2
         r = core.reduce_trace(tr, tol, mid, red.cand, forced,
-                              keep_offset=keep_offset, check=False)
+                              keep_offset=keep_offset, check=False,
+                              keep_extrema=keep_extrema)
         if fixed + emit.shape_bytes(r) <= budget:
             best, lo = mid, mid + 1
         else:
@@ -86,7 +91,8 @@ def fit_budget(tr, tol, budget, m, forced, cand, max_points=None,
         best = 2
     for _ in range(12):                      # 收尾核一次真字节数，超了再收一点
         red = core.reduce_trace(tr, tol, best, red.cand, forced,
-                                keep_offset=keep_offset)
+                                keep_offset=keep_offset,
+                                keep_extrema=keep_extrema)
         txt = emit.emit(red, m, notes)
         if emit.nbytes(txt) <= budget or best <= 2:
             break
@@ -96,7 +102,8 @@ def fit_budget(tr, tol, budget, m, forced, cand, max_points=None,
         # 压不进去就**说出来**。强制保留点（spur 峰及其包络、极值、事件）
         # 是不许为了预算牺牲的 —— 牺牲了就等于回到 54x 低报那个坑里。
         red = core.reduce_trace(tr, tol, best, red.cand, forced,
-                                keep_offset=keep_offset)
+                                keep_offset=keep_offset,
+                                keep_extrema=keep_extrema)
         txt = emit.emit(red, m, (notes or []) + [
             "**超预算**：%d > %d 字节。强制保留点有 %d 个（spur/极值/事件，"
             "不许为预算牺牲），已经压到 %d 点还是下不来。"
