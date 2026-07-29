@@ -68,6 +68,9 @@ GRID = "#dcdcdc"
 BAND = "#c8c8c8"
 GATE_BG = "#fdf3e3"       # 出口台：答案区
 GATE_LINE = "#e8791a"
+RAIL_BG = "#fff4e5"       # 内容轨：改这里 = 改要粘走的文本
+RAIL_W = 258
+VIEW_BG = "#eef0f2"       # 视图条：只改这张图
 HINT_BG = "#fffbe6"       # 出路卡：下一步该点哪里
 HINT_LINE = "#e5a50a"
 VCOL = {"ok": "#1a7f37", "warn": "#9a6700", "bad": "#c01c28"}
@@ -335,8 +338,19 @@ class WaveGui(object):
         self.selfcheck_v = tk.StringVar(value="")
         self.hint_v = tk.StringVar(value="")
         self.receipt_v = tk.StringVar(value="")
+        self.actual_v = tk.StringVar(value="")
+        self.winlab_v = tk.StringVar(value="")
+        self.fx_v = tk.StringVar(value="极值")
+        self.fm_v = tk.StringVar(value="spur / 事件")
+        self.maxcand_v = tk.StringVar(
+            value="%d" % (getattr(args, "max_cand", None) or core.MAX_CAND))
         self._copied = None          # (字节数, 那一刻的参数指纹)
         self._autofit_pending = False
+        # 后台压预算的那条线程和主线程改的是**同一批 Block**。两边同时算
+        # 就是数据竞争：实测屏幕上 21332 字节、剪贴板里 20411 字节，
+        # 因为一条线程正把 max_points 清成 None，另一条还按旧值在算。
+        # 所以压预算期间主线程一律不算 —— 转圈已经说清楚在忙什么了。
+        self._fitting = False
         self.tol_v = tk.DoubleVar(value=(args.tol or core.DEFAULT_TOL) * 1000.0)
         self.mp_v = tk.IntVar(value=0)
         b0 = args.budget if args.budget else 0
@@ -462,6 +476,239 @@ class WaveGui(object):
         box.bind("<Configure>", lambda e: self.lab_hint.configure(
             wraplength=max(300, e.width - 10)))
 
+    # ------------------------------------------------------------ 内容轨
+
+    def _rail_group(self, parent, title):
+        """一组可折叠的轨内控件。-> 放东西的那个 body Frame。
+
+        必须可折叠：轨里六组全展开约 620 px，而六路信号时光「搬哪几列」
+        就是六行 —— 实测 880 高的窗口里 ④⑤⑥ 整个掉到屏幕外，
+        和上一版「控件被右边切掉」是同一种病，只是换了个方向。
+        规格里写的滚动 Frame 不做（内外两个 Configure 双向同步 + 滚轮
+        按指针分派 + X11 上子控件未 map 时 bbox 返回 None，坑比收益多），
+        改成折叠：装不下就从 ⑥ 往回收，而且**收了要看得见**。
+        """
+        holder = tk.Frame(parent, bg=RAIL_BG, highlightthickness=1,
+                          highlightbackground="#e8d5b8")
+        holder.pack(fill="x", padx=6, pady=(4, 0))
+        hv = tk.StringVar(value="▾ " + title)
+        head = tk.Label(holder, textvariable=hv, bg=RAIL_BG, fg="#7a4a00",
+                        font=("Consolas", 9, "bold"), anchor="w", cursor="hand2")
+        head.pack(fill="x", padx=4, pady=1)
+        body = tk.Frame(holder, bg=RAIL_BG)
+        body.pack(fill="x", padx=6, pady=(0, 3))
+        grp = {"holder": holder, "body": body, "var": hv, "title": title,
+               "open": True}
+        self._rail_groups.append(grp)
+        head.bind("<Button-1>", lambda _e, g=grp: self._toggle_group(g))
+        return body
+
+    def _toggle_group(self, g, want=None):
+        want = (not g["open"]) if want is None else want
+        if want == g["open"]:
+            return
+        g["open"] = want
+        g["var"].set(("▾ " if want else "▸ ") + g["title"])
+        if want:
+            g["body"].pack(fill="x", padx=6, pady=(0, 3))
+        else:
+            g["body"].pack_forget()
+
+    def _fit_rail(self):
+        """装不下就从 ⑥ 往回折。折叠状态由标题上的 ▸ 说明，不是静默隐藏。"""
+        if not self._rail_groups:
+            return
+        avail = self.rail.winfo_height()
+        if avail < 50:                       # 还没布局好
+            return
+        for g in self._rail_groups:          # 先全展开再重新决定
+            self._toggle_group(g, True)
+        self.root.update_idletasks()
+        for g in reversed(self._rail_groups):
+            need = sum(x["holder"].winfo_reqheight() + 4
+                       for x in self._rail_groups) + 30
+            if need <= avail:
+                break
+            self._toggle_group(g, False)
+            self.root.update_idletasks()
+
+    def _build_rail(self, parent):
+        """左边这一条**全是会改变要粘出去的文本的东西**。
+
+        为什么竖排 + 固定宽度：横着排必然被窗口右边切掉，而且**看不出被切了**
+        —— 上一版六路电流时「解调 / 只压视窗 / EVENTS」整列消失，人只会
+        以为这个版本没有解调。上次的修法是把窗口调宽，没修住（信号一多、
+        名字一长又会溢出）。竖排之后，控件的可见性和信号条数、名字长短
+        彻底解耦，这才是结构性的解。
+        """
+        self._rail_groups = []
+        rail = self.rail = tk.Frame(parent, bg=RAIL_BG, width=RAIL_W)
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)              # 宽度说了算，不让内容撑开
+        rail.bind("<Configure>", lambda _e: self.root.after_idle(self._fit_rail))
+        tk.Frame(rail, bg=GATE_LINE, width=3).place(x=0, y=0, relheight=1.0)
+        tk.Label(rail, text="改这里 = 改变要粘走的文本", bg=RAIL_BG,
+                 fg="#7a4a00", font=("Consolas", 9, "bold")).pack(
+                     anchor="w", padx=10, pady=(6, 0))
+
+        g1 = self._rail_group(rail, "① 搬哪几块")
+        self.tracebar = tk.Frame(g1, bg=RAIL_BG)
+        self.tracebar.pack(fill="x")
+
+        g2 = self._rail_group(rail, "② 搬哪几列")
+        self.colbox = tk.Frame(g2, bg=RAIL_BG)
+        self.colbox.pack(fill="x")
+
+        g3 = self._rail_group(rail, "③ 搬哪一段 x")
+        row = tk.Frame(g3, bg=RAIL_BG)
+        row.pack(fill="x")
+        tk.Radiobutton(row, text="全长", variable=self.win_v, value=False,
+                       bg=RAIL_BG, fg=FG, selectcolor=RAIL_BG,
+                       font=("Consolas", 9),
+                       command=self._remode).pack(side="left")
+        tk.Radiobutton(row, text="只搬一段", variable=self.win_v, value=True,
+                       bg=RAIL_BG, fg=FG, selectcolor=RAIL_BG,
+                       font=("Consolas", 9),
+                       command=self._remode).pack(side="left")
+        tk.Button(g3, text="取当前视窗", font=("Consolas", 9),
+                  command=self._take_window).pack(anchor="w", pady=(2, 0))
+        self.lab_win = tk.Label(g3, textvariable=self.winlab_v, bg=RAIL_BG,
+                                fg="#7a5c00", font=("Consolas", 8),
+                                justify="left", anchor="w", wraplength=230)
+        self.lab_win.pack(fill="x")
+
+        g4 = self._rail_group(rail, "④ 压多细")
+        # 改名：它**从来就不是上限**。RDP 先把保底点整套放进 kept 再判预算
+        # （wave_core 里 `kept = set(brk)` 那一段），所以滑块写 3803、
+        # 实际写出 7082 是常态。叫「上限」是在骗人。
+        tk.Label(g4, text="形状点数（保底点另计）", bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 9)).pack(anchor="w")
+        self.s_mp = tk.Scale(g4, from_=2, to=4000, orient="horizontal",
+                             variable=self.mp_v, length=228, bg=RAIL_BG, fg=FG,
+                             highlightthickness=0, font=("Consolas", 8),
+                             command=self._on_slider)
+        self.s_mp.pack(anchor="w")
+        tk.Label(g4, textvariable=self.actual_v, bg=RAIL_BG, fg="#7a5c00",
+                 font=("Consolas", 8), anchor="w",
+                 justify="left", wraplength=230).pack(fill="x")
+        self.tol_lab = tk.StringVar(value="存储精度 tol (‰)")
+        tk.Label(g4, textvariable=self.tol_lab, bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 9)).pack(anchor="w", pady=(4, 0))
+        self.s_tol = tk.Scale(g4, from_=0.1, to=100.0, resolution=0.1,
+                              orient="horizontal", variable=self.tol_v,
+                              length=228, bg=RAIL_BG, fg=FG, font=("Consolas", 8),
+                              highlightthickness=0, command=self._on_tol)
+        self.s_tol.pack(anchor="w")
+        cc = tk.Frame(g4, bg=RAIL_BG)
+        cc.pack(fill="x", pady=(2, 0))
+        tk.Label(cc, text="候选点上限", bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 9)).pack(side="left")
+        e = tk.Entry(cc, textvariable=self.maxcand_v, width=7, bg="#fff", fg=FG)
+        e.pack(side="left", padx=(4, 2))
+        e.bind("<Return>", lambda _: self._on_maxcand())
+        tk.Button(cc, text="重算", font=("Consolas", 8),
+                  command=self._on_maxcand).pack(side="left")
+
+        g5 = self._rail_group(rail, "⑤ 派生（会改块数）")
+        tk.Checkbutton(g5, text="解调：包络+频率", variable=self.demod_v,
+                       bg=RAIL_BG, fg=FG, selectcolor=RAIL_BG,
+                       font=("Consolas", 9),
+                       command=self._remode).pack(anchor="w")
+        kb = tk.Frame(g5, bg=RAIL_BG)
+        kb.pack(anchor="w")
+        tk.Label(kb, text="代表周期存几个", bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 8)).pack(side="left")
+        self.sp_rep = tk.Spinbox(kb, from_=0, to=12, width=3,
+                                 textvariable=self.nrep_v, command=self._remode)
+        self.sp_rep.pack(side="left", padx=(4, 0))
+        kb2 = tk.Frame(g5, bg=RAIL_BG)
+        kb2.pack(anchor="w")
+        tk.Label(kb2, text="测频跨周期", bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 8)).pack(side="left")
+        self.sp_fspan = tk.Spinbox(kb2, from_=0, to=64, width=3,
+                                   textvariable=self.fspan_v,
+                                   command=self._remode)
+        self.sp_fspan.pack(side="left", padx=(4, 2))
+        tk.Label(kb2, text="0=自动", bg=RAIL_BG, fg="#888",
+                 font=("Consolas", 8)).pack(side="left")
+
+        g6 = self._rail_group(rail, "⑥ 保底点（不为预算牺牲）")
+        tk.Checkbutton(g6, textvariable=self.fx_v, variable=self.force_extrema,
+                       bg=RAIL_BG, fg=FG, selectcolor=RAIL_BG,
+                       font=("Consolas", 9),
+                       command=self._defer).pack(anchor="w")
+        tk.Checkbutton(g6, textvariable=self.fm_v, variable=self.force_metrics,
+                       bg=RAIL_BG, fg=FG, selectcolor=RAIL_BG,
+                       font=("Consolas", 9),
+                       command=self._defer).pack(anchor="w")
+        # 诚实说明：forced 是一组扁平的 x 下标，没有信号归属信息
+        # （metrics 层的 `_forced` 就是个 set），所以取消某一列不会减少它们。
+        tk.Label(g6, text="保底点按整条记 —— 取消某一列不会减少它们",
+                 bg=RAIL_BG, fg="#888", font=("Consolas", 8),
+                 wraplength=230, justify="left").pack(anchor="w")
+
+    def _build_viewbar(self, parent):
+        """这一条里**不许出现任何会改输出的东西，一个都没有**。
+
+        原来「纵轴跟视窗」和「强制保留极值」并排、「波形上标出 EVENTS」
+        和「解调」并排 —— 一个只改眼前这张图，一个改要粘出去的东西，
+        排在同一个视觉分组里，用户没有任何线索区分。
+        """
+        vb = tk.Frame(parent, bg=VIEW_BG)
+        vb.pack(fill="x", pady=(4, 0))
+        tk.Frame(vb, bg="#9aa4ad", width=3).pack(side="left", fill="y")
+        tk.Label(vb, text=" 只改这张图，不改要粘走的文本 ", bg=VIEW_BG,
+                 fg="#4a5560", font=("Consolas", 9, "bold")).pack(side="left")
+        tk.Checkbutton(vb, text="纵轴跟视窗", variable=self.y_local, bg=VIEW_BG,
+                       fg=FG, selectcolor=VIEW_BG, font=("Consolas", 9),
+                       command=self._redraw).pack(side="left", padx=(10, 0))
+        tk.Checkbutton(vb, text="标出 EVENTS", variable=self.ev_v, bg=VIEW_BG,
+                       fg=FG, selectcolor=VIEW_BG, font=("Consolas", 9),
+                       command=self._redraw).pack(side="left", padx=(6, 0))
+        tk.Label(vb, text="│ 下格:", bg=VIEW_BG, fg="#4a5560",
+                 font=("Consolas", 9)).pack(side="left", padx=(8, 0))
+        for val, lab in (("err", "误差"), ("cycles", "代表周期")):
+            tk.Radiobutton(vb, text=lab, variable=self.low_v, value=val,
+                           bg=VIEW_BG, fg=FG, selectcolor=VIEW_BG,
+                           font=("Consolas", 9),
+                           command=self._redraw).pack(side="left")
+        tk.Label(vb, text="│ 文本框:", bg=VIEW_BG, fg="#4a5560",
+                 font=("Consolas", 9)).pack(side="left", padx=(8, 0))
+        tk.Radiobutton(vb, text="METRICS", variable=self.view_full, value=False,
+                       bg=VIEW_BG, fg=FG, selectcolor=VIEW_BG,
+                       font=("Consolas", 9),
+                       command=self._fill_text).pack(side="left")
+        tk.Radiobutton(vb, text="完整 .wv", variable=self.view_full, value=True,
+                       bg=VIEW_BG, fg=FG, selectcolor=VIEW_BG,
+                       font=("Consolas", 9),
+                       command=self._fill_text).pack(side="left")
+
+    def _take_window(self):
+        """把当前视窗**显式提交**成搬运范围。
+
+        为什么不做成「持续跟随视窗」：每次缩放都会触发一次整条重建
+        （切窗口 + analyze + 找周期，几十万点上一两秒），探索阶段没法用。
+        显式提交 + 可反复点 + 不一致时给徽章，三样一起补住「快照语义
+        没人猜得到」这个顾虑。
+        """
+        if not self.view:
+            return
+        self.win_v.set(True)
+        self._remode()
+
+    def _on_maxcand(self):
+        try:
+            n = int(float(self.maxcand_v.get()))
+        except ValueError:
+            self.maxcand_v.set("%d" % self._max_cand())
+            return
+        self.args.max_cand = max(100, n)
+        if self.ship:
+            for b in self.ship.blocks:
+                b.cand = None
+                b.touch()
+        self._on_tol()
+
     # ------------------------------------------------------------ 界面
 
     def _build(self):
@@ -478,115 +725,44 @@ class WaveGui(object):
         self._build_gate(r)
         self._build_hint(r)
 
-        self.c_wave = tk.Canvas(r, bg=BG, height=330, highlightthickness=1,
+        # 主体：左边一条固定宽的「内容轨」，右边视图条 + 两个画布。
+        body = tk.Frame(r, bg=BG)
+        body.pack(fill="both", expand=True, padx=0, pady=0)
+        self._build_rail(body)
+        right = tk.Frame(body, bg=BG)
+        right.pack(side="left", fill="both", expand=True, padx=(6, 8))
+        self._build_viewbar(right)
+
+        self.c_wave = tk.Canvas(right, bg=BG, height=330, highlightthickness=1,
                                 highlightbackground=GRID)
-        self.c_wave.pack(fill="both", expand=True, padx=8, pady=2)
-        self.c_err = tk.Canvas(r, bg=BG, height=180, highlightthickness=1,
+        self.c_wave.pack(fill="both", expand=True, pady=(2, 2))
+        self.c_err = tk.Canvas(right, bg=BG, height=180, highlightthickness=1,
                                highlightbackground=GRID)
-        self.c_err.pack(fill="x", padx=8, pady=2)
-
-        ctl = tk.Frame(r, bg=BG)
-        ctl.pack(fill="x", padx=8, pady=4)
-        tk.Label(ctl, text="max-points", bg=BG, fg=FG).grid(row=0, column=0)
-        self.s_mp = tk.Scale(ctl, from_=2, to=4000, orient="horizontal",
-                             variable=self.mp_v, length=330, bg=BG, fg=FG,
-                             highlightthickness=0, command=self._on_slider)
-        self.s_mp.grid(row=0, column=1, padx=(4, 18))
-        self.tol_lab = tk.StringVar(value="tol (‰)")
-        tk.Label(ctl, textvariable=self.tol_lab, bg=BG,
-                 fg=FG).grid(row=0, column=2)
-        self.s_tol = tk.Scale(ctl, from_=0.1, to=100.0, resolution=0.1,
-                              orient="horizontal", variable=self.tol_v,
-                              length=250, bg=BG, fg=FG, highlightthickness=0,
-                              command=self._on_tol)
-        self.s_tol.grid(row=0, column=3, padx=4)
-        # 预算是整个工具在优化的那个数，必须能在这里改 ——
-        # 20 KB 是「聊天框这条通道」的宽度，换条通道就该跟着变。
-        bb = tk.Frame(ctl, bg=BG)
-        bb.grid(row=1, column=3, sticky="w", pady=(4, 0))
-        tk.Label(bb, text="预算", bg=BG, fg=FG).pack(side="left")
-        e = tk.Entry(bb, textvariable=self.budget_v, width=6, bg="#fff", fg=FG)
-        e.pack(side="left", padx=(4, 2))
-        e.bind("<Return>", lambda _: self._on_budget())
-        e.bind("<FocusOut>", lambda _: self._on_budget())
-        tk.Label(bb, text="KB (0=不限)", bg=BG, fg=FG).pack(side="left")
-        tk.Button(bb, text="自动压到预算", command=self._fit).pack(side="left",
-                                                                  padx=6)
-
-        self.colbox = tk.Frame(ctl, bg=BG)
-        self.colbox.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        fb = tk.Frame(ctl, bg=BG)
-        fb.grid(row=0, column=4, rowspan=2, padx=12)
-        tk.Checkbutton(fb, text="强制保留极值", variable=self.force_extrema,
-                       bg=BG, fg=FG, selectcolor=BG,
-                       command=self._defer).pack(anchor="w")
-        tk.Checkbutton(fb, text="强制保留 spur/事件", variable=self.force_metrics,
-                       bg=BG, fg=FG, selectcolor=BG,
-                       command=self._defer).pack(anchor="w")
-        tk.Checkbutton(fb, text="纵轴跟视窗", variable=self.y_local,
-                       bg=BG, fg=FG, selectcolor=BG,
-                       command=self._redraw).pack(anchor="w")
-        mb = tk.Frame(ctl, bg=BG)
-        mb.grid(row=0, column=5, rowspan=2, padx=12)
-        tk.Checkbutton(mb, text="解调（包络+频率+代表周期）", variable=self.demod_v,
-                       bg=BG, fg=FG, selectcolor=BG,
-                       command=self._remode).pack(anchor="w")
-        tk.Checkbutton(mb, text="只压当前视窗", variable=self.win_v,
-                       bg=BG, fg=FG, selectcolor=BG,
-                       command=self._remode).pack(anchor="w")
-        tk.Checkbutton(mb, text="波形上标出 EVENTS", variable=self.ev_v,
-                       bg=BG, fg=FG, selectcolor=BG,
-                       command=self._redraw).pack(anchor="w")
-        # 解调那一层的两个**取舍**旋钮。tol 管不着它们（tol 只管「算出来的曲线
-        # 存得准不准」），而它们决定「测得准不准」—— 两层精度是叠加的
-        kb = tk.Frame(mb, bg=BG)
-        kb.pack(anchor="w", pady=(2, 0))
-        tk.Label(kb, text="代表周期", bg=BG, fg=FG).pack(side="left")
-        tk.Spinbox(kb, from_=0, to=12, width=3, textvariable=self.nrep_v,
-                   command=self._remode).pack(side="left", padx=(2, 8))
-        tk.Label(kb, text="测频跨周期", bg=BG, fg=FG).pack(side="left")
-        tk.Spinbox(kb, from_=0, to=64, width=3, textvariable=self.fspan_v,
-                   command=self._remode).pack(side="left", padx=2)
-        tk.Label(kb, text="(0=自动)", bg=BG, fg="#888").pack(side="left")
-
-        # 下窗格的工具条。**复制到剪贴板**是这里最重要的一个按钮：
-        # .wv 的归宿就是粘进聊天框，「先另存成文件、再打开、再全选、再复制」
-        # 中间三步纯属多余。
-        tb = tk.Frame(r, bg=BG)
-        tb.pack(fill="x", padx=8, pady=(4, 0))
-        tk.Button(tb, text="打开 CSV…", command=self._open).pack(side="left")
-        self.tracebar = tk.Frame(tb, bg=BG)
-        tk.Button(tb, text="复制全文到剪贴板", command=self._copy).pack(
-            side="left", padx=(8, 2))
-        tk.Button(tb, text="另存 .wv…", command=self._save).pack(side="left")
-        tk.Label(tb, text="  下格:", bg=BG, fg=FG).pack(side="left", padx=(12, 0))
-        for val, lab in (("err", "误差"), ("cycles", "代表周期")):
-            tk.Radiobutton(tb, text=lab, variable=self.low_v, value=val,
-                           bg=BG, fg=FG, selectcolor=BG,
-                           command=self._redraw).pack(side="left")
-        tk.Radiobutton(tb, text="METRICS", variable=self.view_full, value=False,
-                       bg=BG, fg=FG, selectcolor=BG,
-                       command=self._fill_text).pack(side="left", padx=(16, 0))
-        tk.Radiobutton(tb, text="完整 .wv（可全选手动复制）",
-                       variable=self.view_full, value=True, bg=BG, fg=FG,
-                       selectcolor=BG, command=self._fill_text).pack(side="left")
+        self.c_err.pack(fill="x", pady=(0, 2))
 
         # 动作条：复制回执落在这里，**绝不碰出口台** —— 粘贴前最后一眼
         # 永远看得到判据。原来「已复制 N 字节…」会把整条状态栏盖掉。
         act = tk.Frame(r, bg=BG)
         act.pack(fill="x", padx=8, pady=(2, 0))
+        tk.Button(act, text="打开 CSV…", command=self._open).pack(side="left")
+        tk.Button(act, text="复制全文到剪贴板", command=self._copy).pack(
+            side="left", padx=(8, 2))
+        tk.Button(act, text="另存 .wv…", command=self._save).pack(side="left")
+        tk.Label(act, textvariable=self.status, bg=BG, fg="#888",
+                 font=("Consolas", 9), anchor="e").pack(side="right")
         self.lab_receipt = tk.Label(act, textvariable=self.receipt_v, bg=BG,
                                     fg="#666", font=("Consolas", 9),
                                     anchor="w", justify="left")
-        self.lab_receipt.pack(side="left", fill="x", expand=True)
-        tk.Label(act, textvariable=self.status, bg=BG, fg="#888",
-                 font=("Consolas", 9), anchor="e").pack(side="right")
+        self.lab_receipt.pack(side="left", fill="x", expand=True, padx=(12, 0))
 
+        # 文本框**不再和画布抢 expand**。两个都 expand 的话，880 高的窗口里
+        # 各分一半，而这个窗口的主诉是「图看不清」。文本要读全文可以拖大窗口，
+        # 或者用「完整 .wv」那个单选 —— 它默认只占 6 行。
         tf = tk.Frame(r, bg=BG)
-        tf.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        tf.pack(fill="x", padx=8, pady=(2, 8))
         sb = tk.Scrollbar(tf)
         sb.pack(side="right", fill="y")
-        self.txt = tk.Text(tf, height=10, bg="#fafafa", fg=FG,
+        self.txt = tk.Text(tf, height=6, bg="#fafafa", fg=FG,
                            font=("Consolas", 9), wrap="none",
                            yscrollcommand=sb.set)
         self.txt.pack(side="left", fill="both", expand=True)
@@ -718,7 +894,7 @@ class WaveGui(object):
 
     def _recompute(self, precise=True):
         """重算焦点块，其余块用缓存 —— 合计字节因此还能实时。"""
-        if not self.ship or self.blk is None:
+        if not self.ship or self.blk is None or self._fitting:
             return
         # 上一次算了 150 ms 以上就先把「重算中」刷出去。同步的活没法打断，
         # 但**不能让窗口看起来死了** —— 六路 20 万点一次两秒多，
@@ -781,11 +957,23 @@ class WaveGui(object):
             b.cols = [True] * len(tr.signals)
         self.cols = [tk.BooleanVar(value=on) for on in b.cols]
         for k, s in enumerate(tr.signals):
-            cb = tk.Checkbutton(self.colbox, text="c%d %s" % (k + 1, s.name),
-                                variable=self.cols[k], bg=BG, fg=COLORS[k % 6],
-                                selectcolor=BG, command=self._defer)
+            row = tk.Frame(self.colbox, bg=RAIL_BG)
+            row.pack(fill="x")
+            cb = tk.Checkbutton(row, variable=self.cols[k], bg=RAIL_BG,
+                                selectcolor=RAIL_BG, highlightthickness=0,
+                                padx=0, command=self._defer)
             cb.pack(side="left")
-            self.colbtn.append(cb)
+            # 色块，不是彩色文字 —— 彩色文字会被当成图例（「这是给我看
+            # 哪条线是哪个颜色的」），而它其实是**决定 .wv 里有没有这一列**。
+            sw = tk.Canvas(row, width=9, height=9, bg=RAIL_BG,
+                           highlightthickness=0)
+            sw.create_rectangle(0, 0, 9, 9, fill=COLORS[k % 6], outline="")
+            sw.pack(side="left", padx=(0, 4))
+            lab = tk.Label(row, text="c%d %s" % (k + 1, s.name), bg=RAIL_BG,
+                           fg=FG, font=("Consolas", 8), anchor="w",
+                           justify="left", wraplength=195)
+            lab.pack(side="left", fill="x", expand=True)
+            self.colbtn.append(lab)
         self.s_mp.configure(to=max(10, len(b.cand)))
         with self._mute():
             self.mp_v.set(b.max_points)
@@ -814,6 +1002,7 @@ class WaveGui(object):
         v = self.ship.verdict()
         if v.bytes_ok:                       # 本来就装得下，别乱动人家的点数
             return
+        self._fitting = True
         self._busy(True)
         self.status.set("压到预算中…（后台，界面照常能用）")
         ship, keep = self.ship, self.force_extrema.get()
@@ -837,6 +1026,7 @@ class WaveGui(object):
             self.root.after(80, lambda: self._poll_autofit(q, keep))
             return
         kind, exc = q.pop(0)
+        self._fitting = False
         self._busy(False)
         if kind == "err":
             self.status.set("自动压到预算失败：%s" % exc)
@@ -853,23 +1043,94 @@ class WaveGui(object):
         self._redraw()
 
     def _sync_trace_bar(self):
-        """多条 trace 时才显示切换条 —— 单条时它是纯噪音。"""
+        """轨①：每块两列 —— 「搬」是勾选框（改输出），「看」是单选（只改看）。
+
+        分成两列是这一版最重要的一处语义拆分：原来切块这一个动作既换了
+        显示、又把那块的参数冲掉，两件事绑死。现在「看」只挪焦点，
+        「搬」才决定 .wv 里有没有这块。
+        """
         for w in self.tracebar.winfo_children():
             w.destroy()
-        if len(self.traces) < 2:
-            self.tracebar.pack_forget()
+        if not self.ship:
             return
-        self.tracebar.pack(side="left", padx=(16, 0))
-        tk.Label(self.tracebar, text="块", bg=BG, fg=FG).pack(side="left")
-        for i, tr in enumerate(self.traces):
-            name = tr.signals[0].name if tr.signals else "?"
-            tk.Radiobutton(self.tracebar,
-                           text="%d/%d %s" % (i + 1, len(self.traces),
-                                              name.split("(")[0]),
-                           variable=self.ti_v, value=i, bg=BG, fg=FG,
-                           selectcolor=BG,
+        blocks = self.ship.blocks
+        hdr = tk.Frame(self.tracebar, bg=RAIL_BG)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="搬", bg=RAIL_BG, fg="#7a4a00",
+                 font=("Consolas", 8), width=2).pack(side="left")
+        tk.Label(hdr, text="看", bg=RAIL_BG, fg="#4a5560",
+                 font=("Consolas", 8), width=2).pack(side="left")
+        self.inc_v = []
+        for i, b in enumerate(blocks):
+            row = tk.Frame(self.tracebar, bg=RAIL_BG)
+            row.pack(fill="x")
+            var = tk.BooleanVar(value=b.included)
+            self.inc_v.append(var)
+            tk.Checkbutton(row, variable=var, bg=RAIL_BG, selectcolor=RAIL_BG,
+                           highlightthickness=0, padx=0,
+                           command=lambda k=i: self._toggle_block(k)
+                           ).pack(side="left")
+            tk.Radiobutton(row, variable=self.ti_v, value=i, bg=RAIL_BG,
+                           selectcolor=RAIL_BG, highlightthickness=0, padx=0,
                            command=lambda: self._use_trace(self.ti_v.get())
                            ).pack(side="left")
+            tk.Label(row, text="%d/%d %s" % (i + 1, len(blocks), b.label()),
+                     bg=RAIL_BG, fg=FG, font=("Consolas", 8),
+                     anchor="w").pack(side="left", fill="x", expand=True)
+            tk.Label(row, textvariable=self._blk_size_v(i), bg=RAIL_BG,
+                     fg="#7a5c00", font=("Consolas", 8)).pack(side="right")
+
+    def _blk_size_v(self, i):
+        if not hasattr(self, "_bsz"):
+            self._bsz = {}
+        if i not in self._bsz:
+            self._bsz[i] = tk.StringVar(value="")
+        return self._bsz[i]
+
+    def _toggle_block(self, i):
+        """勾掉「搬」= .wv 里真的没有这块。这是 A 类动作。"""
+        if not self.ship:
+            return
+        self.ship.blocks[i].included = self.inc_v[i].get()
+        for b in self.ship.blocks:        # 每块分到的预算变了
+            b.touch()
+        self._defer()
+
+    def _sync_rail_readouts(self):
+        """轨上那几个「实际是多少」的读数。"""
+        if not self.ship:
+            return
+        for i, b in enumerate(self.ship.blocks):
+            v = self._blk_size_v(i)
+            v.set("%.1fKB" % (b.nbytes() / 1024.0) if b.text else "—")
+        b = self.blk
+        if b is not None and b.red is not None:
+            n_forced = len(b.red.forced)
+            n_kept = len(b.red.kept)
+            over = n_kept > (b.max_points or 0)
+            self.actual_v.set(
+                "实际写出 %d 点（保底 %d）%s"
+                % (n_kept, n_forced,
+                   "\n!! 保底点已吃满，拖滑块无效" if over else ""))
+            self.fx_v.set("极值")
+            self.fm_v.set("spur / 事件  %d 点" % n_forced
+                          if self.force_metrics.get() else "spur / 事件")
+        # 搬运范围 vs 视窗：不一致时要说，否则「我看的这段」和「我搬的这段」
+        # 会被当成同一件事
+        tr = self.traces[self.ti] if self.traces else None
+        if self.win_v.get() and tr is not None:
+            self.winlab_v.set("已按视窗切：%s .. %s"
+                              % (core.eng_str(tr.x[0], tr.xunit, 4),
+                                 core.eng_str(tr.x[-1], tr.xunit, 4)))
+        else:
+            self.winlab_v.set("整条都搬")
+        # 解调关着时那两个旋钮是**假的 A 类控件** —— 转了没反应
+        st = "normal" if self.demod_v.get() else "disabled"
+        for w in (self.sp_rep, self.sp_fspan):
+            try:
+                w.configure(state=st)
+            except tk.TclError:                     # pragma: no cover
+                pass
 
     def _fill_text(self):
         self.txt.delete("1.0", "end")
@@ -951,7 +1212,7 @@ class WaveGui(object):
         就对不上。现在整条删掉，走 `Block.compute(fit=True)`，也就是
         命令行走的那一条。
         """
-        if not self.ship or self.blk is None:
+        if not self.ship or self.blk is None or self._fitting:
             return
         b = self.budget()
         if not b:
@@ -1020,6 +1281,7 @@ class WaveGui(object):
         self._draw_budget_bar(v)
         self._sync_hint()
         self._sync_receipt()
+        self._sync_rail_readouts()
         # 自检行：`# recon:` 那一行的原文。粘贴前最后一眼要看到的就是它。
         self.selfcheck_v.set(self._selfcheck_line())
         self.status.set("%d 点  │  RDP %.0f ms  │  %s"
@@ -1266,14 +1528,18 @@ class WaveGui(object):
         if not self.traces:
             return
         tr = self.traces[self.ti]
-        self.tol_lab.set("tol (‰) → 包络" if self.demod_v.get() else "tol (‰)")
+        # 名字**永远叫「存储精度」**。原来解调时它会改叫「tol → 包络」，
+        # 而 tol 从头到尾只管一件事：算出来的曲线存得准不准。
+        # 「包络提得准不准」是另一层（轨⑤那两个旋钮），改名会让人以为
+        # 拖这个滑块能改提取精度。
+        self.tol_lab.set("存储精度 tol (‰)")
         tol = self.tol_v.get() / 1000.0
         for k, s in enumerate(tr.signals):
             if k >= len(self.colbtn):
                 break
             pinned = core.NOISE_K * s.noise > tol * (s.rng or 1.0)
             self.colbtn[k].configure(
-                text="c%d %s%s" % (k + 1, s.name, " ·噪声底钉住" if pinned else ""))
+                text="c%d %s%s" % (k + 1, s.name, "\n·噪声底钉住" if pinned else ""))
 
     # ------------------------------------------------------------ 交互
 
@@ -1289,7 +1555,7 @@ class WaveGui(object):
         `recon_error`（六路上 0.4 s / 2.2 s），剩下的 RDP 一分不少，
         先粗后精等于把两秒的活干两遍。
         """
-        if self._muted or not self.traces:
+        if self._muted or self._fitting or not self.traces:
             return
         on = sum(1 for v in self.cols if v.get())
         self.status.set("重算中…（%d/%d 列）" % (on, len(self.cols)))
@@ -1310,12 +1576,12 @@ class WaveGui(object):
             self._muted = old
 
     def _on_slider(self, _=None):
-        if self._muted:
+        if self._muted or self._fitting:
             return
         self._live()
 
     def _on_tol(self, _=None):
-        if self._muted or not self.ship:
+        if self._muted or self._fitting or not self.ship:
             return
         # tol 是**整份货**的判据，不是某一块的 —— 所以写进 Shipment，
         # 全部块的候选集一起失效。原来只重算了当前块，别的块还留着旧 tol，

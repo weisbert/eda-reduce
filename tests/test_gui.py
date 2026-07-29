@@ -190,6 +190,15 @@ class TestGuiSelftest(unittest.TestCase):
                 break
             time.sleep(0.02)
         self.assertIsNotNone(app.red, "文件没读进来")
+        # 载入后会自动压一次到预算，那一步在后台线程里。等它落定再交给
+        # 测试 —— 否则测的是一个中间态（实测「屏幕字节数 != 剪贴板字节数」
+        # 就是这么来的）。
+        for _ in range(600):
+            root.update()
+            if not app._fitting:
+                break
+            time.sleep(0.02)
+        self.assertFalse(app._fitting, "自动压到预算没落定")
         root.update()
         return root, app
 
@@ -242,6 +251,49 @@ class TestGuiSelftest(unittest.TestCase):
             cli_txt, _ = wave_cli.process(os.path.join(ROOT, "examples", name),
                                           args)
             self.assertEqual(gui, cli_txt, "%s：GUI 和命令行给了不同的答案" % name)
+
+    def test_rail_never_gets_clipped(self):
+        """内容轨里的东西**永远装得下** —— 这是竖排固定宽的全部理由。
+
+        上一版横着排，六路信号时「解调 / 只压视窗 / EVENTS」整列被窗口
+        右边切掉，而且看不出被切了，人只会以为这版没有解调。
+        上次的修法是把窗口调宽，没修住：信号一多、名字一长又会溢出。
+        """
+        import wave_gui
+        root, app = self._app("demo_tran.csv")
+        try:
+            root.update_idletasks()
+            self.assertEqual(app.rail.winfo_width(), wave_gui.RAIL_W,
+                             "轨的宽度被内容撑开了")
+            for g in app._rail_groups:
+                self.assertLessEqual(
+                    g["holder"].winfo_reqwidth(), wave_gui.RAIL_W,
+                    "轨内 %s 需要的宽度超过了轨宽" % g["title"])
+        finally:
+            root.destroy()
+
+    def test_view_bar_has_nothing_that_changes_the_output(self):
+        """视图条里**一个改输出的控件都不许有**。
+
+        判据就是这个：动完之后 .wv 一个字节都不许变。
+        """
+        root, app = self._app("demo_tran.csv")
+        try:
+            before = app.wv_text()
+            app.y_local.set(not app.y_local.get())
+            app._redraw()
+            app.ev_v.set(not app.ev_v.get())
+            app._redraw()
+            app.low_v.set("cycles")
+            app._redraw()
+            app.low_v.set("err")
+            app.view_full.set(True)
+            app._fill_text()
+            root.update()
+            self.assertEqual(app.wv_text(), before,
+                             "视图条里混进了会改输出的控件")
+        finally:
+            root.destroy()
 
     def test_displayed_bytes_are_the_copied_bytes(self):
         """屏幕上那个字节数必须**就是**剪贴板里的字节数。
