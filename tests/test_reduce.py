@@ -241,6 +241,83 @@ class TestShares(unittest.TestCase):
             os.unlink(p)
 
 
+class TestConstantSignals(unittest.TestCase):
+    """恒定信号必须原样还原，而且自检不许说谎。
+
+    这是这个格式里最坏的一类错：数错了，自检还报 `err 0.00%`。
+    百分比除的是量程，而恒定信号的量程是 0。中招的全是最常见的东西 ——
+    vref / vbg、全程为 1 的使能、直接探电源本身。
+    """
+
+    VALS = [("V(vdd_worst)", 0.776),   # 起振 worst-case 角的 VDD
+            ("V(vref)", 0.75), ("V(vbg)", 1.204), ("V(en)", 1.0),
+            ("I(ibias)", 1.5e-3),      # 原来被 100 mA 的步长直接量化成 0
+            ("V(vtiny)", 0.012)]
+
+    def _trace(self):
+        rows = ["time (s)," + ",".join(n for n, _ in self.VALS)]
+        for i in range(50):
+            rows.append("%.10g," % (i * 5e-9)
+                        + ",".join("%.7g" % v for _, v in self.VALS))
+        tr = core.parse_csv("<t>", text="\n".join(rows) + "\n")[0]
+        core.analyze(tr, kind="tran")
+        core.set_eps(tr, core.DEFAULT_TOL)
+        return tr
+
+    def test_constant_round_trips_exactly(self):
+        tr = self._trace()
+        for keep in (True, False):          # --no-offset 也不许错
+            for cs, (name, want) in zip(
+                    core.make_colspec(tr, core.DEFAULT_TOL, keep_offset=keep),
+                    self.VALS):
+                back = cs.from_out(float(cs.txt(want)))
+                self.assertAlmostEqual(
+                    back, want, delta=abs(want) * 1e-4,
+                    msg="keep_offset=%s %s: 真值 %g 存成了 %g"
+                        % (keep, name, want, back))
+
+    def test_quantum_tracks_magnitude_not_a_fixed_grid(self):
+        """量化步长必须跟着量级走。
+
+        量程为 0 时 eps 是 inf，兜底原来给的是常数 1.0 —— 于是不管这条信号
+        是 1.2 V 还是 1.5 mA，步长一律 100 mV。1.5 mA 就这么变成了 0。
+        """
+        tr = self._trace()
+        for cs, (name, want) in zip(core.make_colspec(tr, core.DEFAULT_TOL,
+                                                      keep_offset=False),
+                                    self.VALS):
+            self.assertLess(cs.q_nat, abs(want),
+                            "%s: 量化步长 %g 比信号本身 %g 还大"
+                            % (name, cs.q_nat, want))
+
+    def test_selfcheck_does_not_claim_zero_error_while_being_wrong(self):
+        """`err 0.00%` 只有在**真的**没错时才许出现。"""
+        import re
+        rows = ["time (s)," + ",".join(n for n, _ in self.VALS)]
+        for i in range(50):
+            rows.append("%.10g," % (i * 5e-9)
+                        + ",".join("%.7g" % v for _, v in self.VALS))
+        import os
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            with open(p, "w", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
+            _, txt = C.run_cli([p])
+            for ln in txt.splitlines():
+                m = re.match(r"# c\d+\s+(\S+).*err ([\d.]+)% \((.+?)\)", ln)
+                if not m:
+                    continue
+                name, pct, abs_txt = m.groups()
+                if float(pct) == 0.0:
+                    self.assertRegex(
+                        abs_txt, r"^0(\.0+)? ?[a-zA-Z]*$",
+                        "%s 报 err 0.00%% 却带着 %s 的绝对误差" % (name, abs_txt))
+        finally:
+            os.unlink(p)
+
+
 class TestQuantization(unittest.TestCase):
 
     def test_step_at_most_quarter_eps(self):

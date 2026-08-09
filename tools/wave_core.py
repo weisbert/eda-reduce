@@ -1375,8 +1375,21 @@ def _pick_offset(lo, hi):
     """
     rng = hi - lo
     mid = 0.5 * (lo + hi)
-    if rng <= 0 or mid == 0.0:
+    if mid == 0.0:
         return 0.0
+    if rng <= 0:
+        # 恒定信号：基线**就是**那个值，而且要一分不差地扣，不走下面那条
+        # 「按 10 的幂取整」—— 取整会把 776 mV 写成 800 mV。
+        #
+        # 不这么做的后果实测过，而且是这个格式里最坏的一类错：量程为 0 时
+        # eps 是 inf，量化步长退到一个**跟量级无关**的 100 mV 栅格上，于是
+        #     0.776 V（起振 worst-case 的 VDD）-> 存成 0.8 V
+        #     1.5 mA（偏置电流）              -> 存成 0
+        # 而自检那一行报的是 `err 0.00%` —— 因为百分比除的是零量程。
+        # 数是错的，自检还说完美。中招的全是最常见的东西：vref/vbg、
+        # 全程为 1 的使能、以及直接探电源本身。
+        # 扣成 offset 之后存的是 0，还原回来是精确值，err 也真的是 0。
+        return mid
     g = pow10_floor(abs(mid))
     off = round(mid / g) * g
     if off == 0.0 or abs(off) < 2.0 * rng:
@@ -1422,7 +1435,15 @@ def make_colspec(tr, tol, labels=None, keep_offset=True):
         lo, hi = s.vmin - cs.offset, s.vmax - cs.offset
         rng = hi - lo
         # 量化步长 <= eps/4：抽点误差已经接受了，量化噪声压到它的 1/4 就够
-        eps = s.eps if math.isfinite(s.eps) else (rng or 1.0)
+        # eps 不可用时的兜底要**跟着量级按 tol 走**，跟别处一个语义。
+        # 原来是 `rng or 1.0`：量程为 0 时给 1.0，于是 1.5 mA 的恒定电流
+        # 被 100 mA 的步长量化成 0。只改成量级还不够 —— 0.776 V 会落到
+        # 100 mV 栅格上，存成 0.8 V（差 24 mV，而自检报 0.00%）。
+        # 恒定信号的「量程」是 0，该拿来定精度的是 tol × 量级。
+        # 默认路径下基线已经被 `_pick_offset` 精确扣掉了，这条只在
+        # `--no-offset` 时兜底 —— 那时它是唯一的防线。
+        eps = (s.eps if math.isfinite(s.eps)
+               else (rng or tol * (abs(hi) or abs(lo)) or 1.0))
         cs.q_nat = pow10_floor(QUANT_FRAC * eps) if eps > 0 else 0.0
         e = _cheapest_prefix(max(abs(lo), abs(hi), rng, cs.q_nat), cs.q_nat)
         cs.scale = 10.0 ** (-e)
