@@ -205,6 +205,25 @@ class TestShares(unittest.TestCase):
         self.assertGreater(len(txt.encode("utf-8")), int(51200 * 0.35),
                            "用不完的份额被浪费了，总量远小于预算")
 
+    def test_over_budget_is_always_declared_never_silent(self):
+        """份额可以把货撑到超预算，但**绝不许悄悄超**。
+
+        预算紧 + 块多的时候确实压不进去（5 块光固定开销就 11 KB）。那没关系，
+        契约从来是「压进去**或者**说清楚压不进去」。
+
+        这条特别值得钉，因为它被自己的分配器抹掉过一次：重分份额时把
+        「压不动的块」的预算改成它的实际用量，等于告诉 fit_budget「你没超」，
+        那行 `**超预算**` 就再也不打印了 —— 输出看着干干净净，其实是假的。
+        """
+        for bud in ("8192", "16384", "51200"):
+            for sh in ("raw=90,env=5,freq=5", "raw=10,env=80,freq=10",
+                       "raw=50,env=30,freq=20"):
+                txt = self._run(["--share", sh], budget=bud)
+                if len(txt.encode("utf-8")) > int(bud):
+                    self.assertIn("超预算", txt,
+                                  "预算 %s 份额 %s：出了 %d 字节却没声明"
+                                  % (bud, sh, len(txt.encode("utf-8"))))
+
     def test_bad_share_is_refused_not_guessed(self):
         import os
         import tempfile

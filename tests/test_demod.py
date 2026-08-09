@@ -291,6 +291,34 @@ class TestAutoWindows(unittest.TestCase):
         self.assertEqual(dm.pick_windows(short, 3, 40), [])
         self.assertTrue(dm.pick_windows(cyc, 3, 40), "够门槛了却不挑")
 
+    def test_windows_apply_without_demod_too(self):
+        """「整条画不清楚」跟解调开没开没关系。
+
+        原来挑窗只挂在 `--demod` 里，于是不解调时 2166 周期的起振波形
+        照样整条摊：实测载入即 232 KB / 预算 50 KB，红着进不去，而自动
+        压预算压不动（保底点撑住下限）。它只跟周期多不多、预算够不够有关。
+        """
+        import os
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            rows = ["time (s),V(o) (V)"]
+            t = 0.0
+            while t < 4e-7:
+                a = 0.28 * (1 - math.exp(-(t - 1e-7) / 2e-8)) if t > 1e-7 else 0.0
+                rows.append("%.12g,%.9g"
+                            % (t, 0.3 + a * math.sin(2 * math.pi * 5.03e9 * t)))
+                t += 1e-11
+            with open(p, "w", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
+            _, txt = C.run_cli([p, "--budget", "51200"])       # 没有 --demod
+            self.assertIn("自动挑窗", txt, "不解调时没挑窗")
+            self.assertLessEqual(len(txt.encode("utf-8")), 51200,
+                                 "不解调时没落进预算")
+        finally:
+            os.unlink(p)
+
     def test_every_window_says_why_it_was_picked(self):
         """挑段是工具替人做的判断。判断必须写进 .wv ——
         否则挑错了没人看得出来，而「看不出来」正是这类功能最大的风险。"""
@@ -371,7 +399,10 @@ class TestOneDocument(unittest.TestCase):
         try:
             with open(p, "w", newline="\n") as fh:
                 fh.write("\n".join(rows) + "\n")
-            _, plain = C.run_cli([p, "--budget", "51200"])
+            # 比的是「解调 vs 整条折线」，所以对照组要把自动挑窗关掉 ——
+            # 不关的话对照组自己也被切成几段、也画得清楚了，比的就不是
+            # 这条测试要问的那件事（而且它会显得更小，因为它只覆盖几段）。
+            _, plain = C.run_cli([p, "--budget", "51200", "--windows", "0"])
             _, demod = C.run_cli([p, "--demod", "--budget", "51200"])
             self.assertLess(len(demod.encode("utf-8")),
                             len(plain.encode("utf-8")))

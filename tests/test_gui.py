@@ -185,8 +185,11 @@ class TestGuiSelftest(unittest.TestCase):
         args = wave_cli.build_parser().parse_args([])
         args.budget = budget
         root = tk.Tk()
-        app = wave_gui.WaveGui(root, os.path.join(ROOT, "examples", csv_name),
-                               args)
+        # 绝对路径直接用：振荡类的夹具得临时造（examples/ 里没有带载波的），
+        # 而挑窗 / 份额这些新东西恰恰只在振荡波形上才看得出来。
+        path = csv_name if os.path.isabs(csv_name) else os.path.join(
+            ROOT, "examples", csv_name)
+        app = wave_gui.WaveGui(root, path, args)
         app.c_wave.configure(width=w, height=330)
         for _ in range(400):
             root.update()
@@ -336,6 +339,78 @@ class TestGuiSelftest(unittest.TestCase):
                             "关掉解调之后超预算了：%d" % app.nbytes)
             self.assertLess(abs(app.nbytes - base), 0.05 * base,
                             "拨回来跟载入时差太远：%d -> %d" % (base, app.nbytes))
+        finally:
+            root.destroy()
+
+    def _wait_debounce(self, root, app):
+        for _ in range(80):
+            root.update()
+            time.sleep(0.02)
+        self._settle(root, app)
+
+    def _osc_file(self):
+        """临时造一条起振波形。examples/ 里没有带载波的夹具，而挑窗 / 份额
+        只有在振荡波形上才看得出来（平缓信号既不用挑窗，点数也早就到顶）。"""
+        import math
+        import tempfile
+        rows = ["i /VCO/VDD; tran (I) X,i /VCO/VDD; tran (I) Y"]
+        t = 0.0
+        while t < 4e-7:
+            a = 2e-3 * (1 - math.exp(-(t - 1e-7) / 2e-8)) if t > 1e-7 else 0.0
+            rows.append("%.12g,%.9g"
+                        % (t, 4e-4 + a * math.sin(2 * math.pi * 5.03e9 * t)))
+            t += 1e-11
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        with open(p, "w", newline="\n") as fh:
+            fh.write("\n".join(rows) + "\n")
+        self.addCleanup(os.unlink, p)
+        return p
+
+    def test_share_slider_actually_changes_the_output(self):
+        """份额滑块不许是死的。
+
+        份额只在**压预算**那一步起作用（它定的是每块能用多少字节）。
+        接到 `_live`（fit=False）上的话每块还按自己的 max_points 压，
+        屏幕上一个字节都不变 —— 实测 raw 拖到 20% 和 90%，字节数一模一样。
+        """
+        root, app = self._app(self._osc_file(), budget=16384)
+        try:
+            app.demod_v.set(True)
+            app._remode()
+            self._settle(root, app)
+            got = {}
+            for raw, env in ((10, 80), (90, 5)):
+                app.share_v["raw"].set(raw)
+                app.share_v["env"].set(env)
+                app._on_share()
+                self._wait_debounce(root, app)
+                got[raw] = sum(len(b.red.kept) for b in app.ship.included()
+                               if b.trace.role == "raw" and b.red)
+                self.assertTrue(app.ship.verdict().bytes_ok,
+                                "份额 raw=%d 撑爆了预算" % raw)
+            self.assertGreater(got[90], got[10],
+                               "把份额给原波形，原波形的点数没变多：%s" % got)
+        finally:
+            root.destroy()
+
+    def test_auto_windows_survives_a_mode_toggle(self):
+        """auto 挡不许被开关拨没。
+
+        `win_n_v` 存的是 auto(-1) 时，`_remode` 里 `max(0, get())` 会把它
+        压成 0 —— 勾一下解调，自动挑窗就永久关掉了，而界面上还写着 auto。
+        所以界面上根本不存 -1：载入时就落成它实际会用的那个数。
+        """
+        root, app = self._app("demo_tran.csv", budget=16384)
+        try:
+            self.assertGreaterEqual(app.win_n_v.get(), 0,
+                                    "界面上不该存 auto 这个隐藏档")
+            before = app.win_n_v.get()
+            app.demod_v.set(True)
+            app._remode()
+            self._settle(root, app)
+            self.assertEqual(app.win_n_v.get(), before, "勾解调把挑窗档位改了")
+            self.assertEqual(app.args.windows, before)
         finally:
             root.destroy()
 
@@ -832,6 +907,10 @@ class TestGuiSelftest(unittest.TestCase):
             args = wave_cli.build_parser().parse_args([])
             args.budget = 51200
             args.demod_cycles, args.demod_min = 6, 20
+            # 这条测的是**两个模式开关可逆**，跟自动挑窗无关。挑窗开着的话
+            # 「取消之后 x 还是整条」这个断言问的就不是同一件事了
+            # （挑窗本来就该改 x 跨度）。关掉，让这条只测它要测的。
+            args.windows = 0
             root = tk.Tk()
             try:
                 app = wave_gui.WaveGui(root, p, args)
@@ -842,7 +921,12 @@ class TestGuiSelftest(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertIsNotNone(app.red)
                 full = (app.red.trace.x[0], app.red.trace.x[-1])
-                self.assertEqual(len(app.traces), 1)
+                # 没勾解调时**全都是原波形**（可能已经被自动挑窗切成几段，
+                # 那是分辨率的事，不是内容类型的事）。原来钉「正好一块」，
+                # 挑窗一开就不成立了，而这条测试要守的是「原始 trace 留着、
+                # 勾了能取消」，跟切几段无关。
+                self.assertTrue(all(t.role == "raw" for t in app.traces),
+                                [t.role for t in app.traces])
 
                 app.demod_v.set(True)
                 app._remode()

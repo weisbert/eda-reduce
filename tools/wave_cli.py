@@ -32,13 +32,26 @@ DEFAULT_BUDGET = 20 * 1024
 # 这些只是**默认值**：`--share raw=50,env=30,freq=20`，GUI 上是旋钮。
 DEFAULT_SHARES = {"raw": 0.72, "env": 0.16, "freq": 0.12}
 
-# 每块的下限。份额再小也得装得下头部 + 列声明 + 两三行 SHAPE，
+# 一块的**固定开销**：头部 + 列声明 + notes + METRICS + EVENTS，跟 SHAPE
+# 有几个点无关。实测约 2.4 KB —— 一个只剩 5 个形状点的窗口照样要 2437 字节。
+#
+# 这个数决定「预算最多养得起几块」。不管它的后果实测过：预算 16 KB、
+# 原波形份额 10% 时切出 3 段，每段分到 1622 字节却怎么压都要 2400，
+# 三段全部超支，合计 18890 / 16384 —— 而 SHAPE 总共才 16 个点。
+# 块数本身就是成本，切得越碎，能留给形状的越少。
+BLOCK_OVERHEAD = 2400
+
+# 每块的下限。份额再小也得装得下固定开销 + 两三行 SHAPE，
 # 否则这块出来是个只有头没有身子的壳，比不搬还难读。
-MIN_BLOCK_BYTES = 900
+MIN_BLOCK_BYTES = 1200
 
 # 「这块把份额用满了吗」的判定余量。fit 是二分出来的，落点本来就带
 # 几十字节的颗粒度，卡死等号会把明明吃紧的块判成有余。
 SHARE_SLACK = 64
+
+# 按实测用量重分几轮。每轮一次「脏块重压」，不是整份货重压，所以便宜。
+# 3 轮实测足够收敛；再多也只是在几十字节上抖。
+SHARE_ROUNDS = 3
 
 
 def default_budget():
@@ -239,6 +252,24 @@ def win_count(args):
         return -1
 
 
+AUTO_WINDOWS = 3                 # auto 实际会切几段
+
+
+def split_raw(tr, args):
+    """原波形该不该切窗、切几段。-> [trace, ...]。**解调开不开都走这里。**
+
+    原来这条只挂在 `--demod` 里面，于是不解调时一份 2166 周期的起振波形
+    照样整条摊 —— 实测载入即 232 KB / 预算 50 KB，红着进不去，而
+    `_autofit` 压不动（保底点撑住下限）。可「整条画不清楚」跟解调开没开
+    毫无关系，它只跟「周期多不多、预算够不够」有关。
+    """
+    try:
+        import wave_demod
+    except ImportError:                      # 逃生舱模式：整条留着，别切
+        return [tr]
+    return _split_raw(tr, args, wave_demod)
+
+
 def _split_raw(tr, args, wave_demod):
     """原波形整条装不下时，切成几段**有信息的**窗口。-> [trace, ...]。
 
@@ -260,12 +291,21 @@ def _split_raw(tr, args, wave_demod):
     raw_bytes = args.budget * w.get("raw", 1.0) / (sum(w.values()) or 1.0)
     if raw_bytes / BYTES_PER_PT >= TARGET_PTS_PER_CYCLE * len(cycles):
         return [tr]                          # 整条就够清楚，不用切
-    if n_win < 0:                            # auto：份额够几段就切几段
-        n_win = 3
+    if n_win < 0:                            # auto
+        n_win = AUTO_WINDOWS
+    # **别切出养不起的块。** 每块有 ~2.4 KB 固定开销（头部/列声明/METRICS/
+    # EVENTS/notes），跟形状点数无关。原波形那份份额养不起几块就只切几块 ——
+    # 硬切的结果是每块都超支、合计爆预算，而形状点数反而更少。
+    #
+    # 注意方向：份额小的时候要切的是**更少的段**，不是「干脆不切」。
+    # 不切 = 整条 1497 个周期的极值全是保底点 = 87 KB，比切 1 段还大 34 倍。
+    # 切窗恰恰是让原波形变小的手段，只养得起一段就切一段（那不过是
+    # 工具替你挑了个 --xrange）。
+    n_win = max(1, min(n_win, int(raw_bytes // BLOCK_OVERHEAD)))
     per = raw_bytes / n_win
     cyc = max(4, int(per / BYTES_PER_PT / TARGET_PTS_PER_CYCLE))
     wins = wave_demod.pick_windows(cycles, n_win, cyc)
-    if len(wins) < 2:                        # 挑不出两段就别切，整条更诚实
+    if not wins:                             # 一段都挑不出来才整条留着
         return [tr]
     out = []
     for i, (t0, t1, why) in enumerate(wins):
@@ -306,7 +346,8 @@ def prepare_traces(path, args):
             # 拿整条的极值去定窗口内的容差会差出量级
             core.slice_trace(tr, *args.xrange)
         core.analyze(tr, kind=args.kind, xscale=args.xscale)
-        prepared.extend(demod_traces(tr, args) if args.demod else [tr])
+        prepared.extend(demod_traces(tr, args) if args.demod
+                        else split_raw(tr, args))
     return prepared
 
 
@@ -516,15 +557,54 @@ class Shipment(object):
             out[b] = max(MIN_BLOCK_BYTES, int(self.budget * wt / tot))
         if not spent:
             return out
-        # 第二遍：收回用不完的，摊给顶到上限的
-        hungry = [b for b in inc if spent.get(b, 0) >= out[b] - SHARE_SLACK]
-        surplus = sum(max(0, out[b] - spent.get(b, 0))
-                      for b in inc if b not in hungry)
-        if surplus <= 0 or not hungry:
-            return out
-        hw = sum(w.get(b.trace.role, 1.0) for b in hungry) or 1.0
-        for b in hungry:
-            out[b] += int(surplus * w.get(b.trace.role, 1.0) / hw)
+        # 第二遍：按**第一遍实际用了多少**重新分。三种块要分开待：
+        #
+        #   压不动的  用量 > 份额。固定开销（头部/列声明/METRICS/EVENTS）就
+        #             那么大，份额给少了它也下不来。实测 env 块的底是 6.3 KB，
+        #             给它 5% × 50 KB = 2.5 KB 它照样吐 6.3 KB —— 于是合计
+        #             54270 / 51200 超了，而超的原因跟原波形一点关系都没有。
+        #             这种块按它**实际需要**的记账，别再假装它只占 2.5 KB。
+        #   吃饱的    用量 < 份额。它到自己的自然上限了（包络就那么几个点），
+        #             再给也不会变大。多出来的份额收回来。
+        #   吃紧的    用量 ≈ 份额。剩下的预算全给这些块 —— 它们是唯一能把
+        #             多出来的字节变成分辨率的。
+        #
+        # 不区分这三种的话，「50 KB」要么空着一截，要么被压不动的块顶穿。
+        # 第一步：把**压不动**的块按实际用量记账，剩下的预算给其余块按权重分。
+        # 顺序很关键：先扣掉压不动的，其余块才知道真正还剩多少 —— 哪怕这意味着
+        # 它们要比上一遍**缩**。不这么做的话，压不动的那点超支没人埋单，
+        # 合计就一直是超的（实测 env+freq 超 5 KB，原波形明明还有余量却不缩）。
+        #
+        # 关键：压不动的块**记账**按实际用量（别人才知道还剩多少），但**发给
+        # 它的预算仍是它原来那一份**。发它「你实际用了多少」等于告诉
+        # `fit_budget`「你没超」，那行 `**超预算**` 就再也不会打印 ——
+        # 而「压不进去就说出来」是这个格式的立身之本，被自己的分配器
+        # 悄悄抹掉是最坏的一种回归。两条测试正是钉这个的。
+        fixed = dict((b, spent.get(b, 0)) for b in inc
+                     if spent.get(b, 0) > out[b] + SHARE_SLACK)
+        rest_blocks = [b for b in inc if b not in fixed]
+        if not rest_blocks:
+            return out                       # 全都压不动：原样发，让它们各自声明
+
+        def split(blocks, pot):
+            tw = sum(w.get(b.trace.role, 1.0) for b in blocks) or 1.0
+            return dict((b, max(MIN_BLOCK_BYTES,
+                                int(pot * w.get(b.trace.role, 1.0) / tw)))
+                        for b in blocks)
+
+        alloc = split(rest_blocks, self.budget - sum(fixed.values()))
+        # 第二步：其余块里有**吃饱**的（到自然上限了，再给也不会变大），
+        # 把它们吃不完的收回来给吃紧的。少了这步，「50 KB」里会空着一截。
+        full = dict((b, spent[b]) for b in rest_blocks
+                    if spent.get(b, 0) < alloc[b] - SHARE_SLACK)
+        hungry = [b for b in rest_blocks if b not in full]
+        if full and hungry:
+            alloc.update(full)
+            alloc.update(split(hungry, self.budget - sum(fixed.values())
+                               - sum(full.values())))
+        for b in inc:
+            if b not in fixed:               # 压不动的保持原份额，好让它声明
+                out[b] = max(MIN_BLOCK_BYTES, alloc[b])
         return out
 
     # -------------------------------------------------- 算
@@ -549,20 +629,33 @@ class Shipment(object):
         """
         shares = self.share_map()
         self._compute_pass(shares, check, only, force, fit)
-        if fit and self.budget:
-            # 第二遍：把用不完的份额收回来摊给吃紧的块。不做这一步，
-            # 「50 KB」里会一直空着一截 —— 实测包络只要 0.3 KB 却分到
-            # 8 KB，那 7.7 KB 本可以变成原波形的分辨率。
+        if not (fit and self.budget):
+            return
+        # 再分几轮，每轮都拿**上一轮真实用了多少字节**去重分。
+        #
+        # 为什么必须闭环：一块要多少字节，事前只能估（窗口多宽 × 每周期几个
+        # 点 × 每点几字节），而真实用量由保底点决定 —— 保底点由数据决定，
+        # 估不准。开环估一次的结果实测是 24 组参数里 11 组超预算，而且越给
+        # 原波形份额越超（份额大 -> 窗口宽 -> 保底点多 -> 比给的还多）。
+        # 拿实测值重分就没有这个问题：每轮都在真实数字上收敛。
+        for _ in range(SHARE_ROUNDS):
             spent = dict((b, emit.nbytes(b.text) if b.text else 0)
                          for b in self.included())
             again = self.share_map(spent)
-            grew = [b for b in again if again[b] > shares[b]]
-            if grew:
-                for b in grew:
-                    b.touch()
-                # force=False：只有刚 touch 过的那几块是脏的，其余块的文本
-                # 还在缓存里。第二遍不该把整份货重压一次。
-                self._compute_pass(again, check, only, False, fit)
+            # 变大变小都要重算。只重算变大的那些是上一版的写法，结果是
+            # 「压不动的块超支 -> 别人该缩却没缩 -> 合计一直超预算」。
+            moved = [b for b in again
+                     if abs(again[b] - shares[b]) > SHARE_SLACK]
+            if not moved:
+                break
+            for b in moved:
+                b.touch()
+            # force=False：只有刚 touch 过的那几块是脏的，其余块的文本
+            # 还在缓存里。重分不该把整份货重压一次。
+            self._compute_pass(again, check, only, False, fit)
+            shares = again
+            if self.total_bytes() <= self.budget:
+                break
 
     def _compute_pass(self, shares, check, only, force, fit):
         for b in self.included():

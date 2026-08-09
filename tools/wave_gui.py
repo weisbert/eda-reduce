@@ -388,6 +388,7 @@ class WaveGui(object):
         self.receipt_v = tk.StringVar(value="")
         self.actual_v = tk.StringVar(value="")
         self.mp_lab = tk.StringVar(value="形状点数（保底点另计）")
+        self.share_lab = tk.StringVar(value="预算分给谁（只在有的类型间分）")
         self.demod_lab = tk.StringVar(value="解调：包络+频率（会改块数）")
         self.winlab_v = tk.StringVar(value="")
         self.fx_v = tk.StringVar(value="极值")
@@ -425,6 +426,21 @@ class WaveGui(object):
         self.lane_mode = tk.StringVar(value="unit")
         self.nrep_v = tk.IntVar(value=getattr(args, "demod_cycles", None) or 6)
         self.fspan_v = tk.IntVar(value=getattr(args, "demod_fspan", 0) or 0)
+        # 预算按内容类型分的份额。**只在实际出现的类型之间归一化**，
+        # 所以没解调时原波形自动拿 100%，不用人去把另外两个拨到 0。
+        sh = dict(cli.DEFAULT_SHARES)
+        sh.update(getattr(args, "shares", None) or {})
+        self.share_v = dict(
+            (k, tk.IntVar(value=int(round(v * 100))))
+            for k, v in ((r, sh.get(r, cli.DEFAULT_SHARES[r]))
+                         for r in cli.DEFAULT_SHARES))
+        # 界面上**不设 auto 这个隐藏档**：auto(-1) 在这里就落成它实际会用的
+        # 那个数（3）。理由有二。一是 `max(0, get())` 会把 -1 压成 0 ——
+        # 实测「勾一下解调」就把自动挑窗永久关掉了，而界面上还写着 auto。
+        # 二是 auto 的「装得下就不切」本来就由 `_split_raw` 的两道闸守着
+        # （周期太少不切、整条画得清楚不切），不需要再来一个模式位。
+        n = cli.win_count(args)
+        self.win_n_v = tk.IntVar(value=n if n >= 0 else cli.AUTO_WINDOWS)
         self._build()
         # 没给文件也要能开窗。开窗和选文件是两件事，绑死了不合理 ——
         # 想先看看界面、想换一个文件重来，都不该被逼着先满足一个文件对话框。
@@ -670,6 +686,19 @@ class WaveGui(object):
                                 fg="#7a5c00", font=("Consolas", 8),
                                 justify="left", anchor="w", wraplength=230)
         self.lab_win.pack(fill="x")
+        # 自动挑窗。放在③而不是④：它决定的是**搬哪几段 x**，
+        # 跟「全长 / 只搬一段」是同一个问题的两个答案。
+        aw = tk.Frame(g3, bg=RAIL_BG)
+        aw.pack(fill="x", pady=(3, 0))
+        tk.Label(aw, text="整条画不清时自动切", bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 8)).pack(side="left")
+        tk.Spinbox(aw, from_=0, to=6, width=3, textvariable=self.win_n_v,
+                   command=self._remode).pack(side="left", padx=(4, 2))
+        tk.Label(aw, text="段", bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 8)).pack(side="left")
+        tk.Label(g3, text="  0 = 不切，整条摊（可能 1.8 点/周期）",
+                 bg=RAIL_BG, fg="#8a7a63", font=("Consolas", 8),
+                 anchor="w", justify="left", wraplength=225).pack(fill="x")
 
         g4 = self._rail_group(rail, "④ 压多细")
         # 改名：它**从来就不是上限**。RDP 先把保底点整套放进 kept 再判预算
@@ -694,6 +723,26 @@ class WaveGui(object):
                               width=11, highlightthickness=0,
                               command=self._on_tol)
         self.s_tol.pack(anchor="w")
+        # 预算怎么分给几类内容。**这是「50 KB 装什么」那个问题的旋钮。**
+        # 不给旋钮的话，摊法就是工具替人做的一个看不见的决定；而各类内容的
+        # 胃口差两个数量级（包络 0.3 KB 到顶，原波形给多少要多少），
+        # 摊错了的表现是「SHAPE 画出来不像正弦」，没人会想到是分配的问题。
+        tk.Label(g4, textvariable=self.share_lab, bg=RAIL_BG, fg=FG,
+                 font=("Consolas", 9), anchor="w").pack(fill="x", pady=(4, 0))
+        self.share_rows = {}
+        for role, cn in (("raw", "原波形"), ("env", "包络"), ("freq", "频率")):
+            row = tk.Frame(g4, bg=RAIL_BG)
+            row.pack(fill="x")
+            tk.Label(row, text=cn, bg=RAIL_BG, fg=FG, width=4, anchor="w",
+                     font=("Consolas", 8)).pack(side="left")
+            tk.Scale(row, from_=0, to=100, orient="horizontal", showvalue=0,
+                     variable=self.share_v[role], length=150, bg=RAIL_BG,
+                     fg=FG, highlightthickness=0, width=9,
+                     command=lambda _v: self._on_share()).pack(side="left")
+            lab = tk.Label(row, text="", bg=RAIL_BG, fg="#7a5c00", width=4,
+                           anchor="e", font=("Consolas", 8))
+            lab.pack(side="left")
+            self.share_rows[role] = (row, lab)
         cc = tk.Frame(g4, bg=RAIL_BG)
         cc.pack(fill="x", pady=(2, 0))
         tk.Label(cc, text="候选点上限", bg=RAIL_BG, fg=FG,
@@ -1100,6 +1149,7 @@ class WaveGui(object):
         with self._mute():
             self.mp_v.set(mp if mp is not None else max(2, ncand // 4))
         self.band = self.band_key = None
+        self._sync_share_labels()
         self._sync_trace_bar()
         self._zoom_all()
         self._recompute()
@@ -1601,7 +1651,8 @@ class WaveGui(object):
                 except ValueError:
                     t = tr                     # 窗口里没点：当没切
                 core.analyze(t, kind=self.args.kind, xscale=self.args.xscale)
-            out.extend(self._demod(t) if self.demod_v.get() else [t])
+            out.extend(self._demod(t) if self.demod_v.get()
+                       else cli.split_raw(t, self.args))
         return out
 
     def _rebuild_ship(self, raw):
@@ -1659,6 +1710,11 @@ class WaveGui(object):
                         % ("开" if self.demod_v.get() else "关",
                            "只压当前" if self.win_v.get() else "全长"))
         self.root.update_idletasks()
+        # 挑几段是在**建 trace 的时候**决定的（切窗要在 analyze 之前），
+        # 所以它必须在 _rebuild_ship 之前落进 args，不能等 compute。
+        self.args.windows = max(0, self.win_n_v.get())
+        self.args.shares = dict(
+            (r, max(0, v.get()) / 100.0) for r, v in self.share_v.items())
         self._rebuild_ship(self.raw)
         # 这两个开关**换的是块集合**，字节总数跟着整个变。载入时会自动落到
         # 预算内，这里不落就自相矛盾：实测勾上解调再取消，回到的不是载入时
@@ -1766,6 +1822,49 @@ class WaveGui(object):
             # 拖到后半程完全没反应；调小 tol -> 候选点变多 -> 拖到头也够不着。
             self._sync_mp_range()
         self._live()
+
+    def _on_share(self):
+        """份额动了：整份货的摊法变了，所有块一起失效。
+
+        跟 tol 同理 —— 份额是 **Shipment** 的属性不是块的。只重算当前块的话，
+        屏幕上那个合计字节数和真正粘出去的东西又要对不上。
+        """
+        if self._muted or self._fitting or not self.ship:
+            return
+        self.args.shares = dict(
+            (r, max(0, v.get()) / 100.0) for r, v in self.share_v.items())
+        self._sync_share_labels()
+        # 份额只在**压预算**那一步起作用（它定的是每块能用多少字节），
+        # 所以这里必须重压一次，不能走 `_live` 那条 fit=False 的快路 ——
+        # 走了的话每块还按自己的 max_points 压，屏幕上一个字节都不变，
+        # 滑块看起来是死的。实测拖 raw 20% 和 90%，字节数一模一样。
+        # 走 `_remode` 而不是只 `_fit`：**窗口宽度是按原波形那份份额算出来的**
+        # （份额 / 每周期目标点数 -> 一段留几个周期）。份额改了不重切的话，
+        # 窗口还是按老份额切的那么宽，新份额装不下 —— 实测把原波形从 72%
+        # 拉到 10%，三段窗口一段都压不进去，直接超预算。
+        # 重来一次是 O(n)，所以 debounce；拖滑块的中间值本来也没人看。
+        self.status.set("按新份额重新分…")
+        if self._precise_job:
+            self.root.after_cancel(self._precise_job)
+        self._precise_job = self.root.after(PRECISE_MS, self._remode)
+
+    def _sync_share_labels(self):
+        """每类**实际**拿到百分之几，以及这类现在在不在。
+
+        显示归一化后的数而不是滑块原值：滑块是权重，没解调时只有原波形，
+        「原波形 72」其实拿的是 100% —— 直接把滑块值当百分比读会读错。
+        """
+        present = set()
+        for b in (self.ship.included() if self.ship else []):
+            present.add(b.trace.role)
+        tot = sum(max(0, self.share_v[r].get()) for r in present) or 1
+        for role, (row, lab) in self.share_rows.items():
+            if role in present:
+                lab.configure(
+                    text="%d%%" % round(100.0 * max(0, self.share_v[role].get())
+                                        / tot), fg="#7a5c00")
+            else:
+                lab.configure(text="—", fg="#b0a48f")   # 这份货里没有这类
 
     def _sync_mp_range(self):
         """把点数滑块的量程对齐到当前候选集。上限的 10 是兜底值。"""
