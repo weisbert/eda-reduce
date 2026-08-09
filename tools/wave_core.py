@@ -235,7 +235,8 @@ class Trace(object):
 
     __slots__ = ("source", "xname", "xunit", "xunit_src", "x", "signals",
                  "kind", "kind_src", "xscale", "notes", "warns", "dt_med",
-                 "dt_min", "dt_max", "index", "window", "extra", "picks")
+                 "dt_min", "dt_max", "index", "window", "extra", "picks",
+                 "role", "role_why")
 
     def __init__(self, xname="x", index=0):
         self.source = ""
@@ -259,6 +260,12 @@ class Trace(object):
         # `[CYCLES]` 段是输出里唯一一块**没有任何画面**的东西，
         # 而它恰恰是判断「波形失真没失真」该看的那块
         self.picks = []
+        # 这块**是什么内容**：raw / env / freq。预算按内容类型分份额要用它，
+        # 界面上「搬哪几块」也按它分组。默认 raw —— 没解调时全是原波形。
+        self.role = "raw"
+        # 这块**为什么在这儿**（自动挑窗填：「起振段」「稳态段」…）。
+        # 挑窗是工具替人做的判断，判断必须写进 .wv，否则挑错了没人看得出来。
+        self.role_why = ""
 
     def __len__(self):
         return len(self.x)
@@ -278,6 +285,7 @@ class Trace(object):
         t.picks = list(self.picks)
         t.warns = list(self.warns)
         t.window = self.window
+        t.role, t.role_why = self.role, self.role_why
         t.dt_med, t.dt_min, t.dt_max = self.dt_med, self.dt_min, self.dt_max
         for s in self.signals:
             d = Signal(s.name, s.unit, s.unit_src)

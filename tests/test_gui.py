@@ -786,10 +786,16 @@ class TestGuiSelftest(unittest.TestCase):
                         break
                     time.sleep(0.02)
                 self.assertIsNotNone(app.red)
-                self.assertTrue(app.red.trace.signals[0].name.startswith("env_hi"),
-                                "GUI 没有解调：%s"
-                                % app.red.trace.signals[0].name)
-                self.assertEqual(len(app.traces), 2, "包络块 + 频率块")
+                # 解调是**加的不是顶替的**，所以第一块现在是原波形窗口，
+                # 包络在后面。钉「派生块在不在」，别钉它排第几 ——
+                # 排第几是展示顺序，不是这条测试要守的东西。
+                names = [s.name for tr in app.traces for s in tr.signals]
+                self.assertTrue(any(n.startswith("env_hi") for n in names),
+                                "GUI 没有解调：%s" % names)
+                self.assertTrue(any(n.startswith("f_inst") for n in names),
+                                "少了瞬时频率块：%s" % names)
+                self.assertGreater(len(app.traces), 2,
+                                   "原波形没跟着一起搬：%s" % names)
                 txt = app.wv_text()
                 self.assertIn("[CYCLES]", txt, "代表性周期没跟着复制出来")
                 _, cli = C.run_cli([p, "--demod", "--budget", "51200"])
@@ -840,8 +846,16 @@ class TestGuiSelftest(unittest.TestCase):
 
                 app.demod_v.set(True)
                 app._remode()
-                self.assertEqual(len(app.traces), 2, "包络块 + 频率块")
-                self.assertTrue(app.red.trace.signals[0].name.startswith("env_hi"))
+                # 解调是**加的不是顶替的**：包络 + 频率 + 原波形都在。
+                # 原来钉「正好两块、第一块是 env_hi」，那是「勾了包络就
+                # 只剩包络」的化石。
+                names = [s.name for tr in app.traces for s in tr.signals]
+                self.assertTrue(any(n.startswith("env_hi") for n in names),
+                                "没有包络块：%s" % names)
+                self.assertTrue(any(n.startswith("f_inst") for n in names),
+                                "没有频率块：%s" % names)
+                self.assertGreater(len(app.traces), 2,
+                                   "原波形没跟着一起搬：%s" % names)
                 self.assertIn("[CYCLES]", app.wv_text())
 
                 app.view = (1.5e-7, 1.7e-7)
@@ -916,6 +930,12 @@ class TestGuiSelftest(unittest.TestCase):
                 bare = len(app.c_err.find_all())
                 app.demod_v.set(True)
                 app._remode()
+                root.update()
+                # 解调是**加的不是顶替的**，焦点块现在是原波形窗口，
+                # 代表周期挂在包络块上。切过去再看 —— 用户也是这么做的。
+                env = [i for i, tr in enumerate(app.traces) if tr.picks]
+                self.assertTrue(env, "解调后没有任何一块带代表性周期")
+                app._use_trace(env[0])
                 root.update()
                 self.assertTrue(app.red.trace.picks, "解调后应当有代表性周期")
                 self.assertGreater(len(app.c_err.find_all()), bare,

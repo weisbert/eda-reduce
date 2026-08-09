@@ -21,6 +21,25 @@ import wave_emit as emit                                        # noqa: E402
 
 DEFAULT_BUDGET = 20 * 1024
 
+# 预算按**内容类型**分的默认权重。归一化只在实际出现的类型之间做 ——
+# 没解调时只有 raw，它就拿 100%。
+#
+# 为什么原波形拿大头：包络和瞬时频率是**每周期一个点**的派生量，几百个点
+# 就到头了（实测 2166 个周期的包络 15 个点、频率 109 个点）；原波形是
+# 唯一一个「给多少分辨率就吃多少」的。把预算摊平等于让原波形挨饿，
+# 而那正是「1.8 点/周期、画出来不像正弦」的来源。
+#
+# 这些只是**默认值**：`--share raw=50,env=30,freq=20`，GUI 上是旋钮。
+DEFAULT_SHARES = {"raw": 0.72, "env": 0.16, "freq": 0.12}
+
+# 每块的下限。份额再小也得装得下头部 + 列声明 + 两三行 SHAPE，
+# 否则这块出来是个只有头没有身子的壳，比不搬还难读。
+MIN_BLOCK_BYTES = 900
+
+# 「这块把份额用满了吗」的判定余量。fit 是二分出来的，落点本来就带
+# 几十字节的颗粒度，卡死等号会把明明吃紧的块判成有余。
+SHARE_SLACK = 64
+
 
 def default_budget():
     """20 KB 是**这条通道**的宽度，不是普适真理。
@@ -57,6 +76,36 @@ def _apply_units(tr, decls):
             for i, s in enumerate(tr.signals):
                 if k in ("c%d" % (i + 1), s.name):
                     s.unit, s.unit_src = v, "declared"
+
+
+def parse_shares(decls):
+    """--share raw=50,env=30,freq=20 -> {"raw":0.5, "env":0.3, "freq":0.2}。
+
+    权重不要求加起来是 1：归一化在 `share_map` 里按**实际出现**的类型做。
+    写死成百分比反而会骗人 —— 没解调时只有 raw，raw=50 也还是拿 100%。
+    """
+    if not decls:
+        return None
+    out = {}
+    for item in decls:
+        for part in item.split(","):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k = k.strip().lower()
+            try:
+                w = float(v.strip())
+            except ValueError:
+                raise SystemExit("--share 的权重得是数字：%r" % part.strip())
+            if w < 0:
+                raise SystemExit("--share 的权重不能是负数：%r" % part.strip())
+            out[k] = w
+    unknown = set(out) - set(DEFAULT_SHARES)
+    if unknown:
+        raise SystemExit("--share 不认识的内容类型 %s（认得的是 %s）"
+                         % (", ".join(sorted(unknown)),
+                            ", ".join(sorted(DEFAULT_SHARES))))
+    return out or None
 
 
 def fit_budget(tr, tol, budget, m, forced, cand, max_points=None,
@@ -118,20 +167,126 @@ def _why_tol(tr, tol):
     return "相当于 %s 的容差" % core.eng_str(tol * r, u, 3)
 
 
-def _demod(tr, args):
-    """--demod：把载波解调掉。-> [trace, ...]（不生效就返回 [原 trace]）。
+def demod_traces(tr, args, n_rep=None, fspan=None, min_cycles=None,
+                 strict=True):
+    """--demod 的**唯一**入口：解调 + 留住原波形 + 自动挑窗。
 
     解调必须在 analyze **之后**（要 vmin/vmax/噪声底才切得出周期），
     在 reduce **之前**（后面整条管道都跑在派生信号上）。
+
+    命令行和 GUI 都走这里。上一版两边都调 `wave_demod.apply()`，看着是
+    共用的，其实「解调之外还做什么」各写各的 —— 于是「原波形一起搬」
+    只加进了命令行，GUI 里勾上解调原波形照样消失。共用的必须是**整件事**，
+    不是中间那一步。`n_rep` / `fspan` / `min_cycles` 给了就覆盖 args，
+    GUI 上那几个旋钮是实时的，不在 args 里。
     """
     try:
         import wave_demod
     except ImportError:                          # 逃生舱模式：只有三个文件时
-        raise SystemExit("--demod 需要 tools/wave_demod.py，这份部署里没有")
-    return wave_demod.apply(tr, args.tol or core.DEFAULT_TOL, args.budget,
-                            args.demod_cycles, args.demod_min,
-                            args.kind, args.xscale,
-                            getattr(args, "demod_fspan", 0))
+        if strict:
+            raise SystemExit("--demod 需要 tools/wave_demod.py，这份部署里没有")
+        tr.note("--demod 需要 tools/wave_demod.py，这份部署里没有")
+        return [tr]
+    # 兜底默认值也放在**消费点**。`main()` 里有一段专门补 demod_cycles /
+    # demod_min，但只有命令行走 main —— GUI 和测试都是
+    # `build_parser().parse_args()` 直接来的，那边拿到的是 None，
+    # 一路带到 `len(picks) < n` 就 TypeError。跟 --windows 是同一个坑。
+    if n_rep is None:
+        n_rep = getattr(args, "demod_cycles", None)
+        if n_rep is None:
+            n_rep = wave_demod.N_REPRESENT
+    if min_cycles is None:
+        min_cycles = getattr(args, "demod_min", None) or wave_demod.MIN_CYCLES
+    if fspan is None:
+        fspan = getattr(args, "demod_fspan", 0) or 0
+    out = wave_demod.apply(tr, args.tol or core.DEFAULT_TOL, args.budget,
+                           n_rep, min_cycles, args.kind, args.xscale, fspan)
+    if out == [tr]:                              # 没生效，原样返回
+        return out
+    # **解调是加的，不是顶替的。** 原来这里把原波形整条换掉，于是「勾了包络
+    # 就只剩包络」—— 用户原话「不能同时导出包络+原波形吗」。载波确实是最贵
+    # 的那部分，但贵不等于该由工具替人决定不要：50 KB 装得下包络 + 频率 +
+    # 几十个周期的原波形，那才是「够本地还原 debug 信息」。要不要原波形
+    # 现在是勾选框（Block.included）和份额的事，不是模式的事。
+    return _split_raw(tr, args, wave_demod) + out
+
+
+# 一个原始样点在 SHAPE 里大约占这么多字节（x + 一列 y + 两个分隔）。
+# 只用来把「份额」换算成「窗口能有多宽」，估偏一点无所谓：真正的点数
+# 还是 fit_budget 二分出来的。
+BYTES_PER_PT = 12
+# 一个周期少于这么多点，画出来就不是正弦了。挑窗的目标就是把每个周期
+# 的点数顶到这个数以上 —— 实测整条 2166 周期只有 1.8 点/周期。
+TARGET_PTS_PER_CYCLE = 20
+
+
+def win_count(args):
+    """--windows 归一成整数。-1 = auto（装不下才切），0 = 永不切。
+
+    归一化放在**消费点**而不是只放在 `main()`：GUI 的 args 是
+    `build_parser().parse_args([])` 直接来的，从不经过 main 的后处理，
+    于是那边拿到的还是字符串 "auto"，一比大小就 TypeError。
+    「默认值只在一条路上被规整」是这个代码库里反复出现的坑。
+    """
+    v = getattr(args, "windows", -1)
+    if isinstance(v, int):
+        return v
+    if v is None or str(v).strip().lower() in ("auto", ""):
+        return -1
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _split_raw(tr, args, wave_demod):
+    """原波形整条装不下时，切成几段**有信息的**窗口。-> [trace, ...]。
+
+    这是「50 KB 装什么都行，够本地还原 debug 信息」那条要求的落点。
+    整条 2166 个周期摊 50 KB 是 1.8 点/周期——画出来不像正弦、数不了周期、
+    量不了摆幅，等于这份 SHAPE 白搬。切成 3 段之后每段 25 点/周期。
+
+    只在**确实装不下**时才切：周期数少、或者整条本来就画得清楚，就别动
+    人家的数据。切了一定在 note 里说清挑了哪几段、按什么挑的。
+    """
+    n_win = win_count(args)
+    if n_win == 0 or not args.budget:
+        return [tr]
+    cycles = wave_demod.find_cycles(tr)[0]
+    if len(cycles) < 3 * wave_demod.MIN_CYCLES:
+        return [tr]
+    w = dict(DEFAULT_SHARES)
+    w.update(getattr(args, "shares", None) or {})
+    raw_bytes = args.budget * w.get("raw", 1.0) / (sum(w.values()) or 1.0)
+    if raw_bytes / BYTES_PER_PT >= TARGET_PTS_PER_CYCLE * len(cycles):
+        return [tr]                          # 整条就够清楚，不用切
+    if n_win < 0:                            # auto：份额够几段就切几段
+        n_win = 3
+    per = raw_bytes / n_win
+    cyc = max(4, int(per / BYTES_PER_PT / TARGET_PTS_PER_CYCLE))
+    wins = wave_demod.pick_windows(cycles, n_win, cyc)
+    if len(wins) < 2:                        # 挑不出两段就别切，整条更诚实
+        return [tr]
+    out = []
+    for i, (t0, t1, why) in enumerate(wins):
+        sub = tr.clone()
+        try:
+            core.slice_trace(sub, t0, t1)
+        except ValueError:
+            continue
+        core.analyze(sub, kind=args.kind, xscale=args.xscale)
+        sub.index = tr.index
+        sub.role, sub.role_why = "raw", why
+        sub.note("自动挑窗 %d/%d：%s。整条 %d 个振荡周期摊在 %s 预算上只有 "
+                 "%.1f 点/周期（画出来不像正弦，也数不了周期）；切成 %d 段之后"
+                 "这一段约 %d 点/周期。**挑段是工具替你做的判断** —— "
+                 "不认同就用 --xrange 自己指定，或 --windows 0 关掉整条不切"
+                 % (i + 1, len(wins), why, len(cycles),
+                    core.eng_str(args.budget, "B", 3),
+                    raw_bytes / BYTES_PER_PT / len(cycles), len(wins), cyc and
+                    int(per / BYTES_PER_PT / max(1, cyc))))
+        out.append(sub)
+    return out or [tr]
 
 
 def prepare_traces(path, args):
@@ -151,7 +306,7 @@ def prepare_traces(path, args):
             # 拿整条的极值去定窗口内的容差会差出量级
             core.slice_trace(tr, *args.xrange)
         core.analyze(tr, kind=args.kind, xscale=args.xscale)
-        prepared.extend(_demod(tr, args) if args.demod else [tr])
+        prepared.extend(demod_traces(tr, args) if args.demod else [tr])
     return prepared
 
 
@@ -327,15 +482,50 @@ class Shipment(object):
         return [b for b in self.blocks if b.included]
 
     def per_block_budget(self):
-        """预算怎么摊 —— **只此一处**。
-
-        原来 GUI 自己写了一条二分、命令行写了另一条，两条对同一份数据
-        给不同的点数。摊法是「按块均分」：不完美（各块的固定开销不一样，
-        env 有两列、f_inst 只有一列），但必须和命令行是同一个不完美，
-        不然屏幕和产物又要对不上。顶穿了由界面去说，不在这里偷偷改算法。
-        """
+        """向后兼容的单值摊法。新代码用 `share_map()`。"""
         inc = self.included()
         return (self.budget // len(inc)) if (self.budget and inc) else None
+
+    def share_map(self, spent=None):
+        """-> {block: 这块能用多少字节}。**预算怎么摊只此一处。**
+
+        原来是「按块均分」。均分的毛病在于块的**胃口差着两个数量级**：
+        同一份 50 KB 里，包络 15 个点要 0.3 KB 就够了，而原波形 2166 个
+        振荡周期给多少都不嫌多。均分等于把 1/3 的预算摊给一个只要 1%
+        的块，剩下的 SHAPE 就只有 1.8 点/周期 —— 画出来不像正弦。
+
+        所以按**内容类型**给权重（raw/env/freq），同类型的块再均分。
+        权重是给的，不是猜的：`--share raw=70,env=20,freq=10`，GUI 上是旋钮。
+
+        `spent` 给了就做**第二遍**：上一遍每块实际用了多少字节。用不完的
+        份额收回来，按权重再摊给那些顶到上限的块 —— 否则「50 KB」里
+        永远有一截是空的，而空的那一截本可以变成原波形的分辨率。
+        """
+        inc = self.included()
+        if not self.budget or not inc:
+            return dict((b, None) for b in inc)
+        w = dict(DEFAULT_SHARES)
+        w.update(getattr(self.args, "shares", None) or {})
+        raw_w = [max(0.0, float(w.get(b.trace.role, w.get("raw", 1.0))))
+                 for b in inc]
+        if not sum(raw_w):                       # 全设成 0 就退回均分
+            raw_w = [1.0] * len(inc)
+        tot = sum(raw_w)
+        out = {}
+        for b, wt in zip(inc, raw_w):
+            out[b] = max(MIN_BLOCK_BYTES, int(self.budget * wt / tot))
+        if not spent:
+            return out
+        # 第二遍：收回用不完的，摊给顶到上限的
+        hungry = [b for b in inc if spent.get(b, 0) >= out[b] - SHARE_SLACK]
+        surplus = sum(max(0, out[b] - spent.get(b, 0))
+                      for b in inc if b not in hungry)
+        if surplus <= 0 or not hungry:
+            return out
+        hw = sum(w.get(b.trace.role, 1.0) for b in hungry) or 1.0
+        for b in hungry:
+            out[b] += int(surplus * w.get(b.trace.role, 1.0) / hw)
+        return out
 
     # -------------------------------------------------- 算
 
@@ -357,8 +547,26 @@ class Shipment(object):
         合计字节」的全部秘诀：动的是焦点块，其余块的文本还在缓存里，
         合计只是把几段字符串加起来。
         """
-        per = self.per_block_budget()
+        shares = self.share_map()
+        self._compute_pass(shares, check, only, force, fit)
+        if fit and self.budget:
+            # 第二遍：把用不完的份额收回来摊给吃紧的块。不做这一步，
+            # 「50 KB」里会一直空着一截 —— 实测包络只要 0.3 KB 却分到
+            # 8 KB，那 7.7 KB 本可以变成原波形的分辨率。
+            spent = dict((b, emit.nbytes(b.text) if b.text else 0)
+                         for b in self.included())
+            again = self.share_map(spent)
+            grew = [b for b in again if again[b] > shares[b]]
+            if grew:
+                for b in grew:
+                    b.touch()
+                # force=False：只有刚 touch 过的那几块是脏的，其余块的文本
+                # 还在缓存里。第二遍不该把整份货重压一次。
+                self._compute_pass(again, check, only, False, fit)
+
+    def _compute_pass(self, shares, check, only, force, fit):
         for b in self.included():
+            per = shares.get(b)
             # 精度**不按块降级**。屏幕上那个合计字节数就是复制出去的字节数，
             # 而 `check=False` 出来的文本少一行 `# recon:` —— 只要有一块走了
             # 便宜那条，合计就比真正复制出去的少几十字节，Step 1 想消灭的
@@ -615,6 +823,20 @@ def build_parser():
                                      "「频率被牵引了多少」看不看得见就取决于它")
     p.add_argument("--demod-min", type=int, default=None, dest="demod_min",
                    metavar="N", help="少于这么多周期就不解调（默认 %d）" % 20)
+    p.add_argument("--windows", metavar="N", default="auto",
+                   help="原波形整条画不清楚时，自动切成 N 段有信息的窗口"
+                        "（起振段 / 异常段 / 稳态段）。默认 auto = 装不下才切、"
+                        "切 3 段；0 = 永远不切，整条摊。"
+                        "挑了哪几段、按什么挑的都写进 note —— 不认同就用 "
+                        "--xrange 自己指定")
+    p.add_argument("--share", action="append", metavar="ROLE=W", default=None,
+                   help="预算按内容类型分的权重，可重复或用逗号分隔："
+                        "`--share raw=50,env=30,freq=20`。"
+                        "只在**实际出现**的类型之间归一化，所以没解调时 raw 拿全部。"
+                        "默认 %s。设成 0 = 这类只留一个最小块（要完全不搬用 GUI 的勾选框）。"
+                        "用不完的份额会自动收回来摊给吃紧的块"
+                        % ",".join("%s=%d" % (k, v * 100)
+                                   for k, v in sorted(DEFAULT_SHARES.items())))
     p.add_argument("--no-metrics", action="store_true",
                    help="只出 SHAPE，不跑测量")
     p.add_argument("--no-offset", action="store_true", help="不扣基线")
@@ -654,6 +876,14 @@ def main(argv=None):
                            core.parse_eng(b) if b.strip() else None)
         except ValueError:
             build_parser().error("--xrange 看不懂: %r" % args.xrange)
+    args.shares = parse_shares(args.share)
+    if str(args.windows).strip().lower() not in ("auto", ""):
+        try:                                 # 早报错，别等到跑一半
+            int(args.windows)
+        except (TypeError, ValueError):
+            build_parser().error("--windows 要写成整数或 auto，看不懂: %r"
+                                 % args.windows)
+    args.windows = win_count(args)
     if not args.budget:
         args.budget = None
     # 默认值放在这里而不是 add_argument 里：wave_demod 可能缺席（逃生舱模式），

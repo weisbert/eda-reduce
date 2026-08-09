@@ -249,12 +249,13 @@ def _fill(a, b, w):
     return [(a + i * step, a + (i + 1) * step, None) for i in range(n)]
 
 
-def _derived(tr, xs, cols, index=0):
+def _derived(tr, xs, cols, index=0, role="env"):
     out = core.Trace(tr.xname, index=index)
     out.source = tr.source
     out.xunit, out.xunit_src = tr.xunit, tr.xunit_src
     out.kind, out.kind_src = tr.kind, tr.kind_src
     out.window = tr.window
+    out.role = role
     out.x = array("d", xs)
     for nm, unit, src, col in cols:
         d = core.Signal(nm, unit, src)
@@ -303,7 +304,7 @@ def demod(tr, si=0, min_cycles=MIN_CYCLES, fspan=0):
     fx, fy, m, sd = _freq_trace(cycles, m=fspan)
     if len(fx) >= 2:
         f = _derived(tr, fx, [("f_inst(%s)" % s.name, "Hz", "declared", fy)],
-                     index=tr.index + 1)
+                     index=tr.index + 1, role="freq")
         if m > 1:
             f.note("频率是**跨 %d 个周期**测的（f = %d / (t[k+%d] - t[k])），"
                    "不是逐周期测完再平均：逐周期的插值误差约 %s（1σ）且带系统性拍，"
@@ -398,6 +399,97 @@ def summary(cycles, sig, n_win):
                core.eng_str(min(f) if f else 0.0, "Hz", 5),
                core.eng_str(max(f) if f else 0.0, "Hz", 5),
                100.0 * res, core.eng_str(worst.at, "s", 5)))
+
+
+def _smooth(v, k):
+    """长度 k 的滑动中位。用中位不用均值：squegging 那种深谷是**真信号**，
+    均值会被谷底自己拉下去，于是「偏离趋势多少」永远算不大。"""
+    if k < 3 or len(v) < k:
+        return list(v)
+    h, out = k // 2, []
+    for i in range(len(v)):
+        w = sorted(v[max(0, i - h):min(len(v), i + h + 1)])
+        out.append(w[len(w) // 2])
+    return out
+
+
+def pick_windows(cycles, n_win, cyc_per_win):
+    """挑几段**原始波形**值得整段留下来。-> [(t0, t1, 为什么)]。
+
+    为什么要挑：起振是 2166 个周期 / 2 µs。50 KB 摊在整条上是 1.8 点/周期，
+    画出来不像正弦，也数不了周期、量不了摆幅 —— 这份 SHAPE 谁都用不上。
+    同样 50 KB 摊在 3 段 × 60 个周期上是 25 点/周期，每段都看得清清楚楚。
+    **窗口不是省事，是把分辨率花在有信息的地方。**
+
+    挑的依据全是包络 A[k] = (hi-lo)/2 的形状，三类各挑一段：
+
+      起振段  |dA/dt| 最大处 —— 波形正在长起来，增益和相位都在这儿定
+      异常段  A 偏离自身滑动中位最远处 —— squegging 的谷、跳变、掉幅
+      稳态段  A 最平的一段（取最后一段平的）—— 最终幅度和频率在这儿读
+
+    挑错了怎么办：每段的理由都写进 .wv 的 `# note`，所以「它挑了哪三段、
+    按什么挑的」是明文。看着不对就用 --xrange 自己指定，这条路一直在。
+    """
+    if not cycles or n_win < 1:
+        return []
+    amp = [c.amp for c in cycles]
+    n = len(amp)
+    if n < 3 * MIN_CYCLES:                   # 本来就没几个周期，整条留着就行
+        return []
+    half = max(1, int(cyc_per_win) // 2)
+    trend = _smooth(amp, max(3, n // 12 | 1))
+    span = (max(amp) - min(amp)) or 1.0
+
+    cand = []
+    # 起振：包络斜率最大。按 trend 算，别让单周期噪声抢了冠军
+    d = [abs(trend[i + 1] - trend[i]) for i in range(len(trend) - 1)]
+    if d:
+        k = max(range(len(d)), key=lambda i: d[i])
+        cand.append((k, abs(d[k]) / span * 4.0, "起振段（包络斜率最大）"))
+    # 异常：包络**掉下来**得最狠的地方（相对它自己之前到过的最高点）。
+    #
+    # 原来这里用的是「偏离滑动中位最远」，那个判据在干净的指数起振上会
+    # 误报：起振段包络涨得快，中位滤波跟不上，偏离自然最大 —— 于是挑出来
+    # 的「异常段」和「起振段」是同一段，白占一个窗口。
+    # 真正要找的是 squegging：涨上去又**掉回来**。跌幅这个判据只在
+    # 非单调的地方才响，干净起振上一次都不响（那就只挑两段，也对）。
+    run, drop = amp[0], []
+    for v in trend:
+        run = max(run, v)
+        drop.append(run - v)
+    k = max(range(n), key=lambda i: drop[i])
+    if drop[k] > 0.10 * span:
+        cand.append((k, drop[k] / span, "异常段（包络掉幅最大，疑似 squegging）"))
+    # 稳态：趋势最平的一段,**只在最后三分之一里找**。
+    #
+    # 不限定范围的话,squegging 那个谷底也是「平」的,而且往往比真稳态还平
+    # ——实测掉幅波形上稳态窗被谷底抢走,于是「最终幅度和频率是多少」
+    # 这个最该读的地方反而没进 .wv。稳态按定义就是**末态**,限定在末段
+    # 既符合语义,也把这次抢占堵死。
+    lo = max(half, int(n * 2 / 3))
+    flat, best = None, None
+    for i in range(lo, n - half):
+        w = trend[i - half:i + half + 1]
+        r = max(w) - min(w)
+        if best is None or r <= best * 1.02:   # <= ：并列时取更靠后的
+            best, flat = r, i
+    if flat is not None:
+        cand.append((flat, 0.5, "稳态段（末段包络最平）"))
+
+    out, used = [], []
+    for k, score, why in sorted(cand, key=lambda t: -t[1]):
+        # 贴着头尾时**整段往里挪**，不是截短。截短的话起振段（永远靠前）
+        # 拿到的窗口只有该有的一半，那半份预算既没用上、也没换成分辨率。
+        i0 = max(0, min(k - half, n - 1 - 2 * half))
+        i1 = min(n - 1, i0 + 2 * half)
+        if any(not (i1 < a or i0 > b) for a, b in used):
+            continue                          # 跟已挑的重叠，跳过
+        used.append((i0, i1))
+        out.append((cycles[i0].t0, cycles[i1].t1, why))
+        if len(out) >= n_win:
+            break
+    out.sort(key=lambda w: w[0])
+    return out
 
 
 def pick_representative(cycles, n=N_REPRESENT):

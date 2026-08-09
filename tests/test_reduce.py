@@ -6,6 +6,7 @@
 """
 
 import math
+import re
 import unittest
 
 import _common as C
@@ -109,6 +110,116 @@ class TestBudget(unittest.TestCase):
         for s in tr.signals:
             self.assertIn(s.vmin_at, red.kept)
             self.assertIn(s.vmax_at, red.kept)
+
+
+def _osc_csv(path, t_end=4e-7, f=5.03e9, dc=4e-4, amp=2e-3, tau=2e-8):
+    """起振电流的样子：直流 + 起振包络 × 载波。写成 ViVA X/Y 列对。"""
+    rows = ["i /VCO/VDD; tran (I) X,i /VCO/VDD; tran (I) Y"]
+    t = 0.0
+    while t < t_end:
+        a = amp * (1 - math.exp(-(t - 1e-7) / tau)) if t > 1e-7 else 0.0
+        rows.append("%.12g,%.9g" % (t, dc + a * math.sin(2 * math.pi * f * t)))
+        t += 1e-11
+    with open(path, "w", newline="\n") as fh:
+        fh.write("\n".join(rows) + "\n")
+    return path
+
+
+class TestShares(unittest.TestCase):
+    """预算按内容类型分份额。「50 KB 装什么都行，够还原 debug 信息」。"""
+
+    def _run(self, extra, budget="51200"):
+        import os
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            _osc_csv(p)
+            rc, txt = C.run_cli([p, "--demod", "--budget", budget] + extra)
+            self.assertEqual(rc, 0, txt[:400])
+            return txt
+        finally:
+            os.unlink(p)
+
+    def _pts(self, txt, tag):
+        """某个派生块保留了多少点。拿 `# WV1 ... N -> M pts` 那一行数。"""
+        blocks = ("\n" + txt).split("\n# WV1")
+        for b in blocks:
+            if tag in b:
+                m = re.search(r"-> (\d+) pts", b)
+                if m:
+                    return int(m.group(1))
+        return None
+
+    def test_share_moves_points_between_content_types(self):
+        """把份额给谁，点数就长在谁身上 —— 否则这个旋钮是假的。
+
+        预算得选在**卡得住**的区间：50 KB 下包络早就到了它的自然上限
+        （1697 个包络点 RDP 到 353 就不再增加，再多字节也买不到点），
+        两种份额都是 353，测不出差别。16 KB 下是 13 vs 353。
+        """
+        few = self._run(["--share", "raw=90,env=2,freq=8"], budget="16384")
+        many = self._run(["--share", "raw=10,env=80,freq=10"], budget="16384")
+        self.assertLess(self._pts(few, "env_hi("), self._pts(many, "env_hi("),
+                        "给包络加份额，包络的点数没变多")
+
+    def test_share_map_is_proportional(self):
+        """摊法本身：权重之比就是字节之比（只在出现的类型之间归一化）。"""
+        import os
+        import tempfile
+        import wave_cli
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            _osc_csv(p)
+            args = wave_cli.build_parser().parse_args(
+                [p, "--demod", "--budget", "51200",
+                 "--share", "raw=60,env=30,freq=10"])
+            args.shares = wave_cli.parse_shares(args.share)
+            args.windows = 0                     # 不切窗，好数 raw 只有一块
+            ship = wave_cli.plan(wave_cli.prepare_traces(p, args), args)
+            by = {}
+            for b, n in ship.share_map().items():
+                by[b.trace.role] = by.get(b.trace.role, 0) + n
+            self.assertAlmostEqual(by["raw"] / float(by["env"]), 2.0, delta=0.1)
+            self.assertAlmostEqual(by["env"] / float(by["freq"]), 3.0, delta=0.2)
+        finally:
+            os.unlink(p)
+
+    def test_total_still_inside_budget_whatever_the_shares(self):
+        """份额怎么分都不许超预算 —— 超了就粘不进聊天框，功能就没了。"""
+        for sh in ("raw=90,env=5,freq=5", "raw=10,env=80,freq=10",
+                   "raw=34,env=33,freq=33"):
+            txt = self._run(["--share", sh])
+            self.assertLessEqual(len(txt.encode("utf-8")), 51200,
+                                 "份额 %s 撑爆了预算" % sh)
+
+    def test_unused_share_is_handed_back_not_stranded(self):
+        """用不完的份额要收回来摊给吃紧的块。
+
+        包络 15 个点只要 0.3 KB，却按份额分到 8 KB。不收回来，「50 KB」
+        里就永远空着一截，而那一截本可以变成原波形的分辨率。
+        """
+        txt = self._run(["--share", "raw=20,env=75,freq=5"])
+        # 包络吃不下 75%，剩下的必须流到别处 —— 总量得明显超过它自己那一份
+        self.assertGreater(len(txt.encode("utf-8")), int(51200 * 0.35),
+                           "用不完的份额被浪费了，总量远小于预算")
+
+    def test_bad_share_is_refused_not_guessed(self):
+        import os
+        import tempfile
+        import wave_cli
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            _osc_csv(p, t_end=5e-8)
+            for bad in (["--share", "raw=abc"], ["--share", "nosuch=50"],
+                        ["--share", "raw=-3"]):
+                with self.assertRaises(SystemExit):
+                    a = wave_cli.build_parser().parse_args([p] + bad)
+                    wave_cli.parse_shares(a.share)
+        finally:
+            os.unlink(p)
 
 
 class TestQuantization(unittest.TestCase):

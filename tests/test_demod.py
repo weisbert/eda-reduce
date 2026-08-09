@@ -239,6 +239,88 @@ class TestFreqSpan(unittest.TestCase):
                         "测频跨度没传下去 / 没声明")
 
 
+class TestAutoWindows(unittest.TestCase):
+    """自动挑窗：整条画不清楚时，把分辨率花在有信息的几段上。"""
+
+    def test_clean_startup_picks_ramp_and_steady(self):
+        """干净起振挑「起振段 + 稳态段」，**不该**挑出异常段。
+
+        判据用「包络掉幅」而不是「偏离滑动中位」正是为了这个：单调上升的
+        包络会让中位滤波一直落后，偏离最大处就是起振段本身，于是挑出来的
+        「异常段」和「起振段」是同一段，白占一个窗口。
+        """
+        cyc, _ = dm.find_cycles(osc())
+        wins = dm.pick_windows(cyc, 3, 40)
+        why = " ".join(w[2] for w in wins)
+        self.assertIn("起振段", why)
+        self.assertIn("稳态段", why)
+        self.assertNotIn("异常段", why, "干净起振上误报了异常段：%s" % why)
+
+    def test_squegging_dip_is_picked(self):
+        """包络掉下去又回来（squegging）必须被挑出来 —— 那是要 debug 的东西。"""
+        cyc, _ = dm.find_cycles(osc(squeg=0.6))
+        wins = dm.pick_windows(cyc, 3, 40)
+        self.assertIn("异常段", " ".join(w[2] for w in wins))
+
+    def test_windows_do_not_overlap_and_are_sorted(self):
+        cyc, _ = dm.find_cycles(osc(squeg=0.6))
+        wins = dm.pick_windows(cyc, 3, 40)
+        self.assertGreaterEqual(len(wins), 2)
+        for a, b in zip(wins, wins[1:]):
+            self.assertLessEqual(a[1], b[0], "窗口重叠或没排序：%s" % (wins,))
+
+    def test_steady_window_lands_in_the_last_third(self):
+        """稳态按定义是**末态**。不限定范围的话，squegging 的谷底也「平」，
+        会把稳态窗抢走 —— 而「最终幅度/频率是多少」恰恰是最该读的。"""
+        cyc, _ = dm.find_cycles(osc(squeg=0.6))
+        wins = dm.pick_windows(cyc, 3, 40)
+        end = cyc[-1].t1
+        for t0, t1, why in wins:
+            if "稳态段" in why:
+                self.assertGreater(t0, 0.5 * end,
+                                   "稳态窗落在了 %g，整条到 %g" % (t0, end))
+                break
+        else:
+            self.fail("没挑出稳态段：%s" % [w[2] for w in wins])
+
+    def test_too_few_cycles_means_no_windows(self):
+        """周期本来就没几个时别切 —— 整条留着更诚实，也画得下。"""
+        self.assertEqual(dm.pick_windows([], 3, 40), [])
+        cyc, _ = dm.find_cycles(osc())
+        short = cyc[:3 * dm.MIN_CYCLES - 1]      # 差一个就够门槛
+        self.assertEqual(dm.pick_windows(short, 3, 40), [])
+        self.assertTrue(dm.pick_windows(cyc, 3, 40), "够门槛了却不挑")
+
+    def test_every_window_says_why_it_was_picked(self):
+        """挑段是工具替人做的判断。判断必须写进 .wv ——
+        否则挑错了没人看得出来，而「看不出来」正是这类功能最大的风险。"""
+        import os
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            rows = ["time (s),V(o) (V)"]
+            t = 0.0
+            while t < 4e-7:
+                a = 0.28 * (1 - math.exp(-(t - 1e-7) / 2e-8)) if t > 1e-7 else 0.0
+                rows.append("%.12g,%.9g"
+                            % (t, 0.3 + a * math.sin(2 * math.pi * 5.03e9 * t)))
+                t += 1e-11
+            with open(p, "w", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
+            _, txt = C.run_cli([p, "--demod", "--budget", "51200"])
+            self.assertIn("自动挑窗", txt, "切了窗却没说")
+            self.assertIn("--xrange", txt, "没告诉人怎么自己指定")
+            n = txt.count("自动挑窗")
+            self.assertGreaterEqual(n, 2)
+            # 关掉就该一段都不切
+            _, off = C.run_cli([p, "--demod", "--budget", "51200",
+                                "--windows", "0"])
+            self.assertNotIn("自动挑窗", off, "--windows 0 没关掉挑窗")
+        finally:
+            os.unlink(p)
+
+
 class TestOneDocument(unittest.TestCase):
     """一键复制是硬要求：四件东西必须在**同一份** .wv 里。"""
 
@@ -259,7 +341,13 @@ class TestOneDocument(unittest.TestCase):
                 fh.write("\n".join(rows) + "\n")
             rc, txt = C.run_cli([p, "--demod", "--budget", "51200"])
             self.assertEqual(rc, 0)
-            self.assertEqual(txt.count("[SHAPE]"), 2, "包络块 + 频率块")
+            # 解调**是加的不是顶替的**：一份 .wv 里同时有原波形、包络、
+            # 瞬时频率、代表周期。原来这里钉的是「正好两块」（包络+频率），
+            # 那是「勾了包络就只剩包络」的化石 —— 用户要的恰恰是都要。
+            self.assertIn("env_hi(", txt, "没有包络块")
+            self.assertIn("f_inst(", txt, "没有瞬时频率块")
+            self.assertGreaterEqual(txt.count("[SHAPE]"), 3,
+                                    "原波形块没跟着一起搬")
             self.assertEqual(txt.count("[CYCLES]"), 1)
             self.assertIn("[METRICS]", txt)
             self.assertIn("解调：", txt)
@@ -287,9 +375,19 @@ class TestOneDocument(unittest.TestCase):
             _, demod = C.run_cli([p, "--demod", "--budget", "51200"])
             self.assertLess(len(demod.encode("utf-8")),
                             len(plain.encode("utf-8")))
-            # 折线在这个预算下必然报出「点/周期不够」，解调不该报
-            self.assertIn("点/周期", plain)
-            self.assertNotIn("点/周期", demod)
+            # 折线在这个预算下必然报出「点/周期不够」，解调不该报。
+            #
+            # 按**行**判而不是按子串判：自动挑窗的 note 里也会出现「点/周期」
+            # （「整条只有 2.1 点/周期，切成 2 段之后约 20 点/周期」），
+            # 那是解释为什么切窗，正好是这条警告的**反面**。
+            # 按子串判会把解释当成警告 —— 实测就是这么误报的。
+            def aliased(txt):
+                return [ln for ln in txt.splitlines()
+                        if ln.startswith("# WARN") and "点/周期" in ln]
+
+            self.assertTrue(aliased(plain), "折线本该报点/周期不够")
+            self.assertFalse(aliased(demod),
+                             "解调之后还在报混叠：%s" % aliased(demod))
         finally:
             os.unlink(p)
 

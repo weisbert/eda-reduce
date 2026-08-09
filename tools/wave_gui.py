@@ -1674,22 +1674,19 @@ class WaveGui(object):
 
         上一轮 `--xrange` / `--max-cand` 是分别接进两边的，结果 `--demod` 只接了
         命令行，GUI 静默忽略——用户拿 `--gui --demod` 开窗，看到的还是原始波形，
-        而且没有任何提示。同一个功能有两个入口就迟早分叉，所以现在共用
-        `wave_demod.apply()`。
+        而且没有任何提示。
+
+        共用的必须是**整件事**，不是中间那一步。上一版两边都调
+        `wave_demod.apply()`，看着共用，其实「解调之外还做什么」各写各的：
+        「原波形一起搬」「自动挑窗」只加进了命令行，GUI 里勾上解调原波形
+        照样消失。所以现在整条走 `wave_cli.demod_traces()`。
         """
         # 要不要解调由**调用方**（窗口里那个勾）决定，不再看 args.demod ——
         # 留着那个早退会让命令行开关把界面开关按死，勾了也没反应
-        try:
-            import wave_demod
-        except ImportError:
-            tr.note("--demod 需要 tools/wave_demod.py，这份部署里没有")
-            return [tr]
-        tol = self.args.tol or core.DEFAULT_TOL
-        return wave_demod.apply(tr, tol, self.args.budget,
-                                max(0, self.nrep_v.get()),
-                                getattr(self.args, "demod_min", None) or 20,
-                                self.args.kind, self.args.xscale,
-                                max(0, self.fspan_v.get()))
+        return cli.demod_traces(tr, self.args,
+                                n_rep=max(0, self.nrep_v.get()),
+                                fspan=max(0, self.fspan_v.get()),
+                                strict=False)
 
     def _sync_eps_marks(self):
         """在每个列选框上标出**这一列的 eps 是谁定的**。
