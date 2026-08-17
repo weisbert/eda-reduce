@@ -21,6 +21,7 @@ EDA_REDUCE_GUI_TEST=1 python -m unittest discover -s tests   # 加上会弹窗�
 | `test_regression.py` | `examples/demo_*.wv` 逐字节基线 + 生成器确定性 |
 | `test_gui.py` | GUI 无人值守自检（默认跳过）+ 不碰 Tk 的纯计算部分 |
 | `test_deploy.py` | **真打包、真解开、真跑 bootstrap.sh**：默认装当前目录、自吃自守卫、CRLF、export-subst、增量更新与失败回滚、依赖哈希闸、glibc 审计闸 |
+| `test_drawio.py` | `.drawio ⇄ .rd` 来回：**`.rd` 是定点**、被保住的样式 key、标签转义、几何反解；装了 draw.io 还会**真渲染逐像素比** |
 
 ## 几条不太一样的地方
 
@@ -35,6 +36,13 @@ EDA_REDUCE_GUI_TEST=1 python -m unittest discover -s tests   # 加上会弹窗�
 **spur 那一组有反证。** `test_without_protection_spurs_are_lost` 关掉 metrics
 再跑一遍，证明三根 spur 会丢掉两根。它存在的意义是让「保护规则值多少」有个数——
 以后谁想简化抽点逻辑，能看见代价。
+
+**drawio 那组的主心骨是「定点」。** `reduce(expand(reduce(x))) == reduce(x)`
+一句话同时守住「reduce 丢了什么」和「expand 猜错了什么」，还不用装东西、不用渲染。
+它唯一管不住的是**两边一致地认错同一个 drawio 默认值**——绕一圈仍然自洽。
+这一类只有真渲染能抓，所以 `TestRenderedPixels` 存在：装了 draw.io 就出两张 PNG 逐点比，
+断言是**零差异**（先把明确单向的下标从原图里去掉，免得阈值随字体飘）。
+`rounded` / `jettySize` / `text;` 三个坑都是这么抓出来的，不是读文档读出来的。
 
 **「说出来了没有」也是断言。** 脏数据被处理了要进 notes、
 容差带比噪声窄要说测不了、压不进预算要声明、截断了事件要报总数。

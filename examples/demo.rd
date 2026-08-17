@@ -1,22 +1,25 @@
 # demo.drawio
 
 ## page demo  vertices=18 edges=16
-## V 图元 | T 文本 | J 结点 | W 连线
+## P 页面 | V 图元 | T 文本 | J 结点 | W 连线
 ## 端点  id:x,y=接在图元上 | @x,y=悬空或折点 | id:?=无约束点 | ~=近似(未做perimeter投影)
+
+P "demo"  850x1100
 
 ## styles
 S1   x1   electrical.transistors.pmos flipH=1
 S2   x1   electrical.transistors.pmos
 S3   x2   electrical.transistors.nmos
 S4   x1   electrical.transistors.nmos flipH=1
-S5   x2   electrical.signal_sources.vss2 flipV=1 fontSize=18
+S5   x2   electrical.signal_sources.vss2 align=center flipV=1 fontSize=18 verticalAlign=top verticalLabelPosition=bottom
 S6   x1   electrical.capacitors.capacitor_2 direction=south
-S7   x6   fillColor=none strokeColor=none text
-S8   x1   fillColor=#dae8fc strokeColor=#6c8ebf
-S9   x1   fillColor=#d5e8d4 rounded=1 strokeColor=#82b366
-E1   x1   endArrow=none
-E2   x14  endArrow=none endFill=0
-E3   x1   endArrow=classic strokeWidth=2
+S7   x5   text align=center fillColor=none strokeColor=none verticalAlign=middle
+S8   x1   fillColor=#dae8fc rounded=0 strokeColor=#6c8ebf whiteSpace=wrap
+S9   x1   fillColor=#d5e8d4 rounded=1 strokeColor=#82b366 whiteSpace=wrap
+S10  x1   text align=left fillColor=none strokeColor=none verticalAlign=middle
+E1   x1   endArrow=none rounded=0
+E2   x14  edgeStyle=orthogonalEdgeStyle endArrow=none endFill=0 rounded=0
+E3   x1   edgeStyle=orthogonalEdgeStyle endArrow=classic rounded=0 strokeWidth=2
 
 ## cells
 V 3    S1  200,180,50,40
@@ -36,7 +39,7 @@ T 33   S7  145,340,30,30  "x4"
 T 34   S7  570,345,80,30  "*CL=2pF*"
 V 40   S8  150,560,140,60  "BIAS GEN"
 V 41   S9  400,560,140,60  "*OTA CORE*"
-T 42   S7  150,650,240,30  "色标: 蓝=VDD_1V8, 绿=VDD_3V3"
+T 42   S10 150,650,240,30  "色标: 蓝=VDD_1V8, 绿=VDD_3V3"
 W 2    E1  @120,120 > @560,120
 W 50   E2  3:200,180 > @200,120
 W 51   E2  4:450,180 > @450,120

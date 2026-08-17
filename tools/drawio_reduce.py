@@ -31,20 +31,47 @@ from collections import OrderedDict
 
 # --------------------------------------------------------------- 样式黑名单
 
-# 纯渲染用途，丢掉不影响语义
+# 闸门只有一条：**这个 key 变了，画出来的图会不会变？**
+# 不会变的（纯编辑器/交互元数据）才丢。会变的一律留 —— 丢了就还原不回来，
+# 而留下来的代价是每个「去重后的样式」几十字符，不是每个 cell。
 DROP = {
-    "html", "shadow", "jettySize", "orthogonalLoop", "pointerEvents", "resizable",
-    "rotatable", "snapToPoint", "perimeter", "sketch", "fillStyle", "aspect",
-    "align", "verticalAlign", "verticalLabelPosition", "labelPosition",
-    "whiteSpace", "arcSize", "glass", "comic", "edgeStyle", "startSize", "endSize",
-    "points", "movable", "deletable", "editable", "connectable", "noLabel",
-    "autosize", "fontFamily", "fontSource", "outlineConnect", "backgroundOutline",
+    "pointerEvents", "resizable", "rotatable", "movable", "deletable", "editable",
+    "connectable", "autosize", "snapToPoint", "aspect", "outlineConnect",
+    "backgroundOutline", "expand", "recursiveResize", "container",
+    # 标签统一按转义后的纯文本带出，expand 一律按 html=1 写回
+    "html",
+}
+
+# 纯开关型、缺省即关闭的 key：取默认值才丢。
+#
+# 谁**不在**这张表里，以及为什么（三条都是渲染实测出来的，别按字面猜；
+# 每条在 tests/test_drawio.py::TestPreservedInfo 里有一个断言钉着）：
+#   align / verticalAlign / *LabelPosition / whiteSpace
+#       默认值不是常数。drawio 的内置具名样式（`text;` `label;` …）自带一套，
+#       `text;` 的 align 默认是 left 不是 center。猜错 = 标签整体挪位置。
+#   rounded
+#       边上缺省画的是**圆角**，顶点上缺省是直角。所以边的 rounded=0 是非默认值。
+#   jettySize
+#       `auto` 不等于缺省。缺省是常数 10，auto 是按箭头大小现算的，
+#       正交边第一段长度会差十几像素。
+DROP_IF_DEFAULT = {
+    "fillStyle": "solid", "points": "[]",
+    "shadow": "0", "sketch": "0", "glass": "0", "comic": "0", "noLabel": "0",
+}
+
+# 只在「这个 cell 有标签」时才影响画面的 key：无标签的 cell 上一律不输出。
+# 电路图里绝大多数图元（管子、电容、结点）都没标签，这一条把 A 的代价按住了。
+LABEL_ONLY = {
+    "align", "verticalAlign", "labelPosition", "verticalLabelPosition",
+    "whiteSpace", "noLabel", "labelBackgroundColor", "labelBorderColor",
+    "textOpacity", "spacing", "spacingTop", "spacingBottom",
+    "spacingLeft", "spacingRight", "textShadow", "overflow",
 }
 
 # 取默认值时丢掉，非默认值保留
 DROP_IF_ZERO = {
     "exitDx", "exitDy", "entryDx", "entryDy", "exitPerimeter", "entryPerimeter",
-    "flipH", "flipV", "dashed", "rounded",
+    "flipH", "flipV", "dashed",
 }
 
 # 已被解算成绝对坐标，边上不再重复输出
@@ -114,24 +141,46 @@ def parse_style(s):
     return d
 
 
-def canon_style(st, consumed=()):
-    """归一化残留样式，shape 放最前，其余按 key 排序以便去重。"""
+def canon_style(st, consumed=(), labeled=True):
+    """归一化残留样式，shape 放最前，其余按 key 排序以便去重。
+
+    样式串以空格分词，所以带空格的值（`dashPattern=8 8`、`fontFamily=Times New
+    Roman`）要加引号，否则 expand 分不回去。
+    """
     shape = None
     items = []
+    named = []      # 无值的词是 drawio 内置具名样式（text / ellipse / swimlane …）
     for k, v in st.items():
         if k in DROP or k in consumed:
             continue
         if k in DROP_IF_ZERO and v in ("0", "0.0", "none", ""):
             continue
+        if DROP_IF_DEFAULT.get(k) == v:
+            continue
+        if not labeled and k in LABEL_ONLY:
+            continue
         if k == "shape":
             shape = v
+            continue
+        if v == "":
+            named.append(k)
             continue
         items.append((k, v))
     parts = []
     if shape:
-        parts.append(shape.replace("mxgraph.", ""))
+        # `mxgraph.a.b` 缩成 `a.b`：留了个点，expand 才认得出这是 stencil 名而不是
+        # `ellipse` / `triangle` 这类无值样式 key。缩不了的原样写 `shape=v`。
+        if shape.startswith("mxgraph.") and "." in shape[8:]:
+            parts.append(shape[8:])
+        else:
+            parts.append("shape=" + shape)
+    # 具名样式必须排在所有 k=v 前面、且保持原有先后：mxGraph 是从左到右合并的，
+    # `align=center;text;` 会被 text 自带的 align=left 顶掉。按字母排序会踩这个坑。
+    parts.extend(named)
     for k, v in sorted(items):
-        parts.append(k if v == "" else "%s=%s" % (k, v))
+        if " " in v:
+            v = '"%s"' % v
+        parts.append("%s=%s" % (k, v))
     return " ".join(parts) or "-"
 
 
@@ -139,17 +188,25 @@ def canon_style(st, consumed=()):
 
 
 def clean_label(v):
-    """去 HTML / LaTeX 包装，但保留 <b>/<i> 的强调语义（转成 * / /）。"""
+    """去 HTML / LaTeX 包装，但保留 <b>/<i> 的强调语义（转成 * / /）。
+
+    正文里本来就有的 `*` 转义成 `\\*`（`\\` 转义成 `\\\\`）—— 不然 `2*C` 会被
+    expand 当成加粗标记读回去。`/` 不转义：`clk/2` 这类名字太常见，
+    转义的噪声比换回斜体的收益大，所以斜体是**单向**的（见 rd-spec.md §7）。
+    """
     if not v:
         return ""
     s = v
-    s = re.sub(r"</?b>|</?strong>", "*", s, flags=re.I)
-    s = re.sub(r"</?i>|</?em>", "/", s, flags=re.I)
+    s = re.sub(r"</?b>|</?strong>", "\x01", s, flags=re.I)
+    s = re.sub(r"</?i>|</?em>", "\x02", s, flags=re.I)
     s = re.sub(r"<(br|div|p|tr|li)\b[^>]*>|</(div|p|tr|li)>", " ", s, flags=re.I)
     s = re.sub(r"<[^>]+>", "", s)          # sub/sup/span/font 等直接去标签不留空格
     s = html.unescape(s)
     s = s.replace("$$", "")
-    s = re.sub(r"\*\s*\*|/\s*/", "", s)    # 清掉配对后变空的强调标记
+    s = re.sub(r"[\x01]\s*[\x01]|[\x02]\s*[\x02]", "", s)  # 配对后变空的强调标记
+    # 正文里的字面量：`\` `*` 会撞上强调标记，`"` 会撞上 .rd 的引号
+    s = s.replace("\\", "\\\\").replace("*", "\\*").replace('"', '\\"')
+    s = s.replace("\x01", "*").replace("\x02", "/")
     return " ".join(s.split())
 
 
@@ -163,6 +220,41 @@ def n(v):
 
 def pt(p):
     return "%s,%s" % (n(p[0]), n(p[1]))
+
+
+def trail(vals):
+    """尾零截掉的坐标串，全零就整个省掉：[x,0,0,0] -> '@x'，[0,0,0,0] -> ''。"""
+    v = list(vals)
+    while v and float(v[-1]) == 0:
+        v.pop()
+    return "@" + ",".join(n(t) for t in v) if v else ""
+
+
+# --------------------------------------------------------------- 页面属性
+
+# mxGraphModel 上「缺省时 drawio 用什么」。等于默认值的不输出。
+MODEL_DEFAULT = {
+    "grid": "1", "gridSize": "10", "guides": "1", "tooltips": "1", "connect": "1",
+    "arrows": "1", "fold": "1", "page": "1", "pageScale": "1",
+    "pageWidth": "850", "pageHeight": "1100", "math": "0", "shadow": "0",
+}
+# dx/dy 是编辑器视口的滚动位置，跟画出来的东西无关
+MODEL_SKIP = {"dx", "dy", "pageWidth", "pageHeight"}
+
+
+def page_line(name, model):
+    """P 行：页名 + 页面尺寸 + 其余非默认的 mxGraphModel 属性。
+
+    导 PNG 时不带 --crop 就是按页面尺寸出图，丢了这行两张图连画布都不一样大。
+    """
+    a = model.attrib
+    extra = "".join(
+        " {%s=%s}" % (k, a[k]) for k in sorted(a)
+        if k not in MODEL_SKIP and MODEL_DEFAULT.get(k) != a[k])
+    return 'P "%s"  %sx%s%s' % (
+        name.replace("\\", "\\\\").replace('"', '\\"'),
+        n(a.get("pageWidth") or MODEL_DEFAULT["pageWidth"]),
+        n(a.get("pageHeight") or MODEL_DEFAULT["pageHeight"]), extra)
 
 
 # --------------------------------------------------------------- 几何解算
@@ -203,6 +295,17 @@ def connection_point(v, px, py, ddx=0.0, ddy=0.0):
     if r2:
         ptx, pty = rot(ptx, pty, r2, cx, cy)
     return (ptx, pty)
+
+
+# drawio 建 waypoint 结点 / 边标签时写死的样式串。归一化后等于这个值、且尺寸也是
+# 默认的，才用紧凑的 J 行 / 光秃秃的 |"…" 写法；否则退回带样式引用的完整写法。
+# expand 靠同样两个字面量写回去 —— 改这里要同步改 drawio_expand.py。
+WAYPOINT_STYLE = ("shape=waypoint;sketch=0;fillStyle=solid;size=6;pointerEvents=1;"
+                  "points=[];fillColor=none;resizable=0;rotatable=0;"
+                  "perimeter=centerPerimeter;snapToPoint=1;")
+WAYPOINT_SIZE = 20.0
+EDGELABEL_STYLE = ("edgeLabel;html=1;align=center;verticalAlign=middle;"
+                   "resizable=0;points=[];")
 
 
 def geom_of(cell):
@@ -275,14 +378,25 @@ def reduce_page(page_name, model, bbox=None):
                    flipV=st.get("flipV") == "1",
                    parent=mx.get("parent"))
         if "edgeLabel" in st:
-            relx = None
+            # 边标签的位置 = 沿线相对位置 x(-1..1) + 垂直偏移 y + 像素 offset。
+            # 只带 x 的话拖过的标签会弹回线上，所以四个都带。
+            pos = [0.0, 0.0, 0.0, 0.0]
             mg = mx.find("mxGeometry")
-            if mg is not None and mg.get("x") is not None:
-                try:
-                    relx = float(mg.get("x"))
-                except ValueError:
-                    pass
-            elabels.setdefault(rec["parent"], []).append((relx, rec["label"]))
+            if mg is not None:
+                for i, k in enumerate(("x", "y")):
+                    try:
+                        pos[i] = float(mg.get(k) or 0)
+                    except ValueError:
+                        pass
+                for mp in mg.findall("mxPoint"):
+                    if mp.get("as") == "offset":
+                        try:
+                            pos[2] = float(mp.get("x") or 0)
+                            pos[3] = float(mp.get("y") or 0)
+                        except ValueError:
+                            pass
+            elabels.setdefault(rec["parent"], []).append(
+                (pos, rec["label"], st))
             continue
         verts[cid] = rec
 
@@ -349,22 +463,39 @@ def reduce_page(page_name, model, bbox=None):
         table[key][1] += 1
         return table[key][0]
 
+    wp_canon = canon_style(parse_style(WAYPOINT_STYLE), labeled=False)
+    # 有没有标签会影响 LABEL_ONLY 那一闸，所以两种都要备着
+    el_canon = {b: canon_style(parse_style(EDGELABEL_STYLE), labeled=b)
+                for b in (False, True)}
+
     lines = []
     for cid, v in verts.items():
         st = v["style"]
-        if st.get("shape") == "waypoint":
+        cs = canon_style(st, labeled=bool(v["label"]))
+        if (st.get("shape") == "waypoint" and cs == wp_canon and not v["label"]
+                and v["bounds"][2] == WAYPOINT_SIZE == v["bounds"][3]):
             lines.append(("J", cid, v))
             continue
-        v["ref"] = ref(sdict, "S", canon_style(st))
+        v["ref"] = ref(sdict, "S", cs)
         lines.append(("T" if ("text" in st and "shape" not in st) else "V", cid, v))
     for eid, e in edges.items():
-        e["ref"] = ref(edict, "E", canon_style(e["style"], EDGE_CONSUMED))
+        e["ref"] = ref(edict, "E", canon_style(e["style"], EDGE_CONSUMED,
+                                               labeled=bool(e["label"])))
+        # 边标签：非默认样式才给引用，默认的（drawio 自己写的那串）省掉
+        out_lab = []
+        for pos, txt, lst in elabels.get(eid, []):
+            cs = canon_style(lst, labeled=bool(txt))
+            out_lab.append((pos, txt, None if cs == el_canon[bool(txt)]
+                            else ref(sdict, "S", cs)))
+        e["labels"] = out_lab
 
     # ---- 输出
     out = []
     out.append("## page %s  vertices=%d edges=%d" % (page_name, len(verts), len(edges)))
-    out.append("## V 图元 | T 文本 | J 结点 | W 连线")
+    out.append("## P 页面 | V 图元 | T 文本 | J 结点 | W 连线")
     out.append("## 端点  id:x,y=接在图元上 | @x,y=悬空或折点 | id:?=无约束点 | ~=近似(未做perimeter投影)")
+    out.append("")
+    out.append(page_line(page_name, model))
     out.append("")
     out.append("## styles")
     for key, (name, cnt) in sdict.items():
@@ -385,8 +516,8 @@ def reduce_page(page_name, model, bbox=None):
     for eid, e in edges.items():
         chain = [e["a"]] + ["@" + pt(p) for p in e["mids"]] + [e["b"]]
         lab = '  "%s"' % e["label"] if e["label"] else ""
-        for relx, txt in elabels.get(eid, []):
-            lab += '  |"%s"%s' % (txt, "" if relx is None else "@%s" % n(relx))
+        for pos, txt, sref in e["labels"]:
+            lab += '  |"%s"%s%s' % (txt, trail(pos), " " + sref if sref else "")
         extra = "".join(" {%s=%s}" % (k, vv) for k, vv in sorted(e["extra"].items()))
         out.append("W %-4s %-3s %s%s%s" % (eid, e["ref"], " > ".join(chain), lab, extra))
     return "\n".join(out)

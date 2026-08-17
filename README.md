@@ -7,7 +7,8 @@
 而不是把文件压小。
 
 ```
-原理图  my.drawio  ──drawio_reduce──▶  my.rd  (1/6 ~ 1/10)  ──▶  模型重建出网表 .ckt
+原理图  my.drawio  ──drawio_reduce──▶  my.rd  (1/5 ~ 1/8)   ──▶  模型重建出网表 .ckt
+                   ◀──drawio_expand──                           改完再画回去
 波形    my.csv     ──wave_reduce────▶  my.wv  (≤20 KB)      ──▶  模型定位 debug 问题
 截图    plot.png   ──plot_digitize──▶  my.wv                ──▶  （导不出数据时的兜底）
 ```
@@ -17,6 +18,7 @@
 | | 状态 | 干什么 |
 |---|---|---|
 | `tools/drawio_reduce.py` | **可用** | `.drawio` → `.rd`。纯标准库，Python 3.8+，无依赖 |
+| `tools/drawio_expand.py` | **可用** | `.rd` → `.drawio`，reduce 的逆。连线走法、标签位置逐像素还原 |
 | `tools/wave_reduce.py` | **可用** | Cadence 波形 CSV → `.wv`（≤20 KB），带 Tkinter GUI 预览。见 [`docs/wave-spec.md`](docs/wave-spec.md) |
 | `tools/plot_digitize.py` | **可用** | 波形截图 → CSV/`.wv`。导不出数据时的兜底 |
 
@@ -43,12 +45,12 @@ Python 3.6+，**全部纯标准库**。仓库里那个 `deploy/requirements.txt`
 `tests/test_format.py` 里有 AST 扫描在守这条线。
 
 ```
-docs/rd-spec.md       .rd 格式规范 + 设计约定（分工线、黑名单、坐标解算）
+docs/rd-spec.md       .rd 格式规范 + 设计约定（分工线、黑名单、坐标解算、反方向）
 docs/ckt-format.md    .ckt 概念网表格式 —— 模型回给你的东西长什么样
 docs/wave-spec.md     .wv 格式 + wave_reduce 设计约定
 docs/wave-decisions.md  spec 没定、实现时拍板的细节（附理由）
 examples/demo.drawio  样例：教科书 5 管 OTA + 一小段架构图
-examples/demo.rd      压缩结果（1.9 KB，同时充当回归测试基准）
+examples/demo.rd      压缩结果（2.3 KB，同时充当回归测试基准）
 examples/demo.ckt     从 .rd 重建出的网表 + 全部推断标注
 examples/gen_demo_wave.py  合成波形生成器 —— 真值已知，所以测量对不对是可判定的
 examples/demo_*.csv   合成波形样例（瞬态 / AC / 谱 / 布局B / 脏数据）
@@ -63,6 +65,7 @@ tests/                unittest 全套（见 tests/README.md）
 ```bash
 python tools/drawio_reduce.py my.drawio -o my.rd
 python tools/drawio_reduce.py my.drawio --bbox 400,300,800,700   # 只导出一个区域
+python tools/drawio_expand.py my.rd -o back.drawio  # 反过来：改完 .rd 再画回去
 
 python tools/wave_reduce.py my.csv -o my.wv        # 默认压到 20 KB 以内
 python tools/wave_reduce.py my.csv --gui           # 看这次压缩丢了什么、能不能粘出去
@@ -92,10 +95,12 @@ python tools/plot_digitize.py shot.png --xaxis 0,300n --yaxis 0.7,0.87 \
 ──────────────────────────────────────────────────────────
 画 my.drawio
    ↓  drawio_reduce.py
-my.rd  (原始体积的 1/6 ~ 1/10)
+my.rd  (原始体积的 1/5 ~ 1/8)
    ↓  粘贴全文  ─────────────────────────────────→  重建 .ckt
                                                     ↓
    对着图核 .ckt 末尾的「推断标注」段  ←────────────  标注出所有猜测
+   ↓  drawio_expand.py                              （或者直接改 .rd 再贴回来）
+改过的 my.drawio
 ```
 
 ## `.wv` 长什么样
@@ -200,11 +205,27 @@ waypoint 圆点那串 190 字符的样式同样如此。按这个密度 150 管�
 
 ## 支持的 drawio 特性
 
-压缩存储（base64+deflate）、多页、`<object>` 自定义属性、`flipH`/`flipV`/`direction`/`rotation`、
-自环边、悬空端点、`<Array as="points">` 显式折点、waypoint 结点圆点、边标签、
+压缩存储（base64+deflate）、多页、页面属性（尺寸/背景/math）、`<object>` 自定义属性、
+`flipH`/`flipV`/`direction`/`rotation`、自环边、悬空端点、`<Array as="points">` 显式折点、
+waypoint 结点圆点、边标签（含拖动过的位置和它自己的样式）、
 HTML 富文本标签（`<b>` 转 `*…*` 保留强调，`V<sub>ss</sub>` → `Vss`）。
 
 不支持 group / 容器的父子坐标折算（暂未实现；图元的嵌套关系可由 bbox 包含推断）。
+
+## 来回一趟丢什么
+
+`drawio_expand.py` 是 `drawio_reduce.py` 的逆。验收判据不是「XML 长得像」，
+而是**原图和还原图各出一张 PNG 逐像素比**——`examples/demo.drawio` 走一圈回来，
+除下面这三样之外零差异（连线走法、拐角、标签位置全在这个断言里）：
+
+| 丢的 | 为什么是**有意**丢的 |
+|---|---|
+| 下标/上标 | `V<sub>ss</sub>` → `Vss`。下游要的是 `Vss` 这个**名字** |
+| 斜体 | `clk/2` `VDD/VSS` 这类名字太常见，给 `/` 转义的噪声比换回斜体的收益大 |
+| cell 的 z 序 | `.rd` 把图元和连线分成两段列，还原出来连线一律在图元之上 |
+
+加粗、对齐方式、正交/直连、拐角圆不圆、边标签拖到哪，全都能回来。
+细则和「三个不能按字面猜的 drawio 默认值」见 [`docs/rd-spec.md`](docs/rd-spec.md) §3 / §7。
 
 ## 数据不进这个仓库
 
