@@ -6,6 +6,9 @@ drawio_reduce.py — 把 .drawio 压成「只剩语义信息」的紧凑文本�
 设计原则：
   1. 脚本只做确定性变换（坐标解算、样式去重、文本清洗），不做任何语义判断。
      不判 d/g/s、不合并节点、不猜走线路径、不关联浮动文本、不起网络名。
+     `--hints` 是这条线上的**量**那一侧：算「坐标相等 / bounds 包含 / 边距多少」
+     这些纯几何事实并单独列出来，但不把它折叠成「同一个网络 / 属于这个框 /
+     这个标签标的是这个电容」。折叠是判断，留给下游。
   2. 保留策略是黑名单：只丢已知纯渲染用途的样式 key，未知 key 一律保留。
   3. 宁可多输出、不解释。脚本猜错了下游看不出来，下游猜错了人对着图能看出来。
 
@@ -13,6 +16,7 @@ drawio_reduce.py — 把 .drawio 压成「只剩语义信息」的紧凑文本�
     python drawio_reduce.py my.drawio
     python drawio_reduce.py my.drawio -o my.rd
     python drawio_reduce.py my.drawio --bbox 400,300,800,700
+    python drawio_reduce.py my.drawio --hints          # 附一段几何提示，见 §8
 
 只依赖 Python 标准库 (3.8+)。
 """
@@ -28,6 +32,24 @@ import urllib.parse
 import zlib
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+
+# --------------------------------------------------------------- 控制台编码
+
+
+def utf8_streams():
+    """把 stdout/stderr 钉成 UTF-8。
+
+    不是为了好看：`-o` 写文件走的是显式 UTF-8，但 `drawio_reduce.py x.drawio > x.rd`
+    走的是 locale 编码 —— 中文 Windows 上就是 GBK，写出来的 `.rd` 是 GBK 字节，
+    `drawio_expand.py` 一读就 UnicodeDecodeError。两条路必须出同一种字节。
+    Windows 控制台本来就是 UTF-8 通道（WriteConsoleW），所以这一行不影响终端显示。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):      # 被重定向成非 TextIO 的场合
+            pass
+
 
 # --------------------------------------------------------------- 样式黑名单
 
@@ -90,6 +112,45 @@ def _inflate(payload):
     except zlib.error:
         txt = zlib.decompress(raw).decode("utf-8")
     return urllib.parse.unquote(txt)
+
+
+def source_sizes(path):
+    """-> (磁盘字节, 等价未压缩 XML 字节)。压缩比的分母要用后者。
+
+    `.drawio` 默认 deflate+base64 存盘，磁盘字节量的是 zlib 的本事，不是这个脚本的；
+    脚本自己一进门就把它解开了，拿磁盘数当基准等于把分子分母算成两样东西 ——
+    同一张图，压缩存的会报「0.5x」、另存成 XML 的报「5.2x」，差一个数量级，
+    而且 drawio 默认就是压缩存，所以用户看到的几乎总是那个看起来像「越压越大」的数。
+    分母的定义是：**下游不用这个脚本、直接读这张图要吞多少字节**。
+
+    重建出来的 XML 不带缩进（drawio 存未压缩时是带的），所以这个数偏小一点，
+    报出来的倍数因此是**保守**的。
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return len(raw), len(raw)
+    if root.tag == "mxGraphModel":
+        return len(raw), len(raw)
+    grew = False
+    for dia in root.iter("diagram"):
+        if dia.find("mxGraphModel") is not None:
+            continue
+        payload = (dia.text or "").strip()
+        if not payload:
+            continue
+        try:
+            inner = ET.fromstring(_inflate(payload))
+        except Exception:      # base64 / zlib / XML 都可能炸，这里只是估个分母
+            continue
+        dia.text = None
+        dia.append(inner)
+        grew = True
+    if not grew:
+        return len(raw), len(raw)
+    return len(raw), len(ET.tostring(root, encoding="utf-8"))
 
 
 def load_pages(path):
@@ -345,10 +406,203 @@ def edge_points(cell):
     return sp, tp, mids
 
 
+# ------------------------------------------------------- 几何提示（--hints）
+
+# 这一段是「量」，不是「判」。下面三件事以前全靠下游手算，但它们没有一个需要
+# 电路常识：坐标相等就是相等，bounds 包含就是包含，两个框差多少像素就是差多少。
+# 脚本给数，判断留给下游 —— 所以 same 不写成「同一个网络」、in 不写成「属于这个
+# 分组」、near 不写成「这个标签标的是这个电容」，而且**默认不开**：
+# `.rd` 常常要走聊天框，这段是纯增量体积，值不值得由用得着它的人决定。
+#
+# 全部以 `#` 开头 = `.rd` 的注释行，expand 原样跳过，定点不变式不受影响。
+
+HINT_KINDS = ("same", "in", "near")
+NEAR_K = 3          # 每个文本框列几个最近的图元
+
+
+def rect_gap(a, b):
+    """两个 bounds 的最短距离（相交/包含时为 0）。纯几何，没有阈值。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    dx = max(0.0, bx - (ax + aw), ax - (bx + bw))
+    dy = max(0.0, by - (ay + ah), ay - (by + bh))
+    return math.hypot(dx, dy)
+
+
+def contains(outer, inner):
+    """outer 的 bounds 完全罩住 inner，且自己更大（面积相等时不算，避免互相当爹）。"""
+    ox, oy, ow, oh = outer
+    ix, iy, iw, ih = inner
+    return (ox <= ix and oy <= iy and ox + ow >= ix + iw and oy + oh >= iy + ih
+            and ow * oh > iw * ih)
+
+
+def endpoint_xy(tok):
+    """端点串 -> (x, y)，没有坐标的（`8:?` / `?`）返回 None。"""
+    tok = tok.strip()
+    if tok.startswith("@"):
+        body = tok[1:]
+    elif ":" in tok:
+        body = tok.split(":", 1)[1].lstrip("~")
+    else:
+        return None
+    try:
+        x, y = body.split(",")
+        return (float(x), float(y))
+    except ValueError:
+        return None
+
+
+def group_same(edges, jcenters, tol):
+    """坐标重合的端点分组。
+
+    tol=0 走的是「输出串完全相同」而不是浮点相等 —— 跟 `.rd` 里写的数字自洽，
+    下游肉眼比也是比那串数字。tol>0 是单连通聚类，**阈值必须由调用方给**：
+    「差 10 像素算不算同一个点」是电路知识，脚本没资格替谁定（rd-spec §5）。
+    """
+    pts = []            # (name, (x, y))
+    for eid, e in edges.items():
+        for name, tok in (("a", e["a"]), ("b", e["b"])):
+            xy = endpoint_xy(tok)
+            if xy:
+                pts.append(("%s.%s" % (eid, name), xy))
+        for i, m in enumerate(e["mids"], 1):
+            pts.append(("%s.m%d" % (eid, i), (m[0], m[1])))
+    for cid, c in jcenters:
+        pts.append(("J" + cid, c))
+    if len(pts) < 2:
+        return []
+
+    if tol <= 0:
+        buckets = OrderedDict()
+        for name, xy in pts:
+            buckets.setdefault(pt(xy), []).append(name)
+        return [(k, v) for k, v in buckets.items() if len(v) > 1]
+
+    parent = list(range(len(pts)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            if math.hypot(pts[i][1][0] - pts[j][1][0],
+                          pts[i][1][1] - pts[j][1][1]) <= tol:
+                parent[find(i)] = find(j)
+    groups = OrderedDict()
+    for i, (name, xy) in enumerate(pts):
+        groups.setdefault(find(i), []).append((name, xy))
+    out = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        cx = sum(m[1][0] for m in members) / len(members)
+        cy = sum(m[1][1] for m in members) / len(members)
+        out.append((pt((cx, cy)), [m[0] for m in members]))
+    return out
+
+
+def group_in(verts, edges, order):
+    """bounds 几何包含的直接父子。父 = 罩住它的图元里面积最小的那个。
+
+    跟 drawio 自己的 group / 容器（`parent` 属性）没有关系 —— reduce 侧压根没解析
+    父子坐标折算（§5）。这里量的纯粹是「谁画在谁的框里」，分区色块就是靠这个认的。
+    """
+    boxes = [(cid, verts[cid]["bounds"]) for cid in order if cid in verts]
+    kids = OrderedDict()
+    for cid, b in boxes:
+        best = None
+        for pid, pb in boxes:
+            if pid == cid or not contains(pb, b):
+                continue
+            area = pb[2] * pb[3]
+            if best is None or area < best[1]:
+                best = (pid, area)
+        if best:
+            kids.setdefault(best[0], []).append(cid)
+    for eid, e in edges.items():
+        pts_ = [p for p in (endpoint_xy(e["a"]), endpoint_xy(e["b"])) if p]
+        pts_ += list(e["mids"])
+        if not pts_:
+            continue
+        best = None
+        for pid, pb in boxes:
+            if not all(pb[0] <= x <= pb[0] + pb[2] and pb[1] <= y <= pb[1] + pb[3]
+                       for x, y in pts_):
+                continue
+            area = pb[2] * pb[3]
+            if best is None or area < best[1]:
+                best = (pid, area)
+        if best:
+            kids.setdefault(best[0], []).append(eid)
+    return [(pid, kids[pid]) for pid, _ in boxes if pid in kids]
+
+
+def group_near(verts, texts, order):
+    """每个纯文本框到最近几个图元的**边距**。
+
+    只给距离，不给归属：`C_{fg}=36pF` 挨着哪个电容，看数字一眼就分得出（4 vs 31）；
+    分不出的时候（12 vs 13）本来就该由懂电路的人来判，脚本替它选一个反而把
+    「这里其实很含糊」这个信息抹掉了。
+
+    跟自己有包含关系的不算邻居。**包含不是挨着**：一个圈住半张图的分区色块跟框里
+    每个文本框的边距都是 0，不排掉就会把真正紧挨着的那个器件挤出榜单 ——
+    而包含关系 `#in` 已经单列了，这里排掉它一位信息都不丢。
+    """
+    out = []
+    rank = {cid: i for i, cid in enumerate(order)}      # 同距离时按 .rd 里的先后
+    for tid in order:
+        if tid not in texts:
+            continue
+        tb = verts[tid]["bounds"]
+        cand = [(rect_gap(tb, verts[cid]["bounds"]), cid)
+                for cid in order
+                if cid in verts and cid != tid and cid not in texts
+                and not contains(verts[cid]["bounds"], tb)
+                and not contains(tb, verts[cid]["bounds"])]
+        if not cand:
+            continue
+        cand.sort(key=lambda t: (t[0], rank[t[1]]))
+        out.append((tid, cand[:NEAR_K]))
+    return out
+
+
+def hint_lines(kinds, verts, edges, texts, jcenters, order, tol):
+    kinds = [k for k in HINT_KINDS if k in kinds]
+    if not kinds:
+        return []
+    out = ["", "## hints  脚本只量几何，不下判断；这几件事以前全靠下游手算"]
+    if "same" in kinds:
+        out.append("## same <x,y>  坐标重合的端点（`边id.a/.b/.m#`、`J结点`）"
+                   "—— 重合 ≠ 同网，容差 %s" % ("--same-tol %g" % tol if tol > 0
+                                             else "0，只认坐标完全相同"))
+    if "in" in kinds:
+        out.append("## in   <id>    bounds 罩住的直接子项 —— 包含 ≠ 分组，"
+                   "跟 drawio 自己的 group 无关")
+    if "near" in kinds:
+        out.append("## near <id>    文本框到最近 %d 个图元的边距 —— 距离 ≠ 归属，"
+                   "谁标注谁由你判" % NEAR_K)
+    n0 = len(out)
+    if "same" in kinds:
+        for xy, members in group_same(edges, jcenters, tol):
+            out.append("#same %s  %s" % (xy, " ".join(members)))
+    if "in" in kinds:
+        for pid, kids in group_in(verts, edges, order):
+            out.append("#in   %s  %s" % (pid, " ".join(kids)))
+    if "near" in kinds:
+        for tid, cand in group_near(verts, texts, order):
+            out.append("#near %s  %s"
+                       % (tid, " ".join("%s@%s" % (cid, n(d)) for d, cid in cand)))
+    return out if len(out) > n0 else []
+
+
 # --------------------------------------------------------------- 主流程
 
 
-def reduce_page(page_name, model, bbox=None):
+def reduce_page(page_name, model, bbox=None, hints=None, same_tol=0.0):
     verts = OrderedDict()   # id -> {style(dict), bounds, flipH, flipV, label, extra}
     edges = OrderedDict()
     elabels = {}            # edge id -> [(relx, text)]
@@ -520,15 +774,60 @@ def reduce_page(page_name, model, bbox=None):
             lab += '  |"%s"%s%s' % (txt, trail(pos), " " + sref if sref else "")
         extra = "".join(" {%s=%s}" % (k, vv) for k, vv in sorted(e["extra"].items()))
         out.append("W %-4s %-3s %s%s%s" % (eid, e["ref"], " > ".join(chain), lab, extra))
+
+    if hints:
+        out.extend(hint_lines(
+            hints, verts, edges,
+            texts={cid for kind, cid, _ in lines if kind == "T"},
+            jcenters=[(cid, (v["bounds"][0] + v["bounds"][2] / 2.0,
+                             v["bounds"][1] + v["bounds"][3] / 2.0))
+                      for kind, cid, v in lines if kind == "J"],
+            order=[cid for _, cid, _ in lines], tol=same_tol))
     return "\n".join(out)
 
 
-def main():
+def normalize_hints_argv(argv):
+    """`--hints my.drawio` 里的 `my.drawio` 是文件名，不是 KIND。
+
+    argparse 的 `nargs="?"` 只看下一个 token 是不是以 `-` 开头，看不出它是不是合法
+    KIND，于是把文件名吞进 --hints，再报「缺 infile」—— 错在 --hints 上，
+    错误信息却指向 infile。这里先看一眼：是 KIND 才粘成 `--hints=KIND`，
+    不是就让 --hints 光着，文件名还给位置参数。
+    """
+    out, skip = [], False
+    for i, tok in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if tok == "--hints":
+            nxt = argv[i + 1] if i + 1 < len(argv) else ""
+            if nxt and all(t.strip() in HINT_KINDS for t in nxt.split(",")):
+                out.append("--hints=" + nxt)
+                skip = True
+            else:
+                # 一律粘成 `--hints=…`，argparse 就没机会去吞下一个 token
+                out.append("--hints=" + ",".join(HINT_KINDS))
+            continue
+        out.append(tok)
+    return out
+
+
+def main(argv=None):
+    utf8_streams()
     ap = argparse.ArgumentParser(description="把 .drawio 压成紧凑语义文本")
     ap.add_argument("infile")
     ap.add_argument("-o", "--out", help="输出文件，默认 stdout")
     ap.add_argument("--bbox", help="只导出与该区域相交的部分: x1,y1,x2,y2")
-    args = ap.parse_args()
+    ap.add_argument("--hints", nargs="?", const=",".join(HINT_KINDS), default=None,
+                    metavar="KIND[,KIND]",
+                    help="附一段几何提示（默认全给）: same=重合的端点 "
+                         "in=bounds 包含关系 near=文本框到图元的边距。"
+                         "只量不判，全是 # 注释行，expand 原样跳过")
+    ap.add_argument("--same-tol", type=float, default=0.0, metavar="PX",
+                    help="same 的容差，默认 0 = 只认坐标完全相同。"
+                         "「差几像素还算不算同一个点」是电路知识，脚本不替你定")
+    args = ap.parse_args(normalize_hints_argv(
+        sys.argv[1:] if argv is None else list(argv)))
 
     bbox = None
     if args.bbox:
@@ -538,9 +837,17 @@ def main():
         except (ValueError, IndexError):
             ap.error("--bbox 格式应为 x1,y1,x2,y2")
 
+    hints = None
+    if args.hints is not None:
+        hints = [t.strip() for t in args.hints.split(",") if t.strip()]
+        bad = [t for t in hints if t not in HINT_KINDS]
+        if bad:
+            ap.error("--hints 只认 %s，不认 %s"
+                     % ("/".join(HINT_KINDS), "/".join(bad)))
+
     chunks = ["# %s" % os.path.basename(args.infile)]
     for name, model in load_pages(args.infile):
-        chunks.append(reduce_page(name, model, bbox))
+        chunks.append(reduce_page(name, model, bbox, hints, args.same_tol))
     result = "\n\n".join(chunks) + "\n"
 
     if args.out:
@@ -549,10 +856,13 @@ def main():
     else:
         sys.stdout.write(result)
 
-    src = os.path.getsize(args.infile)
+    disk, plain = source_sizes(args.infile)
     dst = len(result.encode("utf-8"))
-    print("\n---- %d -> %d bytes  (%.1fx)" % (src, dst, src / dst if dst else 0),
-          file=sys.stderr)
+    note = "" if disk == plain else "  [磁盘 %d 字节，deflate 存的]" % disk
+    # 前缀 `##` = `.rd` 的注释行：这行走 stderr，但用户 `2>&1` 或者干脆整屏复制
+    # 粘进 .rd 的事天天发生，做成注释就没有「自己的输出自己读不回去」这一说。
+    print("\n## ---- %d -> %d bytes  (%.1fx)%s"
+          % (plain, dst, plain / dst if dst else 0, note), file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@
 `rounded` / `jettySize` / `text;` 三个坑就是这么发现的，注释里记了实测结论。
 """
 
+import io
 import os
 import re
 import subprocess
@@ -339,6 +340,264 @@ class TestLegacyRd(unittest.TestCase):
         xml = X.expand(rd)
         self.assertIn('<diagram name="demo"', xml)
         self.assertIn('pageWidth="850"', xml)          # 退回默认页面尺寸
+
+
+# ------------------------------------------------------- 压缩比 / 自己的尾行
+
+
+def compressed_copy(src, dst):
+    """把 .drawio 改存成 drawio 默认的 deflate+base64 形态。
+
+    drawio 默认就是这么存的，所以用户手上的输入几乎总是这一种；
+    examples/demo.drawio 存的是未压缩 XML，光靠它测不出「分母拿错了」。
+    """
+    import base64
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+    import zlib
+    root = ET.parse(src).getroot()
+    for dia in root.iter("diagram"):
+        inner = dia.find("mxGraphModel")
+        if inner is None:
+            continue
+        packed = urllib.parse.quote(ET.tostring(inner, encoding="unicode"), safe="")
+        co = zlib.compressobj(9, zlib.DEFLATED, -15)
+        dia.remove(inner)
+        dia.text = base64.b64encode(
+            co.compress(packed.encode("utf-8")) + co.flush()).decode("ascii")
+    with open(dst, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(ET.tostring(root, encoding="unicode"))
+    return dst
+
+
+class TestReportedRatio(unittest.TestCase):
+    """同一张图，压缩存的和未压缩存的，报出来的比例必须是同一个数。
+
+    以前拿磁盘字节当分母：压缩存的报 0.5x、另存 XML 的报 5.2x，差一个数量级，
+    而且 drawio 默认压缩存 —— 用户看到的几乎总是那个像「越压越大」的数。
+    分子分母得是同一样东西，分母的定义是「下游不用这个脚本、直接读要吞多少字节」。
+    """
+
+    def _ratio(self, path):
+        _, plain = R.source_sizes(path)
+        return plain / float(len(reduce_file(path).encode("utf-8")))
+
+    def test_plain_input_counts_itself(self):
+        disk, plain = R.source_sizes(DEMO)
+        self.assertEqual(disk, plain)
+
+    def test_compressed_input_counts_the_xml(self):
+        z = compressed_copy(DEMO, os.path.join(
+            tempfile.mkdtemp(prefix="rdratio"), "z.drawio"))
+        disk, plain = R.source_sizes(z)
+        self.assertLess(disk, plain / 2)
+        self.assertGreater(plain, os.path.getsize(DEMO) * 0.9,
+                           "展开出来的 XML 该和未压缩存的那份差不多大")
+
+    def test_same_drawing_same_ratio(self):
+        z = compressed_copy(DEMO, os.path.join(
+            tempfile.mkdtemp(prefix="rdratio"), "z.drawio"))
+        a, b = self._ratio(DEMO), self._ratio(z)
+        self.assertAlmostEqual(a, b, delta=0.15 * a,
+                               msg="两种存法报出来的比例差太多: %.2f vs %.2f" % (a, b))
+        self.assertGreater(a, 3.0, "README 说 1/5~1/8，报出来的数得对得上")
+
+
+class TestOwnOutputRoundTrips(unittest.TestCase):
+    """reduce 打的统计行，expand 必须认。
+
+    它走 stderr，但 `2>&1` 和「整屏复制粘进 .rd」是这条路上的日常 ——
+    自己的输出自己读不回去，是 bug 不是用法问题。
+    """
+
+    def _warnings(self, rd):
+        err = io.StringIO()
+        old, sys.stderr = sys.stderr, err
+        try:
+            X.expand(rd)
+        finally:
+            sys.stderr = old
+        return err.getvalue()
+
+    def test_stats_line_is_a_comment(self):
+        out = subprocess.run(
+            [sys.executable, os.path.join(TOOLS, "drawio_reduce.py"), DEMO,
+             "-o", os.devnull], capture_output=True)
+        tail = [l for l in out.stderr.decode("utf-8").splitlines() if l.strip()][-1]
+        self.assertTrue(tail.startswith("#"), "统计行得是 .rd 的注释行: " + tail)
+        self.assertEqual("", self._warnings(reduce_file(DEMO) + tail + "\n"))
+
+    def test_legacy_stats_line_without_hash(self):
+        """老版本打的是光秃秃的 `---- ...`，已经流出去的 .rd 里就有。"""
+        self.assertEqual("", self._warnings(
+            reduce_file(DEMO) + "\n---- 11830 -> 2273 bytes  (5.2x)\n"))
+
+    def test_real_garbage_still_warns(self):
+        self.assertIn("Z 99", self._warnings(reduce_file(DEMO) + "Z 99 谁也不认得\n"))
+
+
+class TestStdoutIsUtf8(unittest.TestCase):
+    """`reduce x.drawio > x.rd` 得和 `-o x.rd` 出同一种字节。
+
+    以前 stdout 走 locale 编码：中文 Windows 上写出来的是 GBK 的 .rd，
+    expand 一读就 UnicodeDecodeError —— 管道那条路整条是断的。
+    """
+
+    def _run(self, *argv):
+        env = dict(os.environ, PYTHONIOENCODING="gbk")   # 模拟中文 Windows 的 locale
+        return subprocess.run([sys.executable] + list(argv),
+                              capture_output=True, env=env)
+
+    def test_reduce_stdout_decodes_as_utf8(self):
+        out = self._run(os.path.join(TOOLS, "drawio_reduce.py"), DEMO)
+        self.assertIn("图元", out.stdout.decode("utf-8"))
+
+    def test_piped_rd_expands(self):
+        rd = os.path.join(tempfile.mkdtemp(prefix="rdpipe"), "p.rd")
+        with open(rd, "wb") as fh:
+            fh.write(self._run(os.path.join(TOOLS, "drawio_reduce.py"),
+                               DEMO).stdout)
+        out = self._run(os.path.join(TOOLS, "drawio_expand.py"), rd)
+        self.assertEqual(0, out.returncode, out.stderr.decode("utf-8", "replace"))
+        self.assertIn('<diagram name="demo"', out.stdout.decode("utf-8"))
+
+
+# ------------------------------------------------------- --hints
+
+
+def edge(eid, src, dst, ex, ey, nx, ny):
+    return ('<mxCell id="%s" style="exitX=%s;exitY=%s;exitDx=0;exitDy=0;'
+            'exitPerimeter=0;entryX=%s;entryY=%s;entryDx=0;entryDy=0;'
+            'entryPerimeter=0;" edge="1" parent="1" source="%s" target="%s">'
+            '<mxGeometry relative="1" as="geometry"/></mxCell>'
+            % (eid, ex, ey, nx, ny, src, dst))
+
+
+def hints_rd(path, kinds=None, tol=0.0):
+    out = []
+    for name, model in R.load_pages(path):
+        out.append(R.reduce_page(name, model, None,
+                                 list(kinds or R.HINT_KINDS), tol))
+    return "\n".join(out)
+
+
+def hints_xml(xml, kinds=None, tol=0.0):
+    fd, p = tempfile.mkstemp(suffix=".drawio")
+    os.close(fd)
+    try:
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(xml)
+        return hints_rd(p, kinds, tol)
+    finally:
+        os.unlink(p)
+
+
+class TestHints(unittest.TestCase):
+    """`--hints` 只量几何、不下判断，而且不许弄脏 .rd 的语法。"""
+
+    def test_off_by_default(self):
+        self.assertNotIn("## hints", reduce_file(DEMO))
+
+    def test_every_hint_line_is_a_comment(self):
+        rd = hints_rd(DEMO)
+        for line in rd[rd.index("## hints"):].splitlines():
+            self.assertTrue(not line or line.startswith("#"),
+                            "hints 里混进了非注释行: " + line)
+
+    def test_expand_ignores_hints(self):
+        """加不加 hints，expand 出来的 XML 一个字节都不该变。"""
+        self.assertIn("## hints", hints_rd(DEMO))
+        self.assertEqual(X.expand(reduce_file(DEMO)),
+                         X.expand("# demo.drawio\n\n" + hints_rd(DEMO) + "\n"))
+
+    def test_fixed_point_survives(self):
+        self.assertEqual(
+            body(reduce_file(DEMO)),
+            body(roundtrip("# demo.drawio\n\n" + hints_rd(DEMO) + "\n")))
+
+    def test_hints_before_the_filename(self):
+        """`--hints my.drawio` 是最自然的写法，不能让它把文件名吞掉。
+
+        argparse 的 nargs="?" 只看下一个 token 是不是以 `-` 开头，
+        原样用会报「缺 infile」—— 错在 --hints 上，错误信息却指向 infile。
+        """
+        n = R.normalize_hints_argv
+        self.assertEqual(["--hints=" + ",".join(R.HINT_KINDS), "a.drawio"],
+                         n(["--hints", "a.drawio"]))
+        self.assertEqual(["--hints=same,near", "a.drawio"],
+                         n(["--hints", "same,near", "a.drawio"]))
+        self.assertEqual(["a.drawio", "--hints=" + ",".join(R.HINT_KINDS)],
+                         n(["a.drawio", "--hints"]))
+        self.assertEqual(["a.drawio"], n(["a.drawio"]))
+
+    def test_cli_accepts_hints_before_the_filename(self):
+        out = subprocess.run(
+            [sys.executable, os.path.join(TOOLS, "drawio_reduce.py"),
+             "--hints", DEMO], capture_output=True)
+        self.assertEqual(0, out.returncode, out.stderr.decode("utf-8", "replace"))
+        self.assertIn("#same", out.stdout.decode("utf-8"))
+
+    def test_same_finds_coincident_endpoints(self):
+        h = hints_xml(wrap(
+            vertex("a", "rounded=0;", 40, 40, 80, 40)
+            + vertex("b", "rounded=0;", 240, 40, 80, 40)
+            + edge("e1", "a", "b", 1, 0.5, 0, 0.5)
+            + edge("e2", "a", "b", 1, 0.5, 0, 0.5)))
+        self.assertIn("#same 120,60", h)        # 两条边的起点落在同一个点上
+        self.assertIn("e1.a", h)
+        self.assertIn("e2.a", h)
+
+    def test_same_tolerance_is_the_callers_call(self):
+        """差 8 像素算不算同一个点是电路知识，脚本不替谁定：给了容差才合。"""
+        xml = wrap(
+            vertex("a", "rounded=0;", 40, 40, 80, 40)
+            + vertex("b", "rounded=0;", 240, 140, 80, 40)
+            + vertex("c", "rounded=0;", 40, 48, 80, 40)
+            + edge("e1", "a", "b", 1, 0.5, 0, 0.5)
+            + edge("e2", "c", "b", 1, 0.5, 1, 0.5))
+        self.assertNotIn("#same", hints_xml(xml))
+        self.assertIn("#same", hints_xml(xml, tol=10))
+
+    def test_in_reports_geometric_containment(self):
+        h = hints_xml(wrap(
+            vertex("frame", "rounded=0;fillColor=#f8cecc;", 20, 20, 400, 300)
+            + vertex("inner", "rounded=0;", 60, 60, 80, 40)
+            + vertex("outside", "rounded=0;", 600, 60, 80, 40)))
+        self.assertIn("#in   frame  inner", h)
+        self.assertNotIn("outside", h[h.index("#in"):].splitlines()[0])
+
+    def test_in_picks_the_smallest_container(self):
+        h = hints_xml(wrap(
+            vertex("big", "rounded=0;", 0, 0, 800, 600)
+            + vertex("mid", "rounded=0;", 20, 20, 400, 300)
+            + vertex("leaf", "rounded=0;", 40, 40, 40, 40)))
+        self.assertIn("#in   mid  leaf", h)     # 挂最小的那个框，不是最大的
+        self.assertIn("#in   big  mid", h)
+
+    def test_near_skips_containers(self):
+        """分区色块圈住半张图，跟框里每个文本框的边距都是 0。
+
+        包含不是挨着 —— 不排掉的话，真正紧挨着的那个器件会被 `@0` 挤出榜单。
+        包含关系 `#in` 已经单列了，这里排掉一位信息都不丢。
+        """
+        h = hints_xml(wrap(
+            vertex("frame", "rounded=0;fillColor=#f8cecc;", 20, 20, 500, 400)
+            + vertex("cap", "rounded=0;", 200, 200, 60, 20)
+            + vertex("lab", "text;", 270, 200, 60, 20, "C=36pF")))
+        line = [l for l in h.splitlines() if l.startswith("#near lab")][0]
+        self.assertNotIn("frame", line)
+        self.assertIn("cap@10", line)
+        self.assertIn("#in   frame", h)      # 但包含关系还是要报
+
+    def test_near_gives_distances_not_ownership(self):
+        h = hints_xml(wrap(
+            vertex("cap", "shape=mxgraph.electrical.capacitors.capacitor_1;",
+                   200, 200, 60, 20)
+            + vertex("far", "rounded=0;", 600, 500, 40, 40)
+            + vertex("lab", "text;", 270, 200, 60, 20, "C=36pF")))
+        line = [l for l in h.splitlines() if l.startswith("#near lab")][0]
+        self.assertIn("cap@10", line)          # 边距 10 px：是个数，不是结论
+        self.assertLess(line.index("cap@"), line.index("far@"))
 
 
 # --------------------------------------------------------------- 真渲染

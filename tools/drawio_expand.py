@@ -34,6 +34,17 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
+
+def utf8_streams():
+    """把 stdout/stderr 钉成 UTF-8。跟 drawio_reduce.py 里那份是同一件事、同一个理由：
+    `expand x.rd > x.drawio` 不能因为机器的 locale 是 GBK 就写出 GBK 的 XML。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+
+
 # 跟 drawio_reduce.py 里的两个字面量必须一致 —— reduce 靠它判「能不能缩」，
 # expand 靠它写回去。改一边要改两边。
 WAYPOINT_STYLE = ("shape=waypoint;sketch=0;fillStyle=solid;size=6;pointerEvents=1;"
@@ -258,6 +269,12 @@ def parse_rd(text):
             cur.model["pageWidth"] = m.group(2)
             cur.model["pageHeight"] = m.group(3)
             pages.append(cur)
+            continue
+
+        if line.startswith("----"):
+            # reduce/expand 自己打的统计行（老版本没带 `##` 前缀）。走的是 stderr，
+            # 但 `2>&1` 和「整屏复制粘进 .rd」都会把它带进来 —— 自己的输出必须
+            # 自己读得回去，所以这里认它，不当成不认识的行报警告。
             continue
 
         if line.startswith("#"):
@@ -532,6 +549,7 @@ def expand(text):
 
 
 def main(argv=None):
+    utf8_streams()
     ap = argparse.ArgumentParser(description="把 .rd 还原回 .drawio")
     ap.add_argument("infile")
     ap.add_argument("-o", "--out", help="输出文件，默认 stdout")
@@ -547,7 +565,7 @@ def main(argv=None):
         sys.stdout.write(result)
 
     src = os.path.getsize(args.infile)
-    print("\n---- %d -> %d bytes" % (src, len(result.encode("utf-8"))),
+    print("\n## ---- %d -> %d bytes" % (src, len(result.encode("utf-8"))),
           file=sys.stderr)
     return 0
 
