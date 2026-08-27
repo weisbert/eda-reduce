@@ -11,12 +11,19 @@
 # 要么手工加进 requirements.txt 重出 full 包，要么让管理员上系统包。
 
 # ---------------------------------------------------------------- Pillow
-# 只有 tools/plot_digitize.py 用得上，而且是 try/except 可选：
+# 两个工具用它，性质不一样：
+#
+# tools/plot_digitize.py —— try/except 可选：
 #   有  -> 用 Pillow 解 PNG（快，格式吃得全）
 #   没有 -> 退回自带解码器（zlib 手解，非隔行 8-bit，filter 0-4，
 #           颜色类型 0/2/3/4/6）。**结果逐字节一致**，
 #           tests/test_digitize.py 的 test_pure_decoder_matches_pillow 在守这条。
-# 大图上 Pillow 快一个数量级；demo 那张 1920x1080 两条路都在 1 秒内。
+#   大图上 Pillow 快一个数量级；demo 那张 1920x1080 两条路都在 1 秒内。
+#
+# tools/img2b64.py —— **必需**，没有兜底。
+#   它跑在隔离区外面（自己机器上压图 → 粘聊天框），本来就不进气隙包，
+#   所以没必要为它做纯标准库退路。这也是它放在这个文件里而不是
+#   requirements.txt 里的原因 —— 不是「可选」，是「不进包」。
 Pillow>=8.0
 
 # ---------------------------------------------------------------- tkinter

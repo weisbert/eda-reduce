@@ -11,6 +11,8 @@
                    ◀──drawio_expand──                           改完再画回去
 波形    my.csv     ──wave_reduce────▶  my.wv  (≤20 KB)      ──▶  模型定位 debug 问题
 截图    plot.png   ──plot_digitize──▶  my.wv                ──▶  （导不出数据时的兜底）
+图片    fig.png    ──img2b64───────▶  base64 文本 (≤50 KB) ──▶  模型直接看这张图
+                   ◀──img2b64 --decode──                     接收侧还原成图片
 ```
 
 ## 工具
@@ -21,28 +23,43 @@
 | `tools/drawio_expand.py` | **可用** | `.rd` → `.drawio`，reduce 的逆。连线走法、标签位置逐像素还原 |
 | `tools/wave_reduce.py` | **可用** | Cadence 波形 CSV → `.wv`（≤20 KB），带 Tkinter GUI 预览。见 [`docs/wave-spec.md`](docs/wave-spec.md) |
 | `tools/plot_digitize.py` | **可用** | 波形截图 → CSV/`.wv`。导不出数据时的兜底 |
+| `tools/img2b64.py` | **可用** | 图片 → base64 文本，压到一条消息装得下。带 Tkinter GUI，Ctrl+V 粘贴即压。需 Pillow |
 
-## 依赖：没有。不用 `pip install`
+## 依赖：看这个工具跑在哪
+
+判据只有一条：**这个工具本身要不要传进隔离区。**
+
+### 要进隔离区的 —— 尽量纯标准库
+
+`wave_reduce` 那条线是这类：工具得跟着数据一起进去，而里面装包要走审计闸、
+文件只能一个一个传。所以这条线上零依赖不是洁癖，是能不能用得上的问题。
 
 ```bash
 git clone https://github.com/weisbert/eda-reduce.git && cd eda-reduce
 python tools/wave_reduce.py examples/demo_tran.csv     # 就这样，不用装任何东西
 ```
 
-Python 3.6+，**全部纯标准库**。仓库里那个 `deploy/requirements.txt` 是空的
-（只有注释）——部署管道按双包模型建好了，只是现在没东西可装，
-哪天加了 numpy 往里写一行就行，不用回头重做部署链。
-
-两个**可选**的东西，没有也照常跑：
-
-| | 缺了会怎样 | 怎么补 |
-|---|---|---|
-| `Pillow` | `plot_digitize` 退回自带的 PNG 解码器（纯标准库 zlib，约 60 行）。结果一样，大图慢一些 | `pip install Pillow`，纯 python 之外的机器上也可以不装 |
-| `tkinter` | `--gui` 用不了，命令行全部照常 | **装不了 wheel**（CPython 自带的 C 扩展 + Tcl/Tk 运行时），只能上系统包 `python3-tk` / `tkinter` |
-
-这条「核心不依赖任何东西」是**硬约束**不是巧合：`wave_core.py` + `wave_emit.py`
-+ `wave_cli.py` 三个文件 scp 到任何机器就能跑，是部署链坏掉时的逃生舱。
+Python 3.6+，纯标准库。`wave_core.py` + `wave_emit.py` + `wave_cli.py`
+三个文件 scp 到任何机器就能跑，是部署链坏掉时的逃生舱 ——
 `tests/test_format.py` 里有 AST 扫描在守这条线。
+`deploy/requirements.txt` 是空的（只有注释），部署管道按双包模型建好了，
+哪天真要加 numpy 往里写一行就行，不用回头重做部署链。
+
+### 在外面跑的 —— 想用什么库用什么库
+
+`drawio_reduce` / `drawio_expand` / `img2b64` 是这类：你在**自己机器上**
+把原理图或图片压成文本，再粘进聊天框，工具本身从不进隔离区。
+这一层有 git、有网，装什么都行，不受上面那条约束。
+
+（`drawio_reduce` 现在碰巧也是纯标准库的 —— 那是实现得简单，不是约束。）
+
+### 现在实际用到的第三方包
+
+| | 谁用 | 缺了会怎样 |
+|---|---|---|
+| `Pillow` | `img2b64` **必需** | 用不了。它跑在外面，直接 `pip install Pillow` |
+| | `plot_digitize` 可选 | 退回自带的 PNG 解码器（纯标准库 zlib，约 60 行），结果逐字节一致，大图慢一些 |
+| `tkinter` | `wave_reduce --gui`、`img2b64` GUI | 命令行全部照常。**装不了 wheel**（CPython 自带的 C 扩展 + Tcl/Tk 运行时），只能上系统包 `python3-tk` / `tkinter` |
 
 ```
 docs/rd-spec.md       .rd 格式规范 + 设计约定（分工线、黑名单、坐标解算、反方向）
