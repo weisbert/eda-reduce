@@ -33,6 +33,7 @@ import io
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -619,7 +620,10 @@ def main(argv=None):
             return 3
         proc, lines = db_rows(opts.simvisdbutil, opts.db, sigs, opts.out,
                               opts.t_from, opts.t_to)
-        source = os.path.abspath(opts.db)
+        # 连同实际用的是哪个 simvisdbutil 一起记下：没 load 工具环境时 PATH 上
+        # 可能是另一个版本，表头写法不同 —— 两次结果对不上，先看这一行
+        source = "%s   (via %s)" % (os.path.abspath(opts.db),
+                                    shutil.which(opts.simvisdbutil) or opts.simvisdbutil)
     else:
         fh = open(opts.csv, encoding="utf-8", errors="replace")
         lines = fh
