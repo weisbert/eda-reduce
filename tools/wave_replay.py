@@ -485,6 +485,8 @@ def emit(targets, outdir, opts, meta):
         "//",
         "// Ideal sources win against any driver still attached to these nets:",
         "// remove (or switch to an empty view) the blocks that used to drive them.",
+        "// After the run, grep spectre.out for SFE-411: a mistyped hierarchical name is",
+        "// only a WARNING ('treated as a regular node') and that source drives nothing.",
         "simulator lang=spectre",
         "",
     ]
