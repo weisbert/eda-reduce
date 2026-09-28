@@ -13,6 +13,9 @@
 截图    plot.png   ──plot_digitize──▶  my.wv                ──▶  （导不出数据时的兜底）
 图片    fig.png    ──img2b64───────▶  base64 文本 (≤50 KB) ──▶  模型直接看这张图
                    ◀──img2b64 --decode──                     接收侧还原成图片
+
+回放    psf.trn    ──wave_replay────▶  replay.scs + pwl/     ──▶  下一次仿真直接 include
+        （上次仿真录下的节点电压，变成下次仿真的激励；不经过聊天框，全程在隔离区里）
 ```
 
 ## 工具
@@ -24,6 +27,7 @@
 | `tools/wave_reduce.py` | **可用** | Cadence 波形 CSV → `.wv`（≤20 KB），带 Tkinter GUI 预览。见 [`docs/wave-spec.md`](docs/wave-spec.md) |
 | `tools/plot_digitize.py` | **可用** | 波形截图 → CSV/`.wv`。导不出数据时的兜底 |
 | `tools/img2b64.py` | **可用** | 图片 → base64 文本，压到一条消息装得下。带 Tkinter GUI，Ctrl+V 粘贴即压。需 Pillow |
+| `tools/wave_replay.py` | **可用** | SST2 波形库（AMS 的 `psf.trn`）+ 信号清单 → Spectre `vsource` 激励。层次名直连原 net，原理图不用改。纯标准库，Python 3.6+，要 `simvisdbutil` |
 
 ## 依赖：看这个工具跑在哪
 
@@ -115,6 +119,22 @@ export EDA_REDUCE_BUDGET=32k                       # 定成你那条通道的常
 python tools/plot_digitize.py shot.png --xaxis 0,300n --yaxis 0.7,0.87 \
     --trace '#e01b24=vdd_pll' -o dig.csv           # 截图兜底
 ```
+
+```bash
+# 上次仿真拿掉某些模块后重跑：那些模块原来输出的 net 用录下来的波形驱动
+python3 tools/wave_replay.py --list signal_list.csv --db psf/psf.trn -o replay
+                                                   # signal_list.csv = ADE Outputs 导出的 CSV
+                                                   # （取 Output 列），或一行一个 /I_x/net
+                                                   # → replay/replay.scs：ADE 里加进
+                                                   #   Simulation Files → Definition Files
+python3 tools/wave_replay.py ... --tol 0.2m        # 每个录下的点离 PWL 都不超过 0.2 mV（默认 1m）
+python3 tools/wave_replay.py ... --from 200u --to 1.2m   # 只回放这一段，200 µs 挪到新仿真的 t=0
+python3 tools/wave_replay.py ... --skip '/I_top/I_PLL/*' # 这些写成注释（环路内部节点别强制）
+python3 tools/wave_replay.py ... --rs 10           # 每个源串 10 Ω，不当理想源
+```
+
+`replay.scs` 里的是**理想源**：没拆干净的驱动会被硬压住（电压对，那个驱动的电流是假的）。
+`REPORT.txt` 逐信号列出原始点数 → 输出点数、摆幅，以及没对上的名字。
 
 ```
 本地                                              对话里
