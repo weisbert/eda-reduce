@@ -211,6 +211,51 @@ class TestHeader(unittest.TestCase):
         self.assertEqual(st[5][0], "unsupported")
 
 
+class TestBindColumns(unittest.TestCase):
+    """CSV 表头写到哪一层不固定。回归：公司机上见过只有顶层 4 个对上、
+    层级里的 256 个全部 nocolumn —— 表头只剩叶子名，按全路径找不到。"""
+
+    DB = ["sim_TOP.VDD_PG", "sim_TOP.I_top.en", "sim_TOP.I_top.d_x<1>"]
+
+    def _targets(self):
+        tg = [R.Target(p) for p in ("/VDD_PG", "/I_top/en", "/I_top/d_x<1>")]
+        for t, d in zip(tg, self.DB):
+            t.status, t.db = "ok", d
+        return tg
+
+    def test_leaf_only_header_binds_by_position(self):
+        tg = self._targets()
+        pos = R.bind_columns(["SimTime", "VDD_PG", "en", "\\d_x<1> "], tg, self.DB)
+        self.assertTrue(pos)
+        self.assertEqual([t.col for t in tg], [1, 2, 3])
+
+    def test_full_header_binds_by_position(self):
+        tg = self._targets()
+        pos = R.bind_columns(["SimTime"] + self.DB, tg, self.DB)
+        self.assertTrue(pos)
+        self.assertEqual([t.col for t in tg], [1, 2, 3])
+
+    def test_leaf_only_header_by_name_when_counts_differ(self):
+        """列数对不上就不能信位置，退回按名字 —— 叶子名作后缀照样能认。"""
+        tg = self._targets()
+        pos = R.bind_columns(["SimTime", "en", "VDD_PG", "\\d_x<1> ", "extra"], tg, self.DB)
+        self.assertFalse(pos)
+        self.assertEqual([t.col for t in tg], [2, 1, 3])
+
+    def test_position_rejected_when_names_disagree(self):
+        tg = self._targets()
+        pos = R.bind_columns(["SimTime", "en", "VDD_PG", "d_x<1>"], tg, self.DB)
+        self.assertFalse(pos)                   # 顺序反了：位置不可信
+        self.assertEqual([t.col for t in tg], [2, 1, 3])
+
+    def test_ambiguous_leaf_is_nocolumn_not_a_guess(self):
+        tg = [R.Target("/I_a/en"), R.Target("/I_b/en")]
+        for t, d in zip(tg, ("top.I_a.en", "top.I_b.en")):
+            t.status, t.db = "ok", d
+        R.bind_columns(["SimTime", "en", "en", "x"], tg, ["top.I_a.en", "top.I_b.en"])
+        self.assertEqual([t.status for t in tg], ["nocolumn", "nocolumn"])
+
+
 class TestEndToEnd(unittest.TestCase):
 
     def setUp(self):

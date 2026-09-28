@@ -348,26 +348,52 @@ def db_rows(tool, db, signals, workdir, t_from=None, t_to=None):
 # 主流程
 # --------------------------------------------------------------------------
 
-def bind_columns(header, targets):
-    """CSV 表头 → 目标。表头名去掉转义后和库全名（或 ADE 路径）对齐。"""
+def _tail_match(col, full):
+    """表头名是不是完整路径的「按层级对齐的后缀」。
+
+    表头里写到哪一层并不固定：实测见过全路径，也见过只剩叶子名的。
+    只要是按 `/` 边界对齐的后缀，就算同一个信号。
+    """
+    return col == full or full.endswith("/" + col)
+
+
+def bind_columns(header, targets, requested=None):
+    """CSV 表头 → 目标。返回是否按位置对齐（写进 REPORT，诊断用）。
+
+    `--db` 模式下我们知道自己按什么顺序要的信号（`requested`），simvisdbutil
+    按同样顺序出列 —— 所以优先**按位置**对齐，再逐列用 `_tail_match` 校验。
+    校验不过才退回按名字找。
+
+    只按名字找是会漏的：公司机上见过只有顶层 4 个信号对上、层级里的 256 个
+    全部 nocolumn —— 表头的写法跟这里以为的不一样。
+    """
     cols = [c.strip() for c in header]
-    by_key = {}
-    for i, c in enumerate(cols[1:], 1):
-        by_key.setdefault(norm_key(c.replace(".", "/")), i)
+    keys = [norm_key(c.replace(".", "/")) for c in cols]
+    if requested is not None and len(cols) - 1 == len(requested):
+        want = [norm_key(r.replace(".", "/")) for r in requested]
+        if all(_tail_match(k, w) for k, w in zip(keys[1:], want)):
+            pos = {r: i for i, r in enumerate(requested, 1)}
+            for t in targets:
+                if t.status == "ok":
+                    t.col = pos[t.db]
+            return True
+    # 不能用 dict 去重：两个实例下都有叶子名 `en` 时，去重会把两个目标
+    # 悄悄绑到同一列上 —— 数据看着齐全，其实是错的
+    indexed = list(enumerate(keys[1:], 1))
     for t in targets:
         if t.status != "ok":
             continue
-        k = norm_key(t.db.replace(".", "/")) if t.db else t.key
-        i = by_key.get(k)
-        if i is None:                           # --csv 模式：表头可能不带顶层
-            for kk, ii in by_key.items():
-                if kk == t.key or kk.endswith("/" + t.key):
-                    i = ii
-                    break
+        full = norm_key(t.db.replace(".", "/")) if t.db else t.key
+        hits = [ii for ii, kk in indexed if kk == full]
+        if not hits:                            # 表头只写到某一层：找唯一的后缀
+            hits = [ii for ii, kk in indexed
+                    if _tail_match(kk, full) or kk.endswith("/" + t.key)]
+        i = hits[0] if len(hits) == 1 else None
         if i is None:
             t.status = "nocolumn"
         else:
             t.col = i
+    return False
 
 
 def stream(lines, targets, timescale, tol, t_from=None, t_to=None):
@@ -497,7 +523,18 @@ def emit(targets, outdir, opts, meta):
     with open(os.path.join(outdir, "REPORT.txt"), "w", encoding="utf-8",
               newline="\n") as fh:
         fh.write("\n".join(head[:6]) + "\n")
-        fh.write("// rows read: %d\n\n" % meta["rows"])
+        fh.write("// rows read: %d\n" % meta["rows"])
+        h = meta["header"]
+        fh.write("// csv      : %d columns, bound %s; first: %s\n"
+                 % (len(h), "by position" if meta["positional"] else "by name",
+                    " | ".join(h[:3])))
+        if any(t.status == "nocolumn" for t in targets):
+            # 名字在库里解析到了，CSV 里却对不上 —— 把整张表头摊开，一眼看出差在哪
+            fh.write("// NOCOLUMN: resolved in the database, but no CSV column matched.\n"
+                     "//   Full CSV header, one per line:\n")
+            for c in h:
+                fh.write("//   %s\n" % c)
+        fh.write("\n")
         fh.write("%5s  %-11s %9s %6s %12s %12s  %s\n"
                  % ("idx", "kind", "raw", "out", "min", "max", "ADE path  ->  database name"))
         for i, kind, n, no, lo, hi, path, db in rep:
@@ -601,7 +638,8 @@ def main(argv=None):
         source = os.path.abspath(opts.csv)
 
     first = next(iter(lines), "")
-    bind_columns(first.rstrip("\r\n").split(","), targets)
+    header = first.rstrip("\r\n").split(",")
+    positional = bind_columns(header, targets, sigs if opts.db else None)
     rows, cut = stream(lines, targets, timescale, opts.tol, opts.t_from, opts.t_to)
 
     if proc is not None:
@@ -622,7 +660,8 @@ def main(argv=None):
     t_last = max((max(t.cone.tp, t.cone.tq or 0) for t in targets
                   if t.cone and t.cone.n), default=None)
     meta = {"when": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "source": source, "rows": rows, "t_first": t_first, "t_last": t_last}
+            "source": source, "rows": rows, "t_first": t_first, "t_last": t_last,
+            "header": header, "positional": positional}
     cnt = emit(targets, opts.out, opts, meta)
 
     print("%d 行 → %s/replay.scs   dc %d · pwl %d · 注释掉 %d · 未解析 %d"
